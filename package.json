@@ -1,0 +1,24 @@
+{
+  "name": "shell-network",
+  "private": true,
+  "type": "module",
+  "description": "Discord bridge for t3 agent threads: durable buffer, serialized outbox, bot-to-bot cap, watchdog and a confined Discord MCP tool.",
+  "license": "MIT",
+  "scripts": {
+    "test": "sh scripts/contained.sh 900 sh scripts/test.sh",
+    "typecheck": "tsc -p ."
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2",
+    "ws": "8.22.0"
+  },
+  "dependencies": {
+    "@discordjs/core": "2.6.0",
+    "@discordjs/rest": "2.6.3",
+    "@discordjs/ws": "2.0.4"
+  }
+}

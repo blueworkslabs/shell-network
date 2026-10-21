@@ -1,0 +1,277 @@
+{
+ "_source": "t3 stress test, kill run 3 (queue mode, Claude victim); reduced from saved independent and queue snapshots (offline evidence, test payloads only)",
+ "read": {
+  "thread": {
+   "activeRunId": null,
+   "pendingRequestCount": 0
+  },
+  "recentRuns": [
+   {
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "ordinal": 4,
+    "status": "completed"
+   },
+   {
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:3",
+    "ordinal": 3,
+    "status": "completed"
+   },
+   {
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:2",
+    "ordinal": 2,
+    "status": "queued"
+   },
+   {
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "ordinal": 1,
+    "status": "failed"
+   }
+  ],
+  "items": [
+   {
+    "type": "user_message",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "messageId": "mcp:00000000-0000-4000-8000-000000000001",
+    "text": "Run this shell command 12 times, once for each k from 1 to 12, one at a time in the FOREGROUND, each as its own separate command (no background execution, never combine or skip steps): `mkdir -p fixture-out && echo \"step k\" >> fixture-out/LONG-000001.log && sleep 10` (with k replaced by the step number). After step 12, reply with one line: LONGDONE LONG-000001",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "messageId": null,
+    "text": "$ Preparing workspace\nWorkspace preparation completed.",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 1\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 2\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 3\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 4\" >> fixture-out/LONG-000001.log && sleep 10",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "failed"
+   },
+   {
+    "type": "user_message",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:3",
+    "messageId": "message:mcp:client%3A00000000-0000-4000-8000-000000000002:thread-send:fixture-probe-00000002",
+    "text": "Queued follow-up for the task logging to fixture-out/LONG-000001.log: run `echo \"PROBE PROBE-000002\" >> fixture-out/LONG-000001.log` exactly once, then reply with one line: PROBEDONE PROBE-000002",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:3",
+    "messageId": null,
+    "text": "$ echo \"PROBE PROBE-000002\" >> fixture-out/LONG-000001.log\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "assistant_message",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:3",
+    "messageId": "message:provider:claudeAgent:native-item:00000000-0000-4000-8000-000000000102",
+    "text": "PROBEDONE PROBE-000002",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "user_message",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": "message:mcp:client%3A00000000-0000-4000-8000-000000000002:thread-send:fixture-continue-00000003",
+    "text": "The service was interrupted. Continue the same task: first read fixture-out/LONG-000001.log, then run only the steps from 1 to 12 that are not in it yet (never repeat a step that is already logged), plus any additional instruction you were given and have not done yet. Then reply with one line: LONGDONE LONG-000001",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "assistant_message",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": "message:provider:claudeAgent:native-item:00000000-0000-4000-8000-000000000104",
+    "text": "Steps 1\u20134 are logged and the probe is done. Continuing with step 5.",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 5\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 6\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 7\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 8\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 9\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 10\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "assistant_message",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": "message:provider:claudeAgent:native-item:00000000-0000-4000-8000-000000000101",
+    "text": "Steps 1\u201310 are logged. I'm running steps 11 and 12 now.",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 11\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "command_execution",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": null,
+    "text": "$ mkdir -p fixture-out && echo \"step 12\" >> fixture-out/LONG-000001.log && sleep 10\n(Bash completed with no output)",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   },
+   {
+    "type": "assistant_message",
+    "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "messageId": "message:provider:claudeAgent:native-item:00000000-0000-4000-8000-000000000103",
+    "text": "LONGDONE LONG-000001",
+    "textTruncated": false,
+    "nextTextOffset": null,
+    "status": "completed"
+   }
+  ]
+ },
+ "projection": {
+  "runs": [
+   {
+    "id": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:1",
+    "ordinal": 1,
+    "status": "failed",
+    "queueHeld": null,
+    "userMessageId": "mcp:00000000-0000-4000-8000-000000000001"
+   },
+   {
+    "id": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:2",
+    "ordinal": 2,
+    "status": "queued",
+    "queueHeld": true,
+    "userMessageId": "message:mcp:client%3A00000000-0000-4000-8000-000000000002:thread-send:fixture-extra-00000001"
+   },
+   {
+    "id": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:3",
+    "ordinal": 3,
+    "status": "completed",
+    "queueHeld": null,
+    "userMessageId": "message:mcp:client%3A00000000-0000-4000-8000-000000000002:thread-send:fixture-probe-00000002"
+   },
+   {
+    "id": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:4",
+    "ordinal": 4,
+    "status": "completed",
+    "queueHeld": null,
+    "userMessageId": "message:mcp:client%3A00000000-0000-4000-8000-000000000002:thread-send:fixture-continue-00000003"
+   }
+  ]
+ },
+ "queue": {
+  "items": [
+   {
+    "queuedRunId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:2",
+    "text": "Queued follow-up for the task logging to fixture-out/LONG-000001.log: run `echo \"EXTRA EXTRA-000003\" >> fixture-out/LONG-000001.log` exactly once, then reply with one line: EXTRADONE EXTRA-000003",
+    "truncated": false
+   }
+  ]
+ },
+ "extra": {
+  "clientRequestId": "fixture-extra-00000001",
+  "messageId": "message:mcp:client%3A00000000-0000-4000-8000-000000000002:thread-send:fixture-extra-00000001",
+  "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:2",
+  "delivery": "queued",
+  "text": "Queued follow-up for the task logging to fixture-out/LONG-000001.log: run `echo \"EXTRA EXTRA-000003\" >> fixture-out/LONG-000001.log` exactly once, then reply with one line: EXTRADONE EXTRA-000003"
+ },
+ "probe": {
+  "clientRequestId": "fixture-probe-00000002",
+  "messageId": "message:mcp:client%3A00000000-0000-4000-8000-000000000002:thread-send:fixture-probe-00000002",
+  "runId": "run:thread:mcp%3A00000000-0000-4000-8000-000000000001:ordinal:3",
+  "delivery": "started",
+  "text": "Queued follow-up for the task logging to fixture-out/LONG-000001.log: run `echo \"PROBE PROBE-000002\" >> fixture-out/LONG-000001.log` exactly once, then reply with one line: PROBEDONE PROBE-000002"
+ }
+}

@@ -383,6 +383,25 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         : all("SELECT * FROM channel_message WHERE length(id) > length(?) OR (length(id) = length(?) AND id > ?) ORDER BY length(id), id", afterId, afterId, afterId);
     },
 
+    // The unread header's bounded read (lib/bot.ts unreadHeader): of the channel messages after `afterId` that are not
+    // by `selfId` and not in `excludeIds`, the newest `limit` that mention `addressedId` (<@id> or <@!id>; none when it
+    // is null) and the newest `limit` that do not, oldest first, plus how many such messages there are in all, and the
+    // newest message id after `afterId` of any author. Only these can survive a header of at most `limit` lines, so the
+    // read stays bounded however long the unread log is.
+    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number }) {
+      const after = afterId === null ? "1" : "(length(id) > length(?1) OR (length(id) = length(?1) AND id > ?1))";
+      const base = `${after} AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))`;
+      const mention = "(instr(content, '<@' || ?4 || '>') > 0 OR instr(content, '<@!' || ?4 || '>') > 0)";
+      const params = [afterId ?? "", selfId, JSON.stringify(excludeIds), addressedId ?? ""] as SQLInputValue[];
+      type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
+      const newest = (cond: string) => all<Row>(`SELECT * FROM channel_message WHERE ${base} AND ${cond} ORDER BY length(id) DESC, id DESC LIMIT ?5`, ...params, limit).reverse();
+      const addressed = addressedId === null ? [] : newest(mention);
+      const unaddressed = newest(addressedId === null ? "1" : `NOT ${mention}`);
+      const total = (one<{ n: number }>(`SELECT count(*) AS n FROM channel_message WHERE ${base}`, ...params.slice(0, 3)) as { n: number }).n; // ?1..?3 only
+      const last = one<{ id: string }>(`SELECT id FROM channel_message WHERE ${after} ORDER BY length(id) DESC, id DESC LIMIT 1`, ...(afterId === null ? [] : [afterId]));
+      return { addressed, unaddressed, total, newestId: last?.id ?? null };
+    },
+
     buffered(conversationKey: string): InboundRow[] {
       return all<InboundRow>(`SELECT * FROM inbound WHERE conversation_key = ? AND state = 'buffered' ORDER BY ${ARRIVAL}`, conversationKey);
     },

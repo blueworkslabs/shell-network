@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { type Buffer } from "../lib/buffer.ts";
 import type { BotOptions } from "../lib/bot.ts";
 import type { FakeDiscord, FakeRun, FakeT3 } from "./fakes.ts";
-import { makeBot, splitReply, snowflakeAt } from "../lib/bot.ts";
+import { makeBot, BARE_MENTION_TEXT, splitReply, snowflakeAt } from "../lib/bot.ts";
 import { startBridge } from "../lib/startup.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID, STRANGER_ID } from "./fakes.ts";
@@ -74,14 +74,26 @@ test("basic: a mention is committed, acked after commit, sent queue-only, and th
   assert.ok(w.discord.writes.every((x) => x.channelId === CH), "nothing written outside the channel");
 });
 
-test("NEG accept: other channels, bot authors, messages without a mention and empty mentions are not accepted", async () => {
+test("NEG accept: other channels, bot authors and messages without a mention are not accepted", async () => {
   const w = world();
   assert.equal((await w.say("x", { channel: "general" })).reason, "other channel");
   assert.equal((await w.say("x", { bot: true })).reason, "bot author");
   assert.equal((await w.say("x", { mention: false })).reason, "no mention");
-  assert.equal((await w.say("")).reason, "empty after mention");
   assert.equal(w.buffer.buffered("gem").length, 0);
   assert.equal(w.discord.reactions.length, 0);
+});
+
+test("BARE MENTION: a person's mention without text is accepted as the explicit bridge note (no invented user text) and sent", async () => {
+  const w = world();
+  assert.deepEqual(await w.say(""), { accepted: true, inserted: true });
+  assert.deepEqual(await w.say("   "), { accepted: true, inserted: true }, "whitespace only counts as bare");
+  assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), [BARE_MENTION_TEXT, BARE_MENTION_TEXT]);
+  assert.equal(w.discord.reactions.length, 2, "acked like any accepted input");
+  await w.bot.step();
+  assert.ok(w.runs().at(-1)!.text.includes(`user1: ${BARE_MENTION_TEXT}`), w.runs().at(-1)!.text);
+  // control: a mention with text keeps exactly its text
+  await w.say("real words");
+  assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["real words"]);
 });
 
 test("dedupe: the same Discord message delivered twice is stored and acked once", async () => {

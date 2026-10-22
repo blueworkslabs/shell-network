@@ -26,7 +26,15 @@ import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./s
 import type { Buffer } from "./buffer.ts";
 import type { BatchRow, DiscordMessage, DiscordPort, InboundRow, Log, ModelSelection, OutboxRow, Projection, QueueList, T3Port, ThreadRead, Verdict } from "./types.ts";
 
-export interface AcceptResult { accepted: boolean; inserted?: boolean; reason?: string }
+// wake: not accepted, but the message left work for the step loop (an exchange-cap notice to post).
+export interface AcceptResult { accepted: boolean; inserted?: boolean; reason?: string; wake?: boolean }
+// What a person's bare mention (no text) stands for in the batch: an explicit bridge note, never invented user text.
+export const BARE_MENTION_TEXT = "[bridge: a mention without text, i.e. go on with the conversation above]";
+// Unread header: per-line cut, marked so the agent can tell the line is incomplete. Messages that mention the bot
+// (e.g. a handoff the exchange cap held back) get Discord's whole message length, so a resumed bot reads them in full.
+export const HEADER_LINE_MAX = 300;
+export const HEADER_ADDRESSED_LINE_MAX = 2000;
+const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars cut]` : s);
 // phase "open" carries the reconcile verdict of the oldest open batch.
 export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
 type Found = { status: "found"; message: DiscordMessage } | { status: "absent" } | { status: "unknown" };
@@ -54,7 +62,7 @@ export const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floo
 
 export function makeBot({ name, conversationKey, channelId, botUserId, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 2000 }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000 }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -112,17 +120,19 @@ export function makeBot({ name, conversationKey, channelId, botUserId, allowedAu
     // something the bridge relies on.
     const mentioned = Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))));
     if (!mentioned) return { accepted: false, reason: "no mention" };
-    const text = String(msg.content ?? "").replace(mentionRe(), "").trim();
-    if (!text) return { accepted: false, reason: "empty after mention" };
+    // A person's bare mention means "go on" (e.g. after the exchange-cap pause); a bot's bare mention stays dropped.
+    const stripped = String(msg.content ?? "").replace(mentionRe(), "").trim();
+    if (!stripped && fromBot) return { accepted: false, reason: "empty after mention" };
+    const text = stripped || BARE_MENTION_TEXT;
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now() };
     let r: { inserted: boolean; id: number };
     if (crewBot) {
       const b = buffer.acceptFromBot(input, exchangeCap);
       if ("capped" in b) {
         // the cap is reached: not delivered; one notice per episode (key = last human message), whichever bot sees it first
-        buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Waiting for the user: ${[name, ...bots.values()].join(" and ")} have had ${b.count} exchanges without the user, so I stopped here. Mention one of us to go on.`, conversationKey);
+        buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Waiting for the user: ${[name, ...bots.values()].join(" and ")} have had ${b.count} exchanges without the user, so I stopped here. Mention one of us to go on (a bare @mention is enough).`, conversationKey);
         log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: b.count, cap: exchangeCap });
-        return { accepted: false, reason: "exchange cap" };
+        return { accepted: false, reason: "exchange cap", wake: true };
       }
       r = b;
     } else r = buffer.accept({ ...input, authorKind: "human" });
@@ -590,25 +600,33 @@ export function makeBot({ name, conversationKey, channelId, botUserId, allowedAu
   }
 
   // Unread header: what was said in the channel since this bot's last batch, or since the log starts for the
-  // first one (allowlisted people and crew bots only, not this bot, not the messages in the batch), newest `headerMaxMessages`, each line cut at 300 chars, at most
-  // `headerMaxChars` in total (oldest dropped first). Runs inside createBatch's transaction; advances the marker.
+  // first one (allowlisted people and crew bots only, not this bot, not the messages in the batch), at most `headerMaxMessages` lines, each line cut with a visible marker (HEADER_LINE_MAX, or HEADER_ADDRESSED_LINE_MAX for messages that mention this bot), at most
+  // `headerMaxChars` in total (the oldest line that does not mention this bot dropped first, then the oldest). Runs inside createBatch's transaction; advances the marker.
   // mentions of this bot and of the crew bots as @Name (other mentions stay as they are)
   const named = (text: string) => text.replace(/<@!?(\d+)>/g, (all, id: string) => (id === state.botUserId ? `@${name}` : bots.has(id) ? `@${bots.get(id)}` : all));
   function unreadHeader(rows: InboundRow[]): string {
     const since = buffer.kvGet(K("headerSince"));
-    const inBatch = new Set(rows.map((r) => r.source_message_id));
-    const all = buffer.channelSince(since);
-    const newest = [...all.map((m) => m.id), ...rows.map((r) => r.source_message_id)].sort((a, b) => byId({ id: a }, { id: b })).at(-1);
+    // Bounded read: at most `headerMaxMessages` lines can be shown, and lines are dropped oldest unaddressed first, then
+    // oldest addressed (below), so only the newest `headerMaxMessages` of each kind can ever be shown; the rest is counted.
+    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages });
+    const newest = [...(win.newestId ? [win.newestId] : []), ...rows.map((r) => r.source_message_id)].sort((a, b) => byId({ id: a }, { id: b })).at(-1);
     if (newest) buffer.kvSet(K("headerSince"), newest);
     const hint = [...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`);
-    let lines = all.filter((m) => m.author_id !== state.botUserId && !inBatch.has(m.id))
-      .map((m) => `${m.author_name}: ${named(m.content).replace(/\s+/g, " ").trim().slice(0, 300)}`);
-    const total = lines.length;
-    lines = lines.slice(-headerMaxMessages);
-    while (lines.length && lines.join("\n").length > headerMaxChars) lines.shift();
+    const toEntry = (addressed: boolean) => (m: { author_name: string; content: string }) =>
+      ({ addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
+    const entries = [...win.addressed.map((m) => ({ m, e: toEntry(true)(m) })), ...win.unaddressed.map((m) => ({ m, e: toEntry(false)(m) }))]
+      .sort((a, b) => byId(a.m, b.m)).map((x) => x.e);
+    const total = win.total;
+    // Both bounds (count, then size) drop the oldest line that does not mention this bot first, the oldest line only when
+    // every line left mentions it: an addressed handoff outlives any number of later unaddressed lines.
+    while (entries.length && (entries.length > headerMaxMessages || entries.map((e) => e.line).join("\n").length > headerMaxChars)) {
+      const i = entries.findIndex((e) => !e.addressed);
+      entries.splice(i >= 0 ? i : 0, 1);
+    }
+    const lines = entries.map((e) => e.line);
     if (!lines.length) return hint.length ? hint.join("\n") + "\n" : "";
     const left = total - lines.length;
-    return [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} older left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
+    return [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
   }
 
   // One pass: catch up if needed, post finished replies, settle the oldest open batch, then (only if nothing is open,

@@ -13,7 +13,9 @@ Discord ──gateway/REST──▶ bridge (one per bot) ──MCP (write) / WS 
 ```
 
 - **Bridge** (`bin/bridge.ts`, core in `lib/bot.ts`): one process per bot, with one Discord channel and one t3 thread.
-  It is the only writer for its bot token.
+  It is the only writer for its bot token. One step runs at a time (`lib/steploop.ts`). Gateway messages, t3 changes
+  and queued notices wake the loop early. A wake that arrives while a step runs is remembered, so the loop steps again
+  right away instead of waiting for its timer.
 - **Watchdog** (`bin/watchdog.ts`, `lib/watchdog.ts` + `lib/watchdog-run.ts`): the only holder of t3's
   `orchestration:operate` grant. It has no Discord or MCP credentials. It reads the bots' thread ids from the buffer
   and writes notices and its action log there; the bridge posts the notices. `tests/operate.test.ts` checks that the
@@ -28,7 +30,9 @@ every migration run in one IMMEDIATE transaction, and the schema version is kept
 
 1. **Accept.** A message is accepted only if it is in the configured channel, mentions the bot, and comes from an
    allowlisted person or an allowed bot. The bridge commits it to `inbound`, and only then acknowledges it with a
-   reaction. Lost acknowledgements are redone. Everything else is dropped before the buffer.
+   reaction. Lost acknowledgements are redone. Everything else is dropped before the buffer. A person's bare mention
+   (no text) counts as "go on": the batch carries an explicit bridge note instead of invented text. A bot's bare
+   mention is still dropped.
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before
@@ -36,7 +40,11 @@ every migration run in one IMMEDIATE transaction, and the schema version is kept
 3. **Batch.** When nothing is open and the thread is idle, everything buffered is coalesced into one batch. The batch
    gets a stable `clientRequestId`, `bridge-<key>-<prefix>-<id>`. The prefix is random and created once per DB, so a
    recreated DB can't reuse a request id that t3 already stored. The batch starts with an "unread header": what was
-   said in the channel since the bot's last batch.
+   said in the channel since the bot's last batch. Lines are cut at 300 characters with a visible `… [+N chars cut]`
+   marker; messages that mention the bot go in whole, up to 2000 characters. The header holds at most 20 lines and
+   4000 characters; under either limit, lines that don't mention the bot are dropped first (oldest first), and the
+   rest keep their order. The read is bounded in SQL: only the newest 20 messages that mention the bot and the newest
+   20 that don't are loaded, plus a count for "N left out", however long the unread log is.
 4. **Send.** The batch is sent as `t3_thread_send` with mode `queue`. Steering is never used. The t3 adapter
    (`lib/t3.ts`) reaches MCP only through `lib/allowlist.ts`.
 5. **Reconcile** (`lib/reconcile.ts`, pure). This step compares the batch with the MCP thread read, the WS projection
@@ -73,7 +81,9 @@ the tool's sends, reactions and threads.
 
 - A bot accepts mentions from the bots in `BRIDGE_ALLOWED_BOTS`.
 - An episode runs from one message of an allowlisted person to the next. Within an episode, at most
-  `BRIDGE_EXCHANGE_CAP` bot-to-bot messages are accepted. After that, one "waiting for the user" notice is posted.
+  `BRIDGE_EXCHANGE_CAP` bot-to-bot messages are accepted. After that, one "waiting for the user" notice is posted
+  right away: a capped message wakes the step loop. A mention from the user, even a bare one, resumes the bots, and
+  the capped handoff reaches the resumed bot through its unread header.
 - Cap decisions are final: they are stored in `bot_capped` and give the same answer on redelivery or replay.
 - Episode boundaries live in `human_message`, which is never pruned, unlike the 7-day channel log.
 - The tool's `discord_send` reserves from the same, channel-wide budget before it inserts a send that names a bot. The

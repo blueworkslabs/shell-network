@@ -28,7 +28,8 @@ import { discordRest, discordGateway } from "../lib/discord.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import type { LogFields } from "../lib/types.ts";
-import { startBridge } from "../lib/startup.ts";
+import { startBridge, gatewayDispatch } from "../lib/startup.ts";
+import { stepLoop } from "../lib/steploop.ts";
 import { botConfig, crewConfig } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
 import { shellWatch } from "../lib/shellwatch.ts";
@@ -111,45 +112,24 @@ const bot = makeBot({
 });
 log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: me.id, channelId, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap });
 
-// Single-flight step loop; a gateway message wakes it early.
-let stopped = false, wake: (() => void) | null = null;
-const nudge = () => { const w = wake; wake = null; w?.(); };
-async function loop() {
-  while (!stopped) {
-    let open = false;
-    try {
-      const r = await bot.step();
-      open = r.phase !== "idle";
-    } catch (e) {
-      log.emit("bridge.step_error", { error: errText(e) });
-      open = true;
-    }
-    if (stopped) break;
-    await new Promise<void>((r) => { wake = r; setTimeout(r, open ? tickMs : 10 * tickMs); });
-  }
-}
+// Single-flight step loop (lib/steploop.ts); a gateway message or a t3 change wakes it early, also mid-step (latched).
+const loop = stepLoop({ step: () => bot.step(), tickMs, log });
+const nudge = loop.nudge;
 
 // Catch-up runs inside the step loop (single flight); every new live session (READY/RESUMED) closes the dispatch
 // gate until a catch-up has completed within it.
 var gateway: DiscordGateway = discordGateway({
   token, log,
-  onDispatch: (type, d) => {
-    if (type === "READY") { bot.setBotUserId(d.user.id); nudge(); }
-    else if (type === "RESUMED") nudge();
-    else if (type === "MESSAGE_CREATE" && d.channel_id === channelId) {
-      bot.accept(d).then((r) => { if (r.accepted) nudge(); }, (e) => log.emit("bridge.accept_error", { sourceMessageId: d.id, error: errText(e) }));
-    }
-  },
+  onDispatch: gatewayDispatch({ bot, channelId, nudge, log }),
   onFatal: (code) => { log.emit("bridge.fatal", { code }); shutdown(3); },
 });
 // t3 thread changes wake the loop early (relayed completions of runs no batch started); the idle tick stays
 // as the safety net. Read-only session (T1_PUSH_TOKEN), same as the projection reads.
 const watch = shellWatch({ origin: new URL(need("T1_MCP_URL")).origin, tokenPath: PUSH_TOKEN_PATH, threadId: () => buffer.kvGet(`${cfg.key}:threadId`), onChange: nudge, log });
 function shutdown(code = 0) {
-  stopped = true;
+  loop.stop();
   watch.stop();
   gateway.close();
-  nudge();
   setTimeout(() => { try { buffer.close(); } catch {} process.exit(code); }, 500);
 }
 process.on("SIGTERM", () => shutdown(0));
@@ -164,4 +144,4 @@ try {
   process.exit(2);
 }
 watch.start();
-loop();
+loop.start();

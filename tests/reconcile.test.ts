@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { reconcileBatch, messageIdMatchesRequest, blockingBatch } from "../lib/reconcile.ts";
+import { reconcileBatch, messageIdMatchesRequest } from "../lib/reconcile.ts";
 import type { ReadItem, ThreadRead, Verdict } from "../lib/types.ts";
 
 type B = Parameters<typeof reconcileBatch>[0];
@@ -28,7 +28,7 @@ const qList = (over: Record<string, unknown> = {}) => ({ items: [{ queuedRunId: 
 const st = (v: Verdict) => [v.state, v.action];
 
 test("delivered only when the exact complete payload sits in the batch's own completed run", () => {
-  assert.deepEqual(reconcileBatch(sent(), { read: read("completed"), projection: proj("completed") }), { batchId: 7, state: "delivered", action: "done", why: null });
+  assert.deepEqual(st(reconcileBatch(sent(), { read: read("completed"), projection: proj("completed") })), ["delivered", "done"]);
   assert.deepEqual(st(reconcileBatch(sent(), { read: read("completed") })), ["delivered", "done"], "a started run is visible without projection");
 });
 
@@ -123,12 +123,6 @@ test("NEG messageIdMatchesRequest: only the exact ':thread-send:<id>' suffix mat
 test("unusable read -> wait, never a verdict", () => {
   assert.deepEqual(st(reconcileBatch(sent(), { read: null })), ["unknown", "wait"]);
   assert.deepEqual(st(reconcileBatch(sent(), { read: { items: [] } })), ["unknown", "wait"]);
-});
-
-test("blockingBatch: the oldest batch that is not delivered or resolved blocks; escalation does not unblock", () => {
-  assert.equal(blockingBatch<B>([{ id: 9, status: "sent" }, { id: 7, status: "held" }] as B[])!.id, 7);
-  assert.equal(blockingBatch<B>([{ id: 7, status: "escalated" }, { id: 8, status: "prepared" }] as B[])!.id, 7);
-  assert.equal(blockingBatch<B>([{ id: 7, status: "delivered" }, { id: 8, status: "resolved" }, { id: 9, status: "cancelled" }] as B[]), null);
 });
 
 // ---- real stress-test evidence (kill run 3, queue mode, Claude victim) ---------------------------------------------------

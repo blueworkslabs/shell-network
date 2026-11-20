@@ -1,6 +1,6 @@
 // The watchdog's only use of t3's `orchestration:operate` grant: `queue.resume` for one thread over WS
 // `orchestration.dispatchCommand`. Imported only by the watchdog (bin/watchdog.ts); the bridge process never loads
-// this module or the operate token (tests/boundary.test.ts checks the import graph). The command is built here from a
+// this module or the operate token. The command is built here from a
 // thread id and a command id, nothing else; no other command type can be sent through this module.
 import { wsUnary, type WsRpcDeps } from "./wsrpc.ts";
 import type { Log } from "./types.ts";

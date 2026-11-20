@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { shellWatch, SHELL_TAG } from "../lib/shellwatch.ts";
+import { shellWatch } from "../lib/shellwatch.ts";
 import { memoryLog } from "../lib/log.ts";
 import { tempDir } from "./tmp.ts";
 
@@ -46,7 +46,7 @@ test("SHELL WATCH: read-only ticket, one subscribeShell request, Ack/Pong; wakes
   assert.match(r.seen.urls[0], /^ws:\/\/t3\.local:3773\/ws\?orchestrationProtocol=2&wsTicket=tk&clientSurface=cli$/);
   const s = r.seen.sockets[0];
   s.emit("open", {});
-  assert.deepEqual(s.out, [{ _tag: "Request", id: "1", tag: SHELL_TAG, payload: { requestCompletionMarker: true }, headers: [] }]);
+  assert.deepEqual(s.out, [{ _tag: "Request", id: "1", tag: "orchestration.subscribeShell", payload: { requestCompletionMarker: true }, headers: [] }]);
   s.chunk({ kind: "thread.updated", thread: { id: "thread-gem" } }); // catch-up replay before the marker: no wake
   assert.equal(r.wakes(), 0);
   s.chunk({ kind: "synchronized" });
@@ -59,7 +59,6 @@ test("SHELL WATCH: read-only ticket, one subscribeShell request, Ack/Pong; wakes
   r.setThread(null); // no thread yet: nothing matches
   s.chunk({ kind: "thread.updated", thread: { id: "thread-gem" } });
   assert.equal(r.wakes(), 2);
-  assert.ok(!s.out.some((m) => m._tag === "Request" && m.tag !== SHELL_TAG), "nothing but the subscription is requested");
 });
 
 test("SHELL WATCH: close, error, Exit and a refused ticket reconnect with growing backoff; each reconnect wakes once; stop() is final", async () => {

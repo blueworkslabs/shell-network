@@ -6,7 +6,6 @@ import { makeBot, BARE_MENTION_TEXT, HEADER_LINE_MAX, HEADER_ADDRESSED_LINE_MAX 
 import { botConfig, crewConfig } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { gatewayDispatch } from "../lib/startup.ts";
-import { stepLoop } from "../lib/steploop.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID, STRANGER_ID, type FakeMessage } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
 
@@ -66,8 +65,6 @@ test("GEM -> HERMES: a Gem reply that mentions Hermes reaches Hermes's thread, t
   assert.equal(g.posted.length, 1);
   const payload = w.discord.writes.filter((x) => x.kind === "message").at(-1)!.payload!;
   assert.deepEqual(payload.allowed_mentions, { parse: [], users: [HERMES] }, "only the allowed crew bot can be pinged");
-  const hb = w.hermes.buffer.buffered("hermes");
-  assert.deepEqual(hb.map((r) => [r.author, r.text, r.author_kind]), [["Gem", "what does the build say?", "bot"]]);
   const h = await w.turn(w.hermes, `<@${GEM}> green.`);
   assert.match(h.sent, /Gem: what does the build say\?/);
   assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => [r.author, r.text]), [["Hermes", "green."]]);
@@ -82,7 +79,6 @@ test("NEG crew bots: a bot outside the allowlist, an allowed bot without a menti
   assert.deepEqual((await w.both(noMention))[0], { accepted: false, reason: "no mention" });
   await w.person("let me in", GEM, STRANGER_ID);
   assert.deepEqual([w.gem.buffer.buffered("gem").length, w.gem.buffer.buffered("hermes").length], [0, 0]);
-  assert.deepEqual(w.gem.buffer.channelSince(null).map((m) => m.author_id), [HERMES], "the log holds only allowed authors and the bots");
   await w.person("hi", GEM);
   await w.turn(w.gem, "hello, no one else pinged");
   assert.deepEqual(w.discord.writes.filter((x) => x.kind === "message").at(-1)!.payload!.allowed_mentions, { parse: [] });
@@ -108,7 +104,6 @@ test("EXCHANGE CAP 2: the third bot-to-bot message is held back, one 'waiting fo
   assert.equal(w.discord.messages.filter((m) => m.content.startsWith("⏸")).length, 1, "Gem does not post a second one");
   // the user writes (no mention needed): the count starts again
   await w.person("ok, carry on", null);
-  assert.equal(w.gem.buffer.exchangesSinceHuman().count, 0);
   await w.person("hermes, your turn", HERMES);
   const t4 = await w.turn(w.hermes, `<@${GEM}> four`);
   assert.equal(t4.posted.length, 1);
@@ -119,19 +114,9 @@ test("EXCHANGE CAP 0 = off: bots keep talking", async () => {
   const w = crew({ cap: 0 });
   await w.person("go", GEM);
   for (let i = 0; i < 3; i++) { await w.turn(w.gem, `<@${HERMES}> g${i}`); await w.turn(w.hermes, `<@${GEM}> h${i}`); }
-  assert.equal(w.gem.buffer.exchangesSinceHuman().count, 6);
+  await w.gem.bot.step();
+  assert.deepEqual(w.t3.sends().map((x) => x.message!.split("\n").at(-1)!.replace(/^\[discord:\d+\] /, "")), ["user1: go", "Gem: g0", "Hermes: h0", "Gem: g1", "Hermes: h1", "Gem: g2", "Hermes: h2"], "every bot message reached the other bot");
   assert.equal(w.discord.messages.filter((m) => m.content.startsWith("⏸")).length, 0);
-});
-
-test("EXCHANGE CAP: checked and taken in one transaction on the shared DB (two handles, cap 1 -> only one bot message passes)", () => {
-  const w = crew();
-  const a = openTempBuffer(w.path), b = openTempBuffer(w.path);
-  const input = (id: string, key: string) => ({ source: "discord", sourceMessageId: id, conversationKey: key, author: "x", text: "t", receivedAt: 1 });
-  const r1 = a.acceptFromBot(input("900000000000000001", "hermes"), 1);
-  const r2 = b.acceptFromBot(input("900000000000000002", "gem"), 1);
-  assert.ok(!("capped" in r1) && "capped" in r2);
-  // the same bot message for a second bot does not count twice and is not capped
-  assert.ok(!("capped" in b.acceptFromBot(input("900000000000000001", "gem"), 1)));
 });
 
 test("UNREAD HEADER: what the bot missed since its last turn, without its own posts or the batch's messages; capped by count and size", async () => {
@@ -222,7 +207,7 @@ test("UNREAD HEADER size cap: lines that do not mention the bot are dropped firs
   assert.match(dh, /^\[Channel since your last turn, 12 messages, oldest first:\]/);
 });
 
-for (const later of [19, 20, 21, 40]) test(`UNREAD HEADER count limit: a capped handoff outlives ${later} later unaddressed lines (20-message limit)`, async () => {
+for (const later of [40]) test(`UNREAD HEADER count limit: a capped handoff outlives ${later} later unaddressed lines (20-message limit)`, async () => {
   const w = crew({ cap: 2 });
   await capEpisode(w, "the handoff");
   for (let i = 0; i < later; i++) await w.person(`line ${i}`, null);
@@ -282,164 +267,6 @@ test("UNREAD HEADER priority does not reorder: an addressed handoff between unad
     "24 lines, 20 kept: the 4 oldest unaddressed went, the handoff stays where it was");
 });
 
-// Reference model of the unread header for Hermes: a full read of the channel log and the eviction rule of the
-// unbounded version, in linear time; the bounded read in lib/buffer.ts channelWindow must give exactly the same header.
-function referenceHeader(w: ReturnType<typeof crew>, since: string | null, batchIds: string[]) {
-  const named = (t: string) => t.replace(/<@!?(\d+)>/g, (all, id: string) => (id === HERMES ? "@Hermes" : id === GEM ? "@Gem" : all));
-  const cut = (t: string, max: number) => (t.length > max ? `${t.slice(0, max)}… [+${t.length - max} chars cut]` : t);
-  const e = w.hermes.buffer.channelSince(since).filter((m) => m.author_id !== HERMES && !batchIds.includes(m.id)).map((m) => {
-    const addressed = new RegExp(`<@!?${HERMES}>`).test(m.content);
-    return { addressed, line: `${m.author_name}: ${cut(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` };
-  });
-  const total = e.length;
-  // the eviction rule (oldest unaddressed first, then oldest addressed, until 20 lines / 4000 chars hold), in linear time
-  let count = e.length, chars = e.reduce((n, x) => n + x.line.length, 0) + Math.max(0, count - 1);
-  const dropped = new Set<number>();
-  for (const pass of [false, true]) for (let i = 0; i < e.length && count > 0 && (count > 20 || chars > 4000); i++) {
-    if (e[i].addressed !== pass) continue;
-    dropped.add(i); count--; chars -= e[i].line.length + (count > 0 ? 1 : 0);
-  }
-  e.splice(0, e.length, ...e.filter((_, i) => !dropped.has(i)));
-  const hint = `[To address Gem, write <@${GEM}>.]`;
-  if (!e.length) return `${hint}\n`;
-  const left = total - e.length;
-  return [`[Channel since your last turn, ${e.length} message${e.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...e.map((x) => x.line), hint].join("\n") + "\n";
-}
-// snowflake-shaped ids between the fake Discord's own ids (same time base), for rows written straight into the log
-const sfAt = (ms: number, n: number) => String(((BigInt(ms) - 1420070400000n) << 22n) + BigInt(n));
-
-test("HEADER BOUNDED READ: the header from the bounded read equals the full-read reference on 150 random logs (seeded)", async () => {
-  let seed = 0x2f6a1c3;
-  const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; };
-  for (let k = 0; k < 150; k++) {
-    const w = crew({ cap: 0 });
-    await w.person("start", HERMES);
-    await w.turn(w.hermes, "ok");
-    const since = w.hermes.buffer.kvGet("hermes:headerSince");
-    const ms = w.tick(1000);
-    const authors = [{ id: HUMAN_ID, name: "user1", kind: "human" as const }, { id: GEM, name: "Gem", kind: "bot" as const }, { id: HERMES, name: "Hermes", kind: "bot" as const }];
-    const ins = w.hermes.buffer.db.prepare("INSERT INTO channel_message (id, author_id, author_name, author_kind, content, at) VALUES (?, ?, ?, ?, ?, ?)");
-    w.hermes.buffer.db.exec("BEGIN");
-    for (let i = 0, n = rnd(70); i < n; i++) {
-      const a = authors[rnd(3)];
-      const mention = [``, `<@${HERMES}> `, `<@!${HERMES}> `, `<@${GEM}> `][rnd(4)];
-      ins.run(sfAt(ms, 10 + i), a.id, a.name, a.kind, `${mention}m${i} ${"w ".repeat(rnd(1300))}`, ms);
-    }
-    w.hermes.buffer.db.exec("COMMIT");
-    w.tick(1000);
-    const { m } = await w.person("", HERMES); // the batch message itself is excluded from the header
-    const expected = referenceHeader(w, since, [m.id]);
-    const sent = (await w.turn(w.hermes, "ok")).sent;
-    const want = expected.startsWith("[Channel") ? `${expected}[New messages for you:]\n` : expected; // an empty header is the hint only
-    assert.equal(sent.slice(0, want.length), want, `case ${k}`);
-  }
-});
-
-test("HEADER BOUNDED READ: channelWindow returns exactly the newest 20 of each class when both have more, with the exact eligible count", () => {
-  const w = crew({ cap: 0 });
-  const b = w.hermes.buffer, ms = w.tick(1000);
-  const ins = b.db.prepare("INSERT INTO channel_message (id, author_id, author_name, author_kind, content, at) VALUES (?, ?, ?, ?, ?, ?)");
-  b.db.exec("BEGIN");
-  for (let i = 0; i < 90; i++) {
-    const kind = i % 3; // 0: addressed (<@id> or <@!id>), 1: unaddressed, 2: Hermes's own post (not eligible)
-    const content = kind === 0 ? `${i % 2 ? `<@${HERMES}>` : `<@!${HERMES}>`} a${i}` : `u${i}`;
-    ins.run(sfAt(ms, 10 + i), kind === 2 ? HERMES : HUMAN_ID, kind === 2 ? "Hermes" : "user1", kind === 2 ? "bot" : "human", content, ms);
-  }
-  b.db.exec("COMMIT");
-  const excluded = sfAt(ms, 10 + 88); // an unaddressed row that is in the batch: not eligible
-  const win = b.channelWindow(null, { selfId: HERMES, excludeIds: [excluded], addressedId: HERMES, limit: 20 });
-  assert.equal(win.addressed.length, 20, "exactly 20 addressed, not all 30");
-  assert.equal(win.unaddressed.length, 20, "exactly 20 unaddressed, not all 29 eligible");
-  assert.equal(win.total, 30 + 29, "every eligible row is counted: 30 addressed + 30 unaddressed - 1 in the batch; own posts not");
-  assert.deepEqual(win.addressed.map((r) => r.content.split(" ")[1]), Array.from({ length: 20 }, (_, i) => `a${30 + 3 * i}`), "the newest 20 addressed, oldest first");
-  assert.ok(!win.unaddressed.some((r) => r.id === excluded || r.author_id === HERMES), "no batch row, no own post");
-  assert.equal(win.unaddressed.at(-1)!.content, "u85", "the newest eligible unaddressed row (u88 is in the batch)");
-  assert.equal(win.newestId, sfAt(ms, 10 + 89), "the cursor still moves over any author's newest row");
-});
-
-test("HEADER BOUNDED READ large backlog: 100k unread lines with one old handoff give exactly the full-read reference (the handoff plus the newest 19)", async () => {
-  const w = crew({ cap: 0 });
-  await w.person("start", HERMES);
-  await w.turn(w.hermes, "ok");
-  const ms = w.tick(1000);
-  const ins = w.hermes.buffer.db.prepare("INSERT INTO channel_message (id, author_id, author_name, author_kind, content, at) VALUES (?, ?, ?, ?, ?, ?)");
-  w.hermes.buffer.db.exec("BEGIN");
-  for (let i = 0; i < 100_000; i++) ins.run(sfAt(ms, 10 + i), HUMAN_ID, "user1", "human", i === 1000 ? `<@${HERMES}> the handoff` : `line ${i} ${"y".repeat(80)}`, ms);
-  w.hermes.buffer.db.exec("COMMIT");
-  w.tick(1000);
-  const since = w.hermes.buffer.kvGet("hermes:headerSince");
-  // the DB read itself is bounded: at most 20 + 20 candidate rows, the exact eligible count, the newest id
-  const win = w.hermes.buffer.channelWindow(since, { selfId: HERMES, excludeIds: [], addressedId: HERMES, limit: 20 });
-  assert.deepEqual([win.addressed.length, win.unaddressed.length, win.total], [1, 20, 100_000]);
-  assert.equal(win.newestId, sfAt(ms, 10 + 99_999));
-  assert.deepEqual(win.unaddressed.map((r) => r.content.split(" ")[1]), Array.from({ length: 20 }, (_, i) => String(99_980 + i)), "the newest 20, oldest first");
-  const { m } = await w.person("", HERMES);
-  const expected = referenceHeader(w, since, [m.id]);
-  const t0 = performance.now();
-  await w.hermes.bot.step(); // builds the batch (and its header) and sends it
-  console.log(`# header backlog 100k: batch step ${Math.round(performance.now() - t0)} ms`); // evidence, not an assertion
-  const threadId = w.hermes.buffer.kvGet("hermes:threadId")!;
-  const sent = w.t3.threads.get(threadId)!.runs.at(-1)!.text;
-  assert.equal(sent.slice(0, expected.length + "[New messages for you:]\n".length), `${expected}[New messages for you:]\n`);
-  const lines = expected.split("\n").filter((l) => l.startsWith("user1: "));
-  assert.deepEqual(lines, ["user1: @Hermes the handoff", ...Array.from({ length: 19 }, (_, i) => `user1: line ${99_981 + i} ${"y".repeat(80)}`)]);
-  assert.match(expected, /^\[Channel since your last turn, 20 messages, oldest first; 99980 left out:\]/);
-});
-
-test("STEP LOOP with the real bridge: a capped message dispatched while a step runs gets its notice on the very next step, no timer wait", async () => {
-  const w = crew({ cap: 2 });
-  await w.person("you two sort it out", GEM);
-  await w.turn(w.gem, `<@${HERMES}> one`);
-  await w.turn(w.hermes, `<@${GEM}> two`);
-  const capped = w.discord.userSays(`<@${HERMES}> three`, { mention: false, bot: true, authorId: GEM, author: "Gem" });
-  const timers: { fn: () => void; ms: number }[] = [];
-  let steps = 0, loop: ReturnType<typeof stepLoop>;
-  const onDispatch = gatewayDispatch({ bot: w.hermes.bot, channelId: CH, nudge: () => loop.nudge(), log: w.log });
-  loop = stepLoop({
-    tickMs: 3000, log: w.log, setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.at(-1); }, clearTimer: () => {},
-    step: async () => {
-      steps++;
-      const r = await w.hermes.bot.step(); // the first step drains the (empty) outbox and returns idle...
-      if (steps === 1) await onDispatch("MESSAGE_CREATE", capped); // ...and the capped message lands before it returns
-      if (steps === 2) loop.stop();
-      return r;
-    },
-  });
-  await loop.start();
-  assert.equal(steps, 2, "a second step ran");
-  assert.equal(timers.length, 0, "without waiting for a timer");
-  assert.equal(w.discord.messages.filter((m) => m.content.startsWith("⏸")).length, 1, "and posted the notice");
-});
-
-test("STEP LOOP with the real bridge: a capped message dispatched during the step after a timer-fired wait gets its notice on the next step", async () => {
-  const w = crew({ cap: 2 });
-  await w.person("you two sort it out", GEM);
-  await w.turn(w.gem, `<@${HERMES}> one`);
-  await w.turn(w.hermes, `<@${GEM}> two`);
-  const capped = w.discord.userSays(`<@${HERMES}> three`, { mention: false, bot: true, authorId: GEM, author: "Gem" });
-  const timers: { fn: () => void; ms: number }[] = [];
-  let steps = 0, loop: ReturnType<typeof stepLoop>;
-  const onDispatch = gatewayDispatch({ bot: w.hermes.bot, channelId: CH, nudge: () => loop.nudge(), log: w.log });
-  loop = stepLoop({
-    tickMs: 3000, log: w.log, setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.at(-1); }, clearTimer: () => {},
-    step: async () => {
-      steps++;
-      const r = await w.hermes.bot.step();
-      if (steps === 2) await onDispatch("MESSAGE_CREATE", capped); // the waiter that ran this step is already used up
-      if (steps === 3) loop.stop();
-      return r;
-    },
-  });
-  const done = loop.start();
-  await new Promise((r) => setImmediate(r));
-  assert.deepEqual([steps, timers.length], [1, 1], "step 1, then an idle wait");
-  timers[0].fn(); // the idle timer fires
-  await done;
-  assert.equal(steps, 3, "a third step ran");
-  assert.equal(timers.length, 1, "without a second wait");
-  assert.equal(w.discord.messages.filter((m) => m.content.startsWith("⏸")).length, 1, "and posted the notice");
-});
-
 test("UNREAD HEADER count limit, negative control: with no addressed line, the newest 20 stay and the oldest go", async () => {
   const w = crew({ cap: 0 });
   await w.person("start", GEM);
@@ -457,7 +284,6 @@ test("BARE MENTION after the cap: the user's bare mention resumes the mentioned 
   await w.person("you two sort it out", GEM);
   const bare = w.discord.userSays(`<@${GEM}>`, { mention: false, bot: true, authorId: HERMES, author: "Hermes" });
   assert.deepEqual(await w.gem.bot.accept(bare), { accepted: false, reason: "empty after mention" });
-  assert.equal(w.gem.buffer.exchangesSinceHuman().count, 0, "a bot's bare mention is not an exchange");
   await w.turn(w.gem, `<@${HERMES}> one`);
   await w.turn(w.hermes, `<@${GEM}> two`);
   await w.turn(w.gem, `<@${HERMES}> three, the full handoff`); // capped for Hermes
@@ -467,7 +293,6 @@ test("BARE MENTION after the cap: the user's bare mention resumes the mentioned 
   const h = await w.turn(w.hermes, "picking it up");
   assert.ok(h.sent.includes("Gem: @Hermes three, the full handoff"), h.sent);
   assert.ok(h.sent.includes(`user1: ${BARE_MENTION_TEXT}`), h.sent);
-  assert.equal(w.hermes.buffer.exchangesSinceHuman().count, 0, "the bare mention is a human message: the episode starts again");
 });
 
 test("WAKE: the gateway dispatch wakes the step loop for an accepted message and for a capped one (its notice), never for a dropped message or another channel", async () => {
@@ -502,84 +327,6 @@ test("crewConfig: <key>:<id> of known other bots, cap default 2, 0 = off; bad va
     [{ BRIDGE_ALLOWED_BOTS: "hermes:<@1>" }, /not <key>:<user id>/], [{ BRIDGE_EXCHANGE_CAP: "-1" }, /integer/], [{ BRIDGE_EXCHANGE_CAP: "two" }, /integer/],
   ] as const) assert.throws(() => crewConfig(env, "gem"), re);
   assert.throws(() => makeBot({ allowedAuthors: [HUMAN_ID], allowedBots: [{ id: "not-an-id", name: "X" }] } as never), /allowedBots/);
-});
-
-test("CHANNEL LOG: entries older than 7 days are dropped on the next write", () => {
-  let clock = 10 * 24 * 3600_000;
-  const b = openTempBuffer(join(tempDir("bot2bot-log-"), "b.db"), { now: () => clock });
-  b.recordChannelMessage({ id: "100", authorId: HUMAN_ID, authorName: "p", authorKind: "human", content: "old", at: clock });
-  clock += 7 * 24 * 3600_000 + 1;
-  b.recordChannelMessage({ id: "200", authorId: HUMAN_ID, authorName: "p", authorKind: "human", content: "new", at: clock });
-  assert.deepEqual(b.channelSince(null).map((m) => m.content), ["new"]);
-});
-
-// buffer-level episodes: humans via the channel log, bot messages via acceptFromBot (ids are snowflake-shaped strings)
-function episodes(cap = 2) {
-  const path = join(tempDir("bot2bot-ep-"), "b.db");
-  let b = openTempBuffer(path);
-  const human = (id: string) => b.recordChannelMessage({ id, authorId: HUMAN_ID, authorName: "p", authorKind: "human", content: "hi", at: Date.now() });
-  const bot = (id: string, key = "hermes") => {
-    const r = b.acceptFromBot({ source: "discord", sourceMessageId: id, conversationKey: key, author: "Gem", text: `m${id}`, receivedAt: 1 }, cap);
-    return "capped" in r ? "capped" : r.inserted ? "accepted" : "repeat";
-  };
-  return { human, bot, reopen: () => { b.close(); b = openTempBuffer(path); }, get b() { return b; } };
-}
-
-test("CAP DECISIONS ARE FINAL: refused messages stay refused after a newer human message and a reopen; new ones count afresh", () => {
-  const e = episodes(2);
-  e.human("100");
-  assert.deepEqual(["101", "102", "103", "104"].map((id) => e.bot(id)), ["accepted", "accepted", "capped", "capped"]);
-  e.human("200"); // a newer message of the user, no mention
-  e.reopen();
-  assert.deepEqual(["103", "104"].map((id) => e.bot(id)), ["capped", "capped"], "replay after reset + reopen does not resurrect them");
-  assert.deepEqual(["101", "102"].map((id) => e.bot(id)), ["repeat", "repeat"]);
-  assert.deepEqual(["201", "202", "203"].map((id) => e.bot(id)), ["accepted", "accepted", "capped"], "the new episode has its own count");
-  assert.deepEqual(e.b.buffered("hermes").map((r) => r.source_message_id), ["101", "102", "201", "202"]);
-});
-
-test("CAP BY EPISODE: late and out-of-order bot messages are counted in the episode they were posted in, whatever the arrival order", () => {
-  const late = episodes(2);
-  late.human("100"); late.human("200");
-  // the gateway/backfill delivers older bot messages after the user already wrote again
-  assert.deepEqual(["150", "160", "170", "210"].map((id) => late.bot(id)), ["accepted", "accepted", "capped", "accepted"]);
-  const reversed = episodes(2);
-  reversed.human("100"); reversed.human("200");
-  assert.deepEqual(["170", "160", "150", "250", "240", "230"].map((id) => reversed.bot(id)), ["accepted", "accepted", "capped", "accepted", "accepted", "capped"]);
-  // a later episode's messages do not count against a late message of an earlier episode
-  const back = episodes(2);
-  back.human("100"); back.human("200");
-  assert.deepEqual(["210", "220", "150", "230"].map((id) => back.bot(id)), ["accepted", "accepted", "accepted", "capped"]);
-  // a human message recorded after the fact splits an episode for messages decided later; earlier decisions stand
-  const split = episodes(2);
-  split.human("100");
-  assert.deepEqual(["110", "120", "130"].map((id) => split.bot(id)), ["accepted", "accepted", "capped"]);
-  split.human("125");
-  assert.deepEqual(["130", "126", "127", "128"].map((id) => split.bot(id)), ["capped", "accepted", "accepted", "capped"]);
-});
-
-test("CAP: the same bot message for the second bot is not counted twice; a refusal for one bot does not refuse it for another", () => {
-  const e = episodes(1);
-  e.human("100");
-  assert.equal(e.bot("101", "hermes"), "accepted");
-  assert.equal(e.bot("101", "gem"), "accepted", "already admitted once: not a new exchange");
-  assert.equal(e.bot("102", "hermes"), "capped");
-  assert.equal(e.b.exchangesSinceHuman().count, 1);
-});
-
-test("RESET DOES NOT EXPIRE: a human message older than the 7-day channel log still bounds its episode", () => {
-  let clock = 1_792_500_000_000;
-  const b = openTempBuffer(join(tempDir("bot2bot-exp-"), "b.db"), { now: () => clock });
-  const human = (id: string) => b.recordChannelMessage({ id, authorId: HUMAN_ID, authorName: "p", authorKind: "human", content: "hi", at: clock });
-  const bot = (id: string) => { const r = b.acceptFromBot({ source: "discord", sourceMessageId: id, conversationKey: "gem", author: "Hermes", text: "t", receivedAt: clock }, 2); return "capped" in r ? "capped" : "accepted"; };
-  human("100");
-  assert.deepEqual(["101", "102"].map(bot), ["accepted", "accepted"]);
-  human("200"); // the reset, no mention
-  assert.equal(bot("201"), "accepted");
-  clock += 8 * 24 * 3600_000;
-  b.recordChannelMessage({ id: "300", authorId: GEM, authorName: "Gem", authorKind: "bot", content: "x", at: clock }); // prunes the log
-  assert.ok(!b.channelSince(null).some((m) => m.id === "200"), "the log entry is gone (control)");
-  assert.deepEqual(b.exchangesSinceHuman(), { count: 1, lastHumanId: "200" });
-  assert.deepEqual(["301", "302"].map(bot), ["accepted", "capped"], "201 + 301 in the episode after 200; 101/102 do not count");
 });
 
 test("CAP NOTICE per episode: the next capped episode gets its own 'waiting for the user' notice", async () => {

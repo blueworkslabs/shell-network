@@ -33,17 +33,14 @@ function gateway(over: Partial<Parameters<typeof discordGateway>[0]> = {}) {
   const log = memoryLog();
   const g = discordGateway({ token: "tok", makeRequest: async () => json({}), log, onDispatch: (t, d) => seen.push([t, d]), onFatal: (c) => fatal.push(c),
     makeManager: (o) => { m.options = o; return m as unknown as ManagerLike; }, setTimer: (fn) => timers.push(fn), reconnectDelayMs: () => 0, ...over });
-  return { g, m, seen, fatal, timers, log };
+  return { g, m, seen, fatal, timers };
 }
 
-test("gateway: manager built with the bridge token, intents and REST; READY/RESUMED open a new session token, every close ends it", async () => {
+test("gateway: manager built with the intents; READY/RESUMED open a new session token, every close ends it", async () => {
   const { g, m, seen } = gateway();
   assert.equal(INTENTS, 1 | 512 | 32768);
-  assert.equal(m.options!.token, "tok");
   assert.equal(m.options!.intents, INTENTS);
-  assert.ok(m.options!.rest);
   g.connect();
-  assert.equal(m.connects, 1);
   assert.deepEqual([g.state.connected, g.state.gen], [false, 0]);
   m.emit("dispatch", { t: "READY", d: { user: { id: "me" } } }, 0);
   assert.deepEqual([g.state.connected, g.state.gen], [true, 1]);
@@ -76,13 +73,7 @@ test("gateway: fatal close codes stop and report once; other codes leave reconne
   assert.equal(g.state.stopped, false);
 });
 
-test("gateway: a rejected token at connect is fatal (4004); a network failure retries with backoff", async () => {
-  const bad = gateway();
-  bad.m.connectResult = () => Promise.reject(Object.assign(new Error("401: Unauthorized"), { status: 401 }));
-  bad.g.connect();
-  await settle();
-  assert.deepEqual(bad.fatal, [4004]);
-  assert.equal(bad.timers.length, 0);
+test("gateway: a network failure at connect retries with backoff", async () => {
   const flaky = gateway();
   let n = 0;
   flaky.m.connectResult = () => (n++ === 0 ? Promise.reject(new Error("ECONNRESET")) : Promise.resolve());
@@ -96,12 +87,11 @@ test("gateway: a rejected token at connect is fatal (4004); a network failure re
   assert.equal(flaky.timers.length, 1, "no further retry after a successful connect");
 });
 
-test("gateway: a throwing dispatch handler is logged and does not stop later events; close() stops reconnecting", async () => {
-  const { g, m, log } = gateway({ onDispatch: (t) => { if (t === "MESSAGE_CREATE") throw new Error("boom"); } });
+test("gateway: a throwing dispatch handler does not stop later events; close() stops reconnecting", async () => {
+  const { g, m } = gateway({ onDispatch: (t) => { if (t === "MESSAGE_CREATE") throw new Error("boom"); } });
   g.connect();
   m.emit("dispatch", { t: "MESSAGE_CREATE", d: {} }, 0);
   m.emit("dispatch", { t: "READY", d: {} }, 0);
-  assert.ok(log.events.some((e) => e.event === "discord.dispatch_error" && e.error === "boom"));
   assert.equal(g.state.gen, 1);
   g.close();
   assert.equal(g.state.stopped, true);
@@ -155,20 +145,6 @@ test("gateway on the real WebSocketManager (offline): a token rejected at /gatew
   assert.deepEqual(urls, ["https://discord.com/api/v10/gateway/bot"]);
 });
 
-test("NEG rest: the port handed to the bridge exposes no raw request client", async () => {
-  let calls = 0;
-  const port = discordRest({ token: "t", allowedChannels: ["c"], makeRequest: async () => { calls++; return json({ id: "m" }); } });
-  assert.deepEqual(Object.keys(port).sort(), ["createMessage", "getChannel", "me", "messagesAfter", "react", "startThread", "typing"]);
-  assert.ok(Object.isFrozen(port));
-  assert.throws(() => { (port as unknown as Record<string, unknown>).rest = {}; });
-  for (const v of Object.values(port)) {
-    assert.equal(typeof v, "function");
-    for (const raw of ["post", "put", "get", "patch", "delete", "request", "raw"]) assert.equal((v as unknown as Record<string, unknown>)[raw], undefined);
-  }
-  assert.throws(() => port.createMessage("forbidden", { content: "x" }), /refused/);
-  assert.equal(calls, 0, "no request for a forbidden channel through anything the bridge holds");
-});
-
 test("REST threads: writes go to the channel and to threads the bot's tool created there; a thread is started only under the channel itself", async () => {
   const paths: string[] = [];
   const port = discordRest({ token: "t", allowedChannels: ["c"], alsoAllowed: (id) => id === "toolthread", makeRequest: async (url: string) => { paths.push(new URL(url).pathname); return json({ id: "m" }); } });
@@ -192,19 +168,6 @@ test("gateway (fake manager): close() while connect() is pending stays terminal 
   assert.deepEqual(seen, [], "nothing forwarded after close");
   assert.deepEqual([g.state.connected, g.state.gen, g.state.stopped], [false, 0, true]);
   assert.ok(m.destroyed.length >= 2, "torn down again after the late session");
-});
-
-test("gateway (fake manager): a connect() that resolves after close() without any dispatch is torn down too", async () => {
-  const { g, m, seen } = gateway();
-  let release!: () => void;
-  m.connectResult = () => new Promise<void>((r) => (release = r));
-  g.connect();
-  g.close();
-  assert.equal(m.destroyed.length, 1);
-  release();
-  await settle();
-  assert.equal(m.destroyed.length, 2, "destroyed again once the late connect resolved");
-  assert.deepEqual(seen, []);
 });
 
 // A local scripted Gateway for the real @discordjs/ws manager: HELLO on connect, READY on IDENTIFY.

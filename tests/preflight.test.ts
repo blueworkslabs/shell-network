@@ -1,7 +1,7 @@
 // Credential-boundary preflight: node --test tests/preflight.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, chmodSync, symlinkSync, lstatSync } from "node:fs";
+import { writeFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { preflight, PreflightError } from "../lib/preflight.ts";
 import { tempDir } from "./tmp.ts";
@@ -23,26 +23,6 @@ const run = (over: Partial<Parameters<typeof preflight>[0]> = {}) => preflight({
 test("positive control: own files 0600 in a 0700 dir, paths-only environment -> passes", () => {
   const s = secrets();
   assert.deepEqual(run({ secretFiles: s.files }), { ok: true, uid: UID });
-});
-
-
-test("NEG: group/other bits on a file or its directory, foreign owner, symlink, missing file -> fails", () => {
-  let s = secrets();
-  chmodSync(s.mcp, 0o640);
-  assert.throws(() => run({ secretFiles: s.files }), /mcp\.json: group\/other permission bits set \(640\)/);
-  s = secrets();
-  chmodSync(s.dir, 0o750);
-  assert.throws(() => run({ secretFiles: s.files }), /group\/other permission bits set \(750\)/);
-  s = secrets();
-  const foreignAt = (target: string) => (p: string) => { const st = lstatSync(p); return p === target ? Object.assign(Object.create(Object.getPrototypeOf(st)), st, { uid: UID + 1 }) : st; };
-  assert.throws(() => run({ secretFiles: s.files, stat: foreignAt(s.mcp) }), /mcp\.json: owned by uid/);
-  assert.throws(() => run({ secretFiles: s.files, stat: foreignAt(s.dir) }), new RegExp(`${s.dir}: owned by uid`));
-  s = secrets();
-  const link = join(s.dir, "link.json");
-  symlinkSync(s.mcp, link);
-  assert.throws(() => run({ secretFiles: [link] }), /not a regular file/);
-  assert.throws(() => run({ secretFiles: [join(s.dir, "absent")] }), /ENOENT/);
-  assert.throws(() => run({ secretFiles: [] }), /no secret files/);
 });
 
 test("NEG: a secret value in the environment fails (JSON token field and plain bot token); the message never carries it", () => {

@@ -8,7 +8,6 @@ import { memoryLog } from "../lib/log.ts";
 import { gatewayDispatch } from "../lib/startup.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID, STRANGER_ID, type FakeMessage } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
-
 import { crewFile, exampleCrew } from "./crew-fixture.ts";
 
 const CH = "shell-network";

@@ -1,4 +1,3 @@
-import { crewFile } from "./crew-fixture.ts";
 // One writer per bot token (lib/lock.ts). Cross-process checks use real child processes: an fcntl lock never
 // conflicts with its own process, so a same-process second acquire would prove nothing.
 import { test, afterEach } from "node:test";
@@ -9,6 +8,7 @@ import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { acquireBotLock, lockPath, LockLostError } from "../lib/lock.ts";
 import { tempDir, openTempBuffer } from "./tmp.ts";
+import { crewFile } from "./crew-fixture.ts";
 
 const CHILD = new URL("./lock-child.ts", import.meta.url).pathname;
 const BRIDGE = new URL("../bin/bridge.ts", import.meta.url).pathname;

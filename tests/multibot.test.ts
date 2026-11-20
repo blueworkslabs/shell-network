@@ -7,7 +7,6 @@ import { bridgeConfig } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
-
 import { crewFile } from "./crew-fixture.ts";
 
 const CH = "shell-network";

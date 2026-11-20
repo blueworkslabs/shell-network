@@ -5,7 +5,7 @@
 import { wsUnary, type WsRpcDeps } from "./wsrpc.ts";
 import type { Log } from "./types.ts";
 
-export const RESUME_TAG = "orchestration.dispatchCommand";
+const RESUME_TAG = "orchestration.dispatchCommand";
 
 export function operateClient({ origin, token, log, timeoutMs = 15_000, deps = {} }: { origin: string; token: string; log: Log; timeoutMs?: number; deps?: WsRpcDeps }) {
   if (!token) throw new Error("operateClient: token required");

@@ -13,21 +13,18 @@ export class ToolDbError extends Error {}
 // ids (cap reset boundary), the bridge's tool config,
 // the outbox and the tool's own requests (idempotent replay, cap reservations). Inserts: an outbox entry and its
 // request row; posting, retries and every state change stay with the bridge.
-export const TOOL_READ_TABLES: readonly string[] = ["channel_message", "human_message", "tool_config", "outbox", "tool_request"];
-export const TOOL_INSERT_TABLES: readonly string[] = ["outbox", "tool_request"];
-const NEVER_WRITE = new Set(["inbound", "batch", "kv"]);
+const READ_TABLES = ["channel_message", "human_message", "tool_config", "outbox", "tool_request"];
+const INSERT_TABLES = ["outbox", "tool_request"];
 
 export interface ToolDb {
-  readonly schemaVersion: number;
   close(): void;
   _db: DatabaseSync; // the confined connection (lib/tools.ts; tests)
 }
 
-export function openToolDb(path: string, { read = TOOL_READ_TABLES, insert = TOOL_INSERT_TABLES, expectVersion = BUFFER_SCHEMA_VERSION }: { read?: readonly string[]; insert?: readonly string[]; expectVersion?: number } = {}): ToolDb {
-  for (const t of insert) if (NEVER_WRITE.has(t)) throw new ToolDbError(`tooldb: ${t} is never writable by the tool`);
+export function openToolDb(path: string): ToolDb {
   if (!existsSync(path)) throw new ToolDbError(`tooldb: ${path} does not exist (the bridge creates it)`);
   const db = new DatabaseSync(path, { timeout: 5000 });
-  const readable = new Set([...read, ...insert]), insertable = new Set(insert);
+  const readable = new Set([...READ_TABLES, ...INSERT_TABLES]), insertable = new Set(INSERT_TABLES);
   db.setAuthorizer((action, arg1, arg2) => {
     switch (action) {
       case C.SQLITE_SELECT: case C.SQLITE_TRANSACTION: case C.SQLITE_SAVEPOINT: case C.SQLITE_FUNCTION: return C.SQLITE_OK;
@@ -44,9 +41,9 @@ export function openToolDb(path: string, { read = TOOL_READ_TABLES, insert = TOO
     db.close();
     throw new ToolDbError(`tooldb: cannot read the schema version of ${path}: ${(e as Error).message}`);
   }
-  if (version !== expectVersion) {
+  if (version !== BUFFER_SCHEMA_VERSION) {
     db.close();
-    throw new ToolDbError(`tooldb: ${path} has schema version ${version}, this tool is built for ${expectVersion}; refusing`);
+    throw new ToolDbError(`tooldb: ${path} has schema version ${version}, this tool is built for ${BUFFER_SCHEMA_VERSION}; refusing`);
   }
-  return { schemaVersion: version, close: () => db.close(), _db: db };
+  return { close: () => db.close(), _db: db };
 }

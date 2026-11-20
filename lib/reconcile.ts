@@ -115,9 +115,3 @@ export function settlement(batch: BatchView, { projection = null, queue = null }
   if (queue.items.some((i) => runs.some((r) => r.id === i.queuedRunId))) return { settled: false, why: "t3 still has a queue entry for it" };
   return { settled: true, why: runs.length ? "every run of it is terminal" : "t3 holds no run for it" };
 }
-
-// Order guard (stress-test run 3: later input overtook a held one). The oldest batch that is not delivered or explicitly
-// resolved/cancelled blocks every newer send for the conversation; escalation does not unblock.
-export function blockingBatch<T extends Pick<BatchRow, "id" | "status">>(batches: T[]): T | null {
-  return [...batches].sort((a, b) => a.id - b.id).find((b) => !["delivered", "resolved", "cancelled"].includes(b.status)) ?? null;
-}

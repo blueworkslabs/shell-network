@@ -6,8 +6,7 @@
 //     (a failed queue release leaves the batch `held`, so it surfaces here);
 //   - timers run from status_since (start of the current status episode); repeated retry results in the same
 //     status do not restart them;
-//   - one alert per batch and status episode: skipped when alerted_episode === episode. Each alert carries its
-//     episode, which the caller passes back to markAlerted(id, episode) after posting.
+//   - one alert per batch and status episode: skipped when alerted_episode === episode.
 //   - the text names the agent only: no batch/message/request ids, no paths, no raw error text. An escalated
 //     batch shows the reconcile state word (e.g. "payload-mismatch") if its last_error starts with one.
 import type { BatchRow, BatchStatus } from "./types.ts";

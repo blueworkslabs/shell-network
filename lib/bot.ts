@@ -49,7 +49,7 @@ export interface BotOptions {
 const PART = 1900;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
-export const splitReply = (text: unknown): string[] => {
+const splitReply = (text: unknown): string[] => {
   const t = String(text ?? "").trim() || "(finished without a text reply)";
   const parts: string[] = [];
   for (let i = 0; i < t.length; i += PART) parts.push(t.slice(i, i + PART));
@@ -58,7 +58,7 @@ export const splitReply = (text: unknown): string[] => {
 const byId = (a: { id: string }, b: { id: string }) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
 const PAGE = 100;
 const DISCORD_EPOCH = 1420070400000n;
-export const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) ) - DISCORD_EPOCH) << 22n;
+const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) ) - DISCORD_EPOCH) << 22n;
 
 export function makeBot({ name, conversationKey, channelId, botUserId, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
@@ -433,9 +433,7 @@ export function makeBot({ name, conversationKey, channelId, botUserId, allowedAu
   }
 
   // A delivered batch's reply, queued part by part (part 0 replies to the batch's first message). False if the
-  // reply cannot be read in full yet. A part with a pre-outbox post marker (crash between its POST and its record
-  // in an older version) is queued as `posting` with the old search start, so it is looked for before anything is
-  // posted again.
+  // reply cannot be read in full yet.
   function queueReply(b: BatchRow, read: ThreadRead): boolean {
     // The batch's run: as acknowledged, else the run of its stored user message (never "whatever ran last").
     const runId = batchRunId(b, read);
@@ -454,11 +452,8 @@ export function makeBot({ name, conversationKey, channelId, botUserId, allowedAu
     const done = new Set(buffer.postedParts(b.id).map((p) => p.part));
     for (let i = 0; i < parts.length; i++) {
       if (done.has(i) || buffer.outboxEntry(conversationKey, `reply:${b.id}:${i}`)) continue;
-      const legacy = buffer.kvGet(K(`post:${b.id}:${i}`)) !== null;
-      const prev = i === 0 ? null : buffer.postedParts(b.id).find((p) => p.part === i - 1)?.channel_message_id ?? null;
       buffer.enqueue(conversationKey, { key: `reply:${b.id}:${i}`, content: parts[i], nonce: `b${b.id}p${i}`,
-        replyTo: i === 0 ? first.source_message_id : null, users: mentionsIn(parts[i]), meta: { parts: parts.length },
-        ...(legacy ? { state: "posting" as const, boundary: prev ?? first.source_message_id } : {}) });
+        replyTo: i === 0 ? first.source_message_id : null, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
     }
     return true;
   }

@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { errText } from "./log.ts";
 import type { Log } from "./types.ts";
 
-export const SHELL_TAG = "orchestration.subscribeShell";
+const SHELL_TAG = "orchestration.subscribeShell";
 const PROTOCOL = 2; // t3 0.1.0 orchestration protocol (as lib/vendor/push.mjs)
 
 export interface ShellWatchDeps {

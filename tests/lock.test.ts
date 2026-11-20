@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { acquireBotLock, lockPath, LockLostError } from "../lib/lock.ts";
 import { tempDir, openTempBuffer } from "./tmp.ts";
+import { crewFile } from "./crew-fixture.ts";
 
 const CHILD = new URL("./lock-child.ts", import.meta.url).pathname;
 const BRIDGE = new URL("../bin/bridge.ts", import.meta.url).pathname;
@@ -76,7 +77,7 @@ test("LOCK LOST: check() throws when the lock transaction ends or the lock file 
 
 test("BRIDGE ORDER: a second bridge for a bot exits 4 'lease held' before it reads any secret file; without the holder it gets to the preflight", async () => {
   const dir = tempDir("bridge-lock-");
-  const env = { PATH: process.env.PATH!, TMPDIR: process.env.TMPDIR ?? "/tmp", BRIDGE_BOT: "gem", BRIDGE_DB: join(dir, "buffer.db"),
+  const env = { PATH: process.env.PATH!, TMPDIR: process.env.TMPDIR ?? "/tmp", BRIDGE_BOT: "gem", BRIDGE_CREW_FILE: crewFile(), BRIDGE_DB: join(dir, "buffer.db"),
     BRIDGE_DISCORD_TOKEN: join(dir, "missing-token"), T1_TOKEN: join(dir, "missing-mcp"), T1_PUSH_TOKEN: join(dir, "missing-push") };
   const run = () => spawnSync(process.execPath, [BRIDGE], { env, encoding: "utf8", timeout: 20_000 });
   const h = await holder(dir);

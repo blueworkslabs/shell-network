@@ -79,7 +79,8 @@ the tool's sends, reactions and threads.
 
 ## Bot-to-bot and the exchange cap
 
-- A bot accepts mentions from the bots in `BRIDGE_ALLOWED_BOTS`.
+- A bot takes its identity from `BRIDGE_CREW_FILE` and accepts mentions from the other members, including
+  talk-only members without a t3 instance. The crew file is validated once at startup.
 - An episode runs from one message of an allowlisted person to the next. Within an episode, at most
   `BRIDGE_EXCHANGE_CAP` bot-to-bot messages are accepted. After that, one "waiting for the user" notice is posted
   right away: a capped message wakes the step loop. A mention from the user, even a bare one, resumes the bots, and

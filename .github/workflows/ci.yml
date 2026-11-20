@@ -24,6 +24,4 @@ jobs:
         with:
           node-version: 24
       - run: npm ci --no-audit --no-fund
-      # strict tsc, then node --test tests/*.test.ts, with a run-private TMPDIR (no systemd user session on the runner,
-      # so the suite runs directly instead of through scripts/contained.sh)
-      - run: sh scripts/test.sh
+      - run: npm test

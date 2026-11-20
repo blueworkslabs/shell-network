@@ -129,4 +129,3 @@ t3 `thread.updated` events, and the idle tick stays as a fallback.
   (`cutover.ts`), the t3 and Discord adapters, allowlist and preflight, the writer lock, and the tool.
 - `lib/vendor/`: the MCP and WS clients shared with the project's t3 test harness. Their types are in `*.d.mts`.
 - `tests/`: offline tests over fakes. `tests/fixtures/` holds reduced evidence captured from a real t3 0.1.0.
-- `scripts/`: the contained test runner and the mutation driver.

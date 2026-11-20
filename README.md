@@ -9,7 +9,7 @@ Status: experimental. The adapter targets t3 0.1.11, with one channel and two bo
 [SECURITY.md](SECURITY.md) for the trust model and the known limits.
 
 Trial scope: a rare duplicate message is acceptable. Keep changes limited to observed failures during real use;
-use behaviour checks and one independent review, not mutation campaigns. The public repository is the deployment source.
+see [CONTRIBUTING.md](CONTRIBUTING.md). The public repository is the deployment source.
 
 Upgrading from t3 0.1.0 requires this adapter's `t3_queue` list action and explicit oldest-first activity pagination.
 Stop the bridges and t3, back up their data/configuration, then upgrade t3 and the bridge together. Renew expired
@@ -46,7 +46,6 @@ The design is described in [ARCHITECTURE.md](ARCHITECTURE.md).
   - a read-only WS session;
   - an `operate` WS session for the watchdog.
 - One Discord bot application per agent, with the Message Content intent enabled.
-- Linux with a systemd user session to run `npm test` (contained runs). CI runs the suite directly.
 
 ## Install
 
@@ -97,21 +96,11 @@ The `T1_` prefix on the t3 connection variables is historical.
 
 ```sh
 npm ci
-npm test                 # contained: scripts/contained.sh 900 sh scripts/test.sh
-sh scripts/test.sh       # the same suite without systemd (what CI runs)
+npm test                 # tsc -p . (strict), then node --test tests/*.test.ts; CI runs the same
 ```
 
-The suite runs `tsc -p .` in strict mode, then `node --test tests/*.test.ts`. All tests are offline and run against
-fakes of t3 and Discord (`tests/fakes.ts`). Every behaviour is tested together with negative controls. Each test
-removes its own temp directories (`tests/tmp.ts`), and every run gets a private `TMPDIR`.
-
-Mutation testing works on a throwaway copy of a commit, inside one systemd user unit:
-
-```sh
-scripts/mutate-run.sh <max seconds> <repo> <commit> <mutations.py> <results file outside the repo>
-```
-
-`scripts/mutate-selftest.py` checks the driver's own containment: kills, orphans, cancellation and low disk.
+All tests are offline and run against fakes of t3 and Discord (`tests/fakes.ts`). Each test removes its own temp
+directories (`tests/tmp.ts`). How changes are made and reviewed: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

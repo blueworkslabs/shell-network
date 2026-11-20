@@ -5,7 +5,7 @@
   "description": "Discord bridge for t3 agent threads: durable buffer, serialized outbox, bot-to-bot cap, watchdog and a confined Discord MCP tool.",
   "license": "MIT",
   "scripts": {
-    "test": "sh scripts/contained.sh 900 sh scripts/test.sh",
+    "test": "tsc -p . && node --test tests/*.test.ts",
     "typecheck": "tsc -p ."
   },
   "engines": {

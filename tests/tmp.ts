@@ -1,7 +1,5 @@
-// Test temp lifecycle (not a test file). Test and mutation runs once left hundreds of thousands of
-// temp directories in /tmp. Every temp directory and buffer a test makes through this module is closed/removed after
-// that test (and again after the file); a killed run's leftovers are removed by the runner, which gives every run its
-// own TMPDIR (scripts/test.sh, and the mutation driver per mutation).
+// Test temp lifecycle (not a test file). Earlier test runs once filled /tmp. Every temp directory and buffer a test
+// makes through this module is closed/removed after that test (and again after the file).
 import { after, afterEach } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

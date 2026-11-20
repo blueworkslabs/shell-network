@@ -103,8 +103,6 @@ t3 `thread.updated` events, and the idle tick stays as a fallback.
   episode ends, one follow-up is posted. Alert texts name the agent only: no ids, paths or raw errors.
 - **Watchdog**: findings need the same condition in two snapshots at least 60 s apart.
   - Held queue: `queue.resume`, up to 3 times, 2 min apart, then a notice.
-  - Wedged Codex session: one controlled t3 restart, and only when no other thread has an active turn. There is at
-    most one restart per 10 minutes; anything more becomes a notice.
   - Every action is recorded before it is taken.
 
 ## Discord tool

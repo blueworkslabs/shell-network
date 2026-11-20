@@ -865,11 +865,10 @@ test("STRESS-TEST REPLAY (offline): Claude run fails with a queued EXTRA -> held
   const wd = makeWatchdog({
     store: w.buffer, log: w.log, now: w.now, graceMs: 0,
     async snapshot() {
-      return { at: w.now(), t3MainPid: 1, processes: [], instances: {}, activeThreads: [],
+      return { at: w.now(),
         threads: [{ threadId: w.thread(), runs: w.runs().map((r) => ({ id: r.runId, ordinal: r.ordinal, status: r.status, queueHeld: r.queueHeld ?? false, providerInstanceId: "claudeI" })) }] };
     },
     async resumeQueue(threadId) { w.t3.resume(threadId); },
-    async restartT3() { throw new Error("not expected"); },
   });
   await wd.tick(); w.tick(1000); await wd.tick(); // two snapshots confirm the hold
   await settle(w, 2);

@@ -3,13 +3,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { memoryLog } from "../lib/log.ts";
-import { makeWatchdog, type WatchdogSnapshot } from "../lib/watchdog-run.ts";
-import type { Proc, SnapshotRun } from "../lib/watchdog.ts";
+import { makeWatchdog } from "../lib/watchdog-run.ts";
+import type { Snapshot, SnapshotRun } from "../lib/watchdog.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
 
 const MIN = 60_000;
-const T3: Proc = { pid: 100, ppid: 1, args: "/usr/bin/node /opt/t3/bin.mjs serve" };
-const APP: Proc = { pid: 200, ppid: 100, args: "/home/u/.local/bin/codex app-server" };
 const GEM = "thread-gem", HERMES = "thread-hermes", OTHER = "thread-other";
 
 function world() {
@@ -18,23 +16,17 @@ function world() {
   store.kvSet("gem:threadId", GEM);
   store.kvSet("hermes:threadId", HERMES);
   const t = {
-    procs: [T3, APP] as Proc[],
     runs: new Map<string, SnapshotRun[]>([[GEM, []], [HERMES, []], [OTHER, []]]),
-    active: [] as string[],
     resumes: [] as { threadId: string; commandId: string }[],
-    restarts: 0,
-    restartFails: false,
   };
   const log = memoryLog();
   let ids = 0;
   const wd = makeWatchdog({
     store, log, now: () => clock, newId: () => `cmd-${++ids}`,
-    async snapshot(): Promise<WatchdogSnapshot> {
-      return { at: clock, t3MainPid: 100, processes: [...t.procs], instances: { codexI: "codex", claudeI: "claudeAgent" },
-        threads: [...t.runs].map(([threadId, runs]) => ({ threadId, runs: runs.map((r) => ({ ...r })) })), activeThreads: [...t.active] };
+    async snapshot(): Promise<Snapshot> {
+      return { at: clock, threads: [...t.runs].map(([threadId, runs]) => ({ threadId, runs: runs.map((r) => ({ ...r })) })) };
     },
     async resumeQueue(threadId, commandId) { t.resumes.push({ threadId, commandId }); },
-    async restartT3() { t.restarts++; if (t.restartFails) throw new Error("unit failed"); t.procs = [T3, APP]; },
   });
   const tick = async (ms = MIN) => { clock += ms; return wd.tick(); };
   return { store, t, wd, tick, notices: () => [...store.pendingNotices("gem"), ...store.pendingNotices("hermes")].sort((a, b) => a.id - b.id).map((n) => n.text) };
@@ -43,7 +35,6 @@ const held = (): SnapshotRun[] => [
   { id: "r1", ordinal: 1, status: "failed", providerInstanceId: "claudeI" },
   { id: "r2", ordinal: 2, status: "queued", providerInstanceId: "claudeI", queueHeld: true },
 ];
-const wedged = (): SnapshotRun[] => [{ id: "w1", ordinal: 1, status: "running", providerInstanceId: "codexI" }];
 
 test("held-queue on a bot thread: confirmed over two snapshots, then one queue.resume with a recorded command id", async () => {
   const w = world();
@@ -76,83 +67,6 @@ test("held-queue: still held -> retried after resumeRetryMs, at most 3 times, th
   assert.equal(n.length, 1);
   assert.match(n[0], /^⚠️ Watchdog needs help: Gem's queue in t3 stays held after 3 releases/);
   assert.ok(!/thread|run|r2|cmd/.test(n[0]), "no ids in the text");
-});
-
-test("codex-wedged on Hermes (no app-server under t3, run active, two snapshots): one restart + notice, then the held queue is released", async () => {
-  const w = world();
-  w.t.runs.set(HERMES, wedged());
-  w.t.active = [HERMES];
-  w.t.procs = [T3];
-  await w.tick(0);
-  const r = await w.tick();
-  assert.deepEqual(r.outcomes, ["restarted"]);
-  assert.equal(w.t.restarts, 1);
-  assert.match(w.notices()[0], /^🔧 Watchdog: restarted t3 because Hermes's Codex session had stopped responding/);
-  // after the restart: the run failed, the next input is held -> resume on the next confirmed snapshots
-  w.t.runs.set(HERMES, [{ id: "w1", ordinal: 1, status: "interrupted", providerInstanceId: "codexI" }, { id: "w2", ordinal: 2, status: "queued", providerInstanceId: "codexI", queueHeld: true }]);
-  w.t.active = [];
-  await w.tick(); await w.tick();
-  assert.deepEqual(w.t.resumes.map((x) => x.threadId), [HERMES]);
-  assert.equal(w.t.restarts, 1);
-});
-
-test("NEG codex-wedged: app-server alive, Claude run, a non-bot thread, or a single snapshot -> no restart", async () => {
-  const w = world();
-  w.t.runs.set(HERMES, wedged());
-  w.t.active = [HERMES];
-  await w.tick(0); await w.tick(); // app-server alive
-  w.t.procs = [T3];
-  w.t.runs.set(HERMES, [{ id: "c1", ordinal: 1, status: "running", providerInstanceId: "claudeI" }]);
-  await w.tick(); await w.tick();
-  w.t.runs.set(HERMES, []);
-  w.t.runs.set(OTHER, wedged());
-  await w.tick(); await w.tick();
-  assert.equal(w.t.restarts, 0);
-});
-
-test("codex-wedged: other work running in t3 -> wait; restart once it is gone; a notice if it lasts past 10 min", async () => {
-  const w = world();
-  w.t.runs.set(HERMES, wedged());
-  w.t.procs = [T3];
-  w.t.active = [HERMES, "thread-someone-else"];
-  await w.tick(0);
-  const r1 = await w.tick();
-  assert.deepEqual(r1.outcomes, ["restart-wait"]);
-  for (let i = 0; i < 10; i++) await w.tick();
-  assert.equal(w.t.restarts, 0);
-  assert.match(w.notices().at(-1)!, /needs a t3 restart, but other work is still running/);
-  w.t.active = [HERMES];
-  await w.tick();
-  assert.equal(w.t.restarts, 1, "restarted once the other work is gone");
-});
-
-test("codex-wedged twice within 10 min -> one restart only, then a rate-limit notice; after 10 min a restart is allowed again", async () => {
-  const w = world();
-  w.t.runs.set(HERMES, wedged());
-  w.t.active = [HERMES];
-  w.t.procs = [T3];
-  await w.tick(0); await w.tick();
-  assert.equal(w.t.restarts, 1);
-  w.t.procs = [T3]; // still no app-server: wedged again right away
-  await w.tick(); await w.tick();
-  assert.equal(w.t.restarts, 1);
-  assert.match(w.notices().at(-1)!, /stopped responding again within 10 min of the last t3 restart, so I did not restart t3 again/);
-  await w.tick(9 * MIN);
-  await w.tick();
-  assert.equal(w.t.restarts, 2, "allowed again after 10 min");
-});
-
-test("codex-wedged: a failed restart is recorded and reported, and counts for the rate limit", async () => {
-  const w = world();
-  w.t.runs.set(HERMES, wedged());
-  w.t.active = [HERMES];
-  w.t.procs = [T3];
-  w.t.restartFails = true;
-  await w.tick(0); await w.tick();
-  assert.match(w.notices().at(-1)!, /the t3 restart failed/);
-  w.t.restartFails = false;
-  await w.tick(); await w.tick();
-  assert.equal(w.t.restarts, 1, "no second attempt inside 10 min");
 });
 
 test("held-queue: resumes are spaced resumeRetryMs apart (no second resume one minute after the first)", async () => {

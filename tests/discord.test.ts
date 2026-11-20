@@ -100,17 +100,19 @@ test("gateway: a throwing dispatch handler does not stop later events; close() s
   assert.equal(m.connects, 1);
 });
 
-test("rest: createMessage sends the payload unchanged (nonce, enforce_nonce, mentions, reference)", async () => {
+test("rest: createMessage sends the payload unchanged (nonce, enforce_nonce, mentions, reference) with the bot token", async () => {
   const seen: [string, any][] = [];
   const rest = discordRest({ token: "t", allowedChannels: ["c"], makeRequest: async (url, init) => { seen.push([url, init]); return json({ id: "m1" }); } });
   const payload = { content: "hi", nonce: "b1p0", enforce_nonce: true, allowed_mentions: { parse: [] }, message_reference: { message_id: "9", channel_id: "c", fail_if_not_exists: false } };
   assert.deepEqual(await rest.createMessage("c", payload), { id: "m1" });
   assert.equal(seen.length, 1);
   assert.equal(seen[0][0], "https://discord.com/api/v10/channels/c/messages");
+  assert.equal(seen[0][1].method, "POST");
   assert.deepEqual(JSON.parse(String(seen[0][1].body)), payload);
+  assert.equal(seen[0][1].headers.Authorization, "Bot t");
 });
 
-test("rest: 429 waits retry_after and retries; other errors throw with the HTTP status; history query", async () => {
+test("rest: 429 waits retry_after and retries; other errors throw with the HTTP status; history query and emoji encoding", async () => {
   const replies = [json({ message: "You are being rate limited.", retry_after: 0.05, global: false }, 429, { "retry-after": "0.05" }), json({ id: "m1" })];
   const urls: string[] = [];
   const log = memoryLog();
@@ -122,7 +124,8 @@ test("rest: 429 waits retry_after and retries; other errors throw with the HTTP 
   const got: string[] = [];
   const r = discordRest({ token: "t", allowedChannels: ["c"], makeRequest: async (url) => { got.push(url); return json([]); } });
   assert.deepEqual(await r.messagesAfter("c", "123"), []);
-  assert.deepEqual(got, ["https://discord.com/api/v10/channels/c/messages?after=123&limit=100"]);
+  await r.react("c", "5", "👀");
+  assert.deepEqual(got, ["https://discord.com/api/v10/channels/c/messages?after=123&limit=100", `https://discord.com/api/v10/channels/c/messages/5/reactions/${encodeURIComponent("👀")}/@me`]);
 });
 
 test("NEG rest: no hidden retry of a failed POST (retries: 0); the bridge's own recovery decides", async () => {

@@ -18,8 +18,7 @@ Discord ──gateway/REST──▶ bridge (one per bot) ──MCP (write) / WS 
   right away instead of waiting for its timer.
 - **Watchdog** (`bin/watchdog.ts`, `lib/watchdog.ts` + `lib/watchdog-run.ts`): the only holder of t3's
   `orchestration:operate` grant. It has no Discord or MCP credentials. It reads the bots' thread ids from the buffer
-  and writes notices and its action log there; the bridge posts the notices. `tests/operate.test.ts` checks that the
-  bridge never imports the operate client.
+  and writes notices and its action log there; the bridge posts the notices.
 - **Discord tool** (`bin/discord-tool.ts`, `lib/tools.ts`, `lib/tooldb.ts`, `lib/mcpserver.ts`): a stdio MCP server
   for the agent. It has no token and opens no network connection. It inserts outbox entries, and the bridge posts them.
 

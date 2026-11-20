@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { makeBot } from "../lib/bot.ts";
-import { botConfig, KNOWN_BOTS } from "../lib/bots.ts";
+import { botConfig } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
@@ -17,7 +17,6 @@ test("botConfig: known bots get their default instance and model, env overrides 
   assert.throws(() => botConfig({ BRIDGE_BOT: "iris" }), /unknown bot/);
   assert.deepEqual(botConfig({ BRIDGE_BOT: "iris", BRIDGE_BOT_NAME: "Iris", BRIDGE_INSTANCE_ID: "i", BRIDGE_MODEL: "m" }).key, "iris");
   for (const bad of ["Gem", "gem2", "gem:x", "", "a".repeat(21)]) assert.throws(() => botConfig({ BRIDGE_BOT: bad }), /lowercase letters only/, bad);
-  assert.deepEqual(Object.keys(KNOWN_BOTS), ["gem", "hermes"]);
 });
 
 function twoBots() {

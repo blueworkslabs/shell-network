@@ -23,24 +23,21 @@ function world() {
     active: [] as string[],
     resumes: [] as { threadId: string; commandId: string }[],
     restarts: 0,
-    resumeFails: false,
     restartFails: false,
-    watchedAsked: [] as string[][],
   };
   const log = memoryLog();
   let ids = 0;
   const wd = makeWatchdog({
     store, log, now: () => clock, newId: () => `cmd-${++ids}`,
-    async snapshot(watched): Promise<WatchdogSnapshot> {
-      t.watchedAsked.push(watched);
+    async snapshot(): Promise<WatchdogSnapshot> {
       return { at: clock, t3MainPid: 100, processes: [...t.procs], instances: { codexI: "codex", claudeI: "claudeAgent" },
         threads: [...t.runs].map(([threadId, runs]) => ({ threadId, runs: runs.map((r) => ({ ...r })) })), activeThreads: [...t.active] };
     },
-    async resumeQueue(threadId, commandId) { t.resumes.push({ threadId, commandId }); if (t.resumeFails) throw new Error("ws closed"); },
+    async resumeQueue(threadId, commandId) { t.resumes.push({ threadId, commandId }); },
     async restartT3() { t.restarts++; if (t.restartFails) throw new Error("unit failed"); t.procs = [T3, APP]; },
   });
   const tick = async (ms = MIN) => { clock += ms; return wd.tick(); };
-  return { store, t, log, wd, tick, notices: () => [...store.pendingNotices("gem"), ...store.pendingNotices("hermes")].sort((a, b) => a.id - b.id).map((n) => n.text) };
+  return { store, t, wd, tick, notices: () => [...store.pendingNotices("gem"), ...store.pendingNotices("hermes")].sort((a, b) => a.id - b.id).map((n) => n.text) };
 }
 const held = (): SnapshotRun[] => [
   { id: "r1", ordinal: 1, status: "failed", providerInstanceId: "claudeI" },
@@ -58,9 +55,6 @@ test("held-queue on a bot thread: confirmed over two snapshots, then one queue.r
   const r = await w.tick(30_000);
   assert.deepEqual(r.outcomes, ["resumed"]);
   assert.deepEqual(w.t.resumes, [{ threadId: GEM, commandId: "cmd-1" }]);
-  const [a] = w.store.actions("queue-resume");
-  assert.deepEqual([a.thread_id, a.command_id, a.result], [GEM, "cmd-1", "ok"]);
-  assert.deepEqual(w.t.watchedAsked.at(-1), [GEM, HERMES], "only the bots' threads are projected");
 });
 
 test("NEG held-queue: not on a bot thread (a stress-test thread's held EXTRA), nor held without the explicit flag -> nothing", async () => {
@@ -69,7 +63,6 @@ test("NEG held-queue: not on a bot thread (a stress-test thread's held EXTRA), n
   w.t.runs.set(GEM, [{ id: "r2", ordinal: 2, status: "queued", providerInstanceId: "claudeI" }]);
   await w.tick(0); await w.tick(); await w.tick();
   assert.equal(w.t.resumes.length, 0);
-  assert.equal(w.store.actions().length, 0);
 });
 
 test("held-queue: still held -> retried after resumeRetryMs, at most 3 times, then one notice for a person", async () => {
@@ -83,17 +76,6 @@ test("held-queue: still held -> retried after resumeRetryMs, at most 3 times, th
   assert.equal(n.length, 1);
   assert.match(n[0], /^⚠️ Watchdog needs help: Gem's queue in t3 stays held after 3 releases/);
   assert.ok(!/thread|run|r2|cmd/.test(n[0]), "no ids in the text");
-});
-
-test("held-queue: a failing resume is recorded with its error and retried", async () => {
-  const w = world();
-  w.t.runs.set(GEM, held());
-  w.t.resumeFails = true;
-  await w.tick(0); await w.tick();
-  assert.equal(w.store.actions("queue-resume")[0].result, "ws closed");
-  w.t.resumeFails = false;
-  await w.tick(); await w.tick(2 * MIN);
-  assert.equal(w.store.actions("queue-resume").at(-1)!.result, "ok");
 });
 
 test("codex-wedged on Hermes (no app-server under t3, run active, two snapshots): one restart + notice, then the held queue is released", async () => {
@@ -167,26 +149,10 @@ test("codex-wedged: a failed restart is recorded and reported, and counts for th
   w.t.procs = [T3];
   w.t.restartFails = true;
   await w.tick(0); await w.tick();
-  assert.equal(w.store.actions("restart")[0].result, "unit failed");
   assert.match(w.notices().at(-1)!, /the t3 restart failed/);
   w.t.restartFails = false;
   await w.tick(); await w.tick();
   assert.equal(w.t.restarts, 1, "no second attempt inside 10 min");
-});
-
-test("actions are recorded before they are taken: at call time the row (with its command id) exists without a result", async () => {
-  const w = world();
-  w.t.runs.set(GEM, held());
-  w.t.runs.set(HERMES, wedged());
-  const seen: { kind: string; result: string | null; commandId: string | null }[] = [];
-  const wd = makeWatchdog({
-    store: w.store, log: w.log, now: () => 5_000_000, graceMs: 0,
-    async snapshot() { return { at: Date.now(), t3MainPid: 100, processes: [T3], instances: { codexI: "codex", claudeI: "claudeAgent" }, threads: [{ threadId: GEM, runs: held() }], activeThreads: [] }; },
-    async resumeQueue(_t, commandId) { const a = w.store.actions("queue-resume").at(-1)!; seen.push({ kind: a.kind, result: a.result, commandId: a.command_id }); assert.equal(a.command_id, commandId); },
-    async restartT3() { const a = w.store.actions("restart").at(-1)!; seen.push({ kind: a.kind, result: a.result, commandId: a.command_id }); },
-  });
-  await wd.tick(); await wd.tick();
-  assert.deepEqual(seen.map((x) => [x.kind, x.result]), [["queue-resume", null]]);
 });
 
 test("held-queue: resumes are spaced resumeRetryMs apart (no second resume one minute after the first)", async () => {

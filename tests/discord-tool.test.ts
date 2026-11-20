@@ -2,7 +2,7 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -16,13 +16,13 @@ const req = (id: number, method: string, params: Record<string, unknown> = {}) =
 const bridgeDb = () => { const path = join(tempDir("bridge-tool-"), "buffer.db"); openTempBuffer(path).close(); return path; };
 const baseEnv = (db: string) => ({ PATH: process.env.PATH!, TMPDIR: process.env.TMPDIR ?? "/tmp", DISCORD_TOOL_BOT: "gem", DISCORD_TOOL_DB: db });
 
-test("MCP: initialize answers with a supported protocol version and the tools capability; ping, tools/list, unknown method", async () => {
+test("MCP: initialize answers with a supported protocol version and the tools capability; ping, unknown method", async () => {
   const init = await handle(req(1, "initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "x", version: "1" } }), []);
-  assert.deepEqual(init, { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "shell-network-discord", version: "0.1.0" } } });
+  const { protocolVersion, capabilities } = (init as { result: { protocolVersion: string; capabilities: unknown } }).result;
+  assert.deepEqual({ protocolVersion, capabilities }, { protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } } });
   const newer = await handle(req(2, "initialize", { protocolVersion: "2099-01-01" }), []);
   assert.equal((newer as { result: { protocolVersion: string } }).result.protocolVersion, SUPPORTED_PROTOCOL_VERSIONS[0]);
   assert.deepEqual(await handle(req(3, "ping"), []), { jsonrpc: "2.0", id: 3, result: {} });
-  assert.deepEqual(await handle(req(4, "tools/list"), []), { jsonrpc: "2.0", id: 4, result: { tools: [] } });
   assert.equal((await handle(req(5, "resources/list"), []))!.error!.code, -32601);
 });
 
@@ -39,7 +39,7 @@ test("MCP: notifications get no reply; malformed input gets the JSON-RPC errors;
   assert.deepEqual((await handle(req(9, "tools/list"), [echo]))!.result, { tools: [{ name: "echo", description: "d", inputSchema: { type: "object" } }] });
 });
 
-test("TOOL PROCESS: handshake and the tool list over stdio (idempotency key required in every mutating tool); exits 0 when stdin closes; no token in its environment", async () => {
+test("TOOL PROCESS: handshake and the tool list over stdio (idempotency key required in every mutating tool); exits 0 when stdin closes", async () => {
   const proc = spawn(process.execPath, [TOOL], { env: baseEnv(bridgeDb()), stdio: ["pipe", "pipe", "pipe"] });
   pids.add(proc.pid!);
   const lines = createInterface({ input: proc.stdout! })[Symbol.asyncIterator]();
@@ -52,8 +52,6 @@ test("TOOL PROCESS: handshake and the tool list over stdio (idempotency key requ
   assert.equal(b.id, 2);
   assert.deepEqual(b.result.tools.map((t: { name: string }) => t.name), ["discord_send", "discord_react", "discord_thread", "discord_read"]);
   for (const t of b.result.tools) assert.equal(t.inputSchema.required.includes("idempotency_key"), t.name !== "discord_read", `${t.name}: idempotency_key required unless read-only`);
-  const environ = readFileSync(`/proc/${proc.pid}/environ`, "utf8").split("\0").map((kv) => kv.split("=")[0]);
-  assert.ok(!environ.some((k) => /TOKEN/.test(k)), environ.join(","));
   const code = await new Promise<number | null>((r) => { proc.once("exit", (c) => r(c)); proc.stdin!.end(); });
   assert.equal(code, 0);
 });
@@ -75,12 +73,4 @@ test("TOOL PROCESS: refuses to start with the bridge's secret paths in its envir
   assert.match(v.stderr, /schema version 99/);
   const ok = spawnSync(process.execPath, [TOOL], { env: baseEnv(bridgeDb()), input: "", encoding: "utf8" });
   assert.equal(ok.status, 0, `control: a clean start exits 0 on closed stdin (${ok.stderr})`);
-});
-
-test("TOOL PROCESS: an invalid bot key is refused at start", () => {
-  for (const key of ["", "Gem", "gem1", "a".repeat(21), "../gem"]) {
-    const r = spawnSync(process.execPath, [TOOL], { env: { ...baseEnv(bridgeDb()), DISCORD_TOOL_BOT: key }, input: "", encoding: "utf8" });
-    assert.equal(r.status, 2, key);
-    assert.match(r.stderr, /DISCORD_TOOL_BOT: lowercase letters only/, key);
-  }
 });

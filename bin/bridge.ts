@@ -27,7 +27,7 @@ import { discordRest, discordGateway } from "../lib/discord.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import type { LogFields } from "../lib/types.ts";
-import { startBridge, gatewayDispatch } from "../lib/startup.ts";
+import { startBridge, gatewayDispatch, managedRole } from "../lib/startup.ts";
 import { stepLoop } from "../lib/steploop.ts";
 import { bridgeConfig } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
@@ -90,11 +90,12 @@ await mcp.connect();
 const discord = discordRest({ token, allowedChannels: [channelId], alsoAllowed: (id) => buffer.isToolThread(cfg.key, id), log });
 const me = await discord.me();
 if (me.id !== cfg.id) { console.error("BRIDGE_CREW_FILE: own bot id does not match Discord token"); process.exit(2); }
+const botRoleId = await managedRole({ discord, channelId, botUserId: cfg.id, log });
 const modelSelection = { instanceId: cfg.instanceId, model: cfg.model };
 // MCP allowlist: this project, this instance, this bot's one thread (kv, set once launched/adopted)
 const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${cfg.key}:threadId`) };
 const bot = makeBot({
-  name: cfg.name, conversationKey: cfg.key, channelId, botUserId: cfg.id, projectId, modelSelection,
+  name: cfg.name, conversationKey: cfg.key, channelId, botUserId: cfg.id, botRoleId, projectId, modelSelection,
   allowedAuthors: need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean),
   allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap,
   buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log,

@@ -133,13 +133,13 @@ export interface FakeDiscord {
   reactions: { messageId: string; emoji: string; at: unknown }[]; nonces: Map<string | undefined, FakeMessage>; crash: DiscordCrash;
   threads: Map<string, { id: string; parent_id: string; name: string }>;
   onReact?: (messageId: string) => unknown;
-  userSays(content: string, opts?: { mention?: boolean; channel?: string; bot?: boolean; author?: string; authorId?: string }): FakeMessage;
+  userSays(content: string, opts?: { mention?: boolean; channel?: string; bot?: boolean; author?: string; authorId?: string; mentionRoles?: string[] }): FakeMessage;
   createMessage(ch: string, payload: CreateMessagePayload): Promise<FakeMessage>;
   typing(ch: string): Promise<void>;
   react(ch: string, messageId: string, emoji: string): Promise<void>;
   messagesAfter(ch: string, afterId: string, limit?: number): Promise<FakeMessage[]>;
   startThread(ch: string, messageId: string, name: string): Promise<{ id: string }>;
-  getChannel(id: string): Promise<{ id: string; parent_id?: string | null }>;
+  getChannel(id: string): Promise<{ id: string; parent_id?: string | null; guild_id?: string }>;
   botPosts(): FakeMessage[];
 }
 
@@ -158,10 +158,10 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
     messages, writes, reactions, nonces, crash, threads,
     // a user message in a channel (not through the bridge)
     // author "user1" is the allowlisted sender in the tests (HUMAN_ID); any other name gets STRANGER_ID unless authorId is given
-    userSays(content, { mention = true, channel = channelId, bot = false, author = "user1", authorId } = {}) {
+    userSays(content, { mention = true, channel = channelId, bot = false, author = "user1", authorId, mentionRoles = [] } = {}) {
       const aid = authorId ?? (author === "user1" ? HUMAN_ID : STRANGER_ID);
       const m: FakeMessage = { id: id(), channel_id: channel, author: { id: aid, username: author, bot }, content: mention ? `<@${botUserId}> ${content}` : content,
-        mentions: mention ? [{ id: botUserId }] : [], timestamp: new Date(now()).toISOString() };
+        mentions: mention ? [{ id: botUserId }] : [], mention_roles: mentionRoles, timestamp: new Date(now()).toISOString() };
       messages.push(m);
       return m;
     },

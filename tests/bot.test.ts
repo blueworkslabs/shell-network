@@ -9,7 +9,8 @@ import { type Buffer } from "../lib/buffer.ts";
 import type { BotOptions } from "../lib/bot.ts";
 import type { FakeDiscord, FakeRun, FakeT3 } from "./fakes.ts";
 import { makeBot, BARE_MENTION_TEXT } from "../lib/bot.ts";
-import { startBridge } from "../lib/startup.ts";
+import { startBridge, managedRole } from "../lib/startup.ts";
+import { discordRest } from "../lib/discord.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
@@ -936,4 +937,71 @@ test("OUTBOX: a reply whose text is not complete in the read is not queued until
   item.nextTextOffset = null;
   await settle(w, 2);
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["partial answer"]);
+});
+
+const OWN_ROLE = "777777777777777777", OTHER_ROLE = "888888888888888888";
+async function roleWorld(failure?: "channel" | "roles" | "missing") {
+  const requests: string[] = [];
+  const log = memoryLog();
+  const rest = discordRest({ token: "fake-token", allowedChannels: [CH], makeRequest: async (url, init) => {
+    requests.push(url);
+    assert.equal(init.method, "GET");
+    const isChannel = url.endsWith(`/channels/${CH}`);
+    if (failure === "channel" && isChannel) throw new Error("lookup unavailable");
+    if (failure === "roles" && !isChannel) return new Response(JSON.stringify({ message: "Missing Access", code: 50001 }), {
+      status: 403, headers: { "content-type": "application/json" },
+    }) as never;
+    const body = isChannel ? { id: CH, guild_id: "test-guild" } : [
+      { id: OTHER_ROLE, tags: { bot_id: "other-bot" } },
+      { id: "999999999999999999" },
+      ...(failure === "missing" ? [] : [{ id: OWN_ROLE, name: "old-display-name", tags: { bot_id: BOT } }]),
+    ];
+    return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } }) as never;
+  } });
+  const botRoleId = await managedRole({ discord: rest, channelId: CH, botUserId: BOT, log });
+  const w = world({ init: false, botOpts: { botRoleId, allowedBots: [{ id: "333333333333333333", name: "Builder" }], exchangeCap: 1 } });
+  let connections = 0;
+  startBridge({ bot: w.bot, gateway: { connect: () => { connections++; } }, startMs: w.now(), log });
+  assert.equal(connections, 1);
+  return { w, requests, log };
+}
+
+test("MANAGED ROLE: startup discovers its role by bot_id; own role reaches the batch, other roles and unknown senders stay dropped", async () => {
+  const { w, requests } = await roleWorld();
+  assert.deepEqual(requests, ["https://discord.com/api/v10/channels/shell-network", "https://discord.com/api/v10/guilds/test-guild/roles"]);
+  assert.equal((await w.say(`<@&${OTHER_ROLE}> other`, { mention: false, mentionRoles: [OTHER_ROLE] })).reason, "no mention");
+  assert.equal((await w.say(`<@&${OWN_ROLE}> outsider`, { mention: false, mentionRoles: [OWN_ROLE], author: "stranger" })).reason, "sender not allowed");
+  assert.equal((await w.say(`<@&${OWN_ROLE}> unknown bot`, { mention: false, mentionRoles: [OWN_ROLE], bot: true })).reason, "bot author");
+  assert.deepEqual(await w.say(`<@&${OWN_ROLE}> role job`, { mention: false, mentionRoles: [OWN_ROLE] }), { accepted: true, inserted: true });
+  await w.bot.step();
+  assert.match(w.runs().at(-1)!.text, /user1: role job/);
+  assert.ok(!w.runs().at(-1)!.text.includes(`<@&${OWN_ROLE}>`));
+});
+
+test("MANAGED ROLE: bare mentions preserve human resume and bot drop rules; crew role mentions obey the cap", async () => {
+  const { w } = await roleWorld();
+  const human = { mention: false, mentionRoles: [OWN_ROLE] };
+  const crew = { ...human, bot: true, authorId: "333333333333333333" };
+  assert.equal((await w.say(`<@&${OWN_ROLE}>`, crew)).reason, "empty after mention");
+  assert.deepEqual(await w.say(`<@&${OWN_ROLE}> first`, crew), { accepted: true, inserted: true });
+  assert.equal((await w.say(`<@&${OWN_ROLE}> second`, crew)).reason, "exchange cap");
+  assert.deepEqual(await w.say(`<@&${OWN_ROLE}>`, human), { accepted: true, inserted: true });
+  assert.ok(w.buffer.buffered("gem").some((r) => r.text === BARE_MENTION_TEXT));
+  assert.deepEqual(await w.say(`<@&${OWN_ROLE}> resumed`, crew), { accepted: true, inserted: true });
+});
+
+for (const failure of ["channel", "roles", "missing"] as const) test(`MANAGED ROLE: ${failure} lookup failure logs once, startup and direct mentions still work`, async () => {
+  const { w, log } = await roleWorld(failure);
+  assert.equal(log.events.filter((e) => e.event === "bridge.role_lookup_failed").length, 1);
+  assert.equal((await w.say(`<@&${OWN_ROLE}> role only`, { mention: false, mentionRoles: [OWN_ROLE] })).reason, "no mention");
+  assert.deepEqual(await w.say("direct still works"), { accepted: true, inserted: true });
+  await w.bot.step();
+  assert.match(w.runs().at(-1)!.text, /direct still works/);
+});
+
+test("MANAGED ROLE: history catch-up accepts a missed role-only mention", async () => {
+  const { w } = await roleWorld();
+  w.discord.userSays(`<@&${OWN_ROLE}> missed role job`, { mention: false, mentionRoles: [OWN_ROLE] });
+  await w.bot.step();
+  assert.match(w.runs().at(-1)!.text, /user1: missed role job/);
 });

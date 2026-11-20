@@ -5,7 +5,7 @@
 // lib/tooldb.ts; the bridge, the one writer per bot token, does every post. Tools (lib/tools.ts): discord_send,
 // discord_react, discord_thread and discord_read.
 //   DISCORD_TOOL_BOT   bot key (lowercase letters, lib/bots.ts)
-//   DISCORD_TOOL_DB    the bridge's buffer DB (must exist: the bridge creates and migrates it)
+//   DISCORD_TOOL_DB    the bridge's buffer DB (must exist: the bridge creates it)
 // stdout carries protocol messages only; diagnostics go to stderr.
 import { createInterface } from "node:readline";
 import { openToolDb } from "../lib/tooldb.ts";

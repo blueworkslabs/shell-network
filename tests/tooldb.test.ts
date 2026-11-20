@@ -1,4 +1,4 @@
-// The Discord tool's narrow DB connection (lib/tooldb.ts): no creation, no migration, schema version checked,
+// The Discord tool's narrow DB connection (lib/tooldb.ts): no creation, schema version checked,
 // statements confined by the authorizer.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -31,7 +31,7 @@ test("TOOLDB: the bridge's DB opens with the built-for schema version; any other
   raw.close();
   assert.throws(() => openToolDb(path), /schema version 2, this tool is built for 1; refusing/);
   const legacy = join(tempDir("bridge-tooldb-"), "legacy.db");
-  new DatabaseSync(legacy).close(); // version 0: a DB no current bridge has migrated
+  new DatabaseSync(legacy).close(); // version 0: a DB the bridge never opened
   assert.throws(() => openToolDb(legacy), /schema version 0/);
 });
 

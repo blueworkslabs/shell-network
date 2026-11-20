@@ -33,7 +33,6 @@ import { stepLoop } from "../lib/steploop.ts";
 import { botConfig, crewConfig } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
 import { shellWatch } from "../lib/shellwatch.ts";
-import { outboxCutover } from "../lib/cutover.ts";
 import { t3Adapter } from "../lib/t3.ts";
 import { McpClient, loadToken } from "../lib/vendor/mcp.mjs";
 import { PUSH_TOKEN_PATH } from "../lib/vendor/push.mjs";
@@ -64,15 +63,6 @@ const channelId = need("BRIDGE_CHANNEL_ID");
 const token = readFileSync(need("BRIDGE_DISCORD_TOKEN"), "utf8").trim();
 const projectId = need("BRIDGE_PROJECT_ID");
 const buffer = openBuffer(dbPath);
-// Settled cutover to the outbox (lib/cutover.ts): before any network or message activity.
-{
-  const c = outboxCutover(buffer, cfg.key);
-  if (!c.ok) {
-    console.error(`refusing to start: the previous version left ${c.open.length} message intent(s) unsettled (${c.open.join("; ")}); let it settle them first`);
-    try { buffer.close(); } catch {}
-    process.exit(2);
-  }
-}
 const log = makeLog(need("BRIDGE_LOG"));
 // Audit only: which holder this is (the lock itself decides who writes, not this number).
 const lockGeneration = Number(buffer.kvGet(`${cfg.key}:lockGeneration`) ?? 0) + 1;

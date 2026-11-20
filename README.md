@@ -88,7 +88,6 @@ The full list of settings is in the header of each entrypoint:
   `WATCHDOG_T3_UNIT`.
 - `bin/discord-tool.ts`: configured in the t3 provider instance with `DISCORD_TOOL_BOT` and `DISCORD_TOOL_DB`. It
   refuses to start if any of the bridge's secret variables are in its environment.
-- `bin/gem-bridge.ts`: a small wrapper for an existing unit (`BRIDGE_BOT` defaults to `gem`).
 
 The `T1_` prefix on the t3 connection variables is historical.
 

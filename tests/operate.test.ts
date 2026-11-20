@@ -77,10 +77,10 @@ function importGraph(entry: string): Set<string> {
 }
 
 test("BOUNDARY: the bridge process does not load the operate client nor read the operate token; the watchdog does", () => {
-  const bridge = importGraph("bin/gem-bridge.ts");
+  const bridge = importGraph("bin/bridge.ts");
   assert.ok(bridge.has("bin/bridge.ts") && bridge.has("lib/bot.ts") && bridge.has("lib/t3.ts") && bridge.has("lib/shellwatch.ts"), "graph walk works (positive control)");
   for (const f of ["lib/operate.ts", "lib/wsrpc.ts", "lib/watchdog-run.ts"]) assert.ok(!bridge.has(f), `bridge imports ${f}`);
-  for (const f of ["bin/gem-bridge.ts", "bin/bridge.ts"]) assert.ok(!readFileSync(join(ROOT, f), "utf8").includes("WATCHDOG_OPERATE_TOKEN"));
+  assert.ok(!readFileSync(join(ROOT, "bin/bridge.ts"), "utf8").includes("WATCHDOG_OPERATE_TOKEN"));
   const wd = importGraph("bin/watchdog.ts");
   assert.ok(wd.has("lib/operate.ts") && wd.has("lib/watchdog-run.ts"));
   for (const f of ["lib/discord.ts", "lib/t3.ts", "lib/allowlist.ts"]) assert.ok(!wd.has(f), `watchdog imports ${f} (no Discord/MCP in the watchdog)`);

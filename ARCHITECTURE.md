@@ -23,8 +23,9 @@ Discord ──gateway/REST──▶ bridge (one per bot) ──MCP (write) / WS 
 - **Discord tool** (`bin/discord-tool.ts`, `lib/tools.ts`, `lib/tooldb.ts`, `lib/mcpserver.ts`): a stdio MCP server
   for the agent. It has no token and opens no network connection. It inserts outbox entries, and the bridge posts them.
 
-All processes share one buffer DB (`lib/buffer.ts`). The DB uses WAL mode with `synchronous=FULL`. The schema and
-every migration run in one IMMEDIATE transaction, and the schema version is kept in `PRAGMA user_version`.
+All processes share one buffer DB (`lib/buffer.ts`). The DB uses WAL mode with `synchronous=FULL`. The schema is
+created in one IMMEDIATE transaction, and its version is kept in `PRAGMA user_version`. There are no migrations: a
+schema change before the trial verdict means a fresh DB.
 
 ## Input: accept, batch, send
 
@@ -125,7 +126,6 @@ t3 `thread.updated` events, and the idle tick stays as a fallback.
 ## Code layout
 
 - `bin/`: the processes.
-- `lib/`: the bridge core (`bot.ts`), buffer and migrations (`buffer.ts`), reconcile, stuck, watchdog, outbox cutover
-  (`cutover.ts`), the t3 and Discord adapters, allowlist and preflight, the writer lock, and the tool.
+- `lib/`: the bridge core (`bot.ts`), buffer (`buffer.ts`), reconcile, stuck, watchdog, the t3 and Discord adapters, allowlist and preflight, the writer lock, and the tool.
 - `lib/vendor/`: the MCP and WS clients shared with the project's t3 test harness. Their types are in `*.d.mts`.
 - `tests/`: offline tests over fakes. `tests/fixtures/` holds reduced evidence captured from a real t3 0.1.0.

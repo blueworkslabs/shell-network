@@ -39,7 +39,7 @@ const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)
 export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
 type Found = { status: "found"; message: DiscordMessage } | { status: "absent" } | { status: "unknown" };
 export interface BotOptions {
-  name: string; conversationKey: string; channelId: string; botUserId: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
+  name: string; conversationKey: string; channelId: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
   buffer: Buffer; t3: T3Port; discord: DiscordPort; log: Log; now?: () => number;
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
@@ -60,7 +60,7 @@ const PAGE = 100;
 const DISCORD_EPOCH = 1420070400000n;
 const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) ) - DISCORD_EPOCH) << 22n;
 
-export function makeBot({ name, conversationKey, channelId, botUserId, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
+export function makeBot({ name, conversationKey, channelId, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
   allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000 }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
@@ -87,6 +87,7 @@ export function makeBot({ name, conversationKey, channelId, botUserId, allowedAu
   const catchUp: { caughtUp: unknown; inFlight: Promise<number> | null; lastAt: number } = { caughtUp: null, inFlight: null, lastAt: 0 };
   const gateOpen = () => catchUp.inFlight === null && catchUp.caughtUp !== null && catchUp.caughtUp === session();
 
+  const roleRe = () => new RegExp(`<@&${botRoleId}>`, "g");
   const mentionRe = () => new RegExp(`<@!?${state.botUserId}>`, "g");
   // Acknowledge an accepted row (reaction), then mark it. Runs only after the row's commit; rows whose ack was lost
   // in a crash are retried by step(). A message that no longer exists (404) counts as acknowledged.
@@ -118,10 +119,11 @@ export function makeBot({ name, conversationKey, channelId, botUserId, allowedAu
     if (!fromBot && !allowed.has(authorId)) { log.emit("bridge.dropped", { bot: name, sourceMessageId: msg.id ?? null, reason: "sender not allowed" }); return { accepted: false, reason: "sender not allowed" }; }
     // A crew bot's mention counts from its text too: whether Discord fills `mentions` for a bot-authored post is not
     // something the bridge relies on.
-    const mentioned = Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))));
+    const mentioned = Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
     if (!mentioned) return { accepted: false, reason: "no mention" };
     // A person's bare mention means "go on" (e.g. after the exchange-cap pause); a bot's bare mention stays dropped.
-    const stripped = String(msg.content ?? "").replace(mentionRe(), "").trim();
+    const withoutUser = String(msg.content ?? "").replace(mentionRe(), "");
+    const stripped = (botRoleId ? withoutUser.replace(roleRe(), "") : withoutUser).trim();
     if (!stripped && fromBot) return { accepted: false, reason: "empty after mention" };
     const text = stripped || BARE_MENTION_TEXT;
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now() };

@@ -85,6 +85,12 @@ own id that differs from the Discord token are refused. Restart the bridge after
 files outside the repository; `crew.json` and `crew.*.json` are ignored except for the example. Remove the old
 `BRIDGE_ALLOWED_BOTS`, `BRIDGE_BOT_NAME`, `BRIDGE_INSTANCE_ID` and `BRIDGE_MODEL` settings when migrating.
 
+At startup the bridge discovers its own managed Discord role by reading the channel's guild and finding the role
+whose `tags.bot_id` matches its own user id. Mentions of that role in `mention_roles` count as mentions of the bot;
+no crew-file setting is needed. Sender allowlists, the exchange cap and bare-mention rules still apply. If discovery
+fails, one `bridge.role_lookup_failed` event is logged and the bridge continues with direct mentions only. Discovery
+runs once per process start; arbitrary shared roles are not included.
+
 Optional settings:
 
 - `BRIDGE_EXCHANGE_CAP`: the bot-to-bot cap (default 2; 0 turns bot-to-bot off).

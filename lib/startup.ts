@@ -2,6 +2,7 @@
 // it exists. If the boundary cannot be stored, the gateway is never connected and the error propagates (the process
 // exits); nothing is received that could fall outside both history recovery and live delivery.
 import { errText } from "./log.ts";
+import type { DiscordRest } from "./discord.ts";
 import type { Log } from "./types.ts";
 
 export function startBridge({ bot, gateway, startMs, log }: { bot: { initWatermark(startMs: number): string }; gateway: { connect(): void }; startMs: number; log: Log }): string {
@@ -24,4 +25,21 @@ export function gatewayDispatch({ bot, channelId, nudge, log }: {
     if (type !== "MESSAGE_CREATE" || d?.channel_id !== channelId) return undefined;
     return bot.accept(d).then((r) => { if (r.accepted || r.wake) nudge(); }, (e) => log.emit("bridge.accept_error", { sourceMessageId: d.id, error: errText(e) }));
   };
+}
+
+// Optional startup discovery: a failed lookup preserves direct-mention operation.
+export async function managedRole({ discord, channelId, botUserId, log }: {
+  discord: Pick<DiscordRest, "getChannel" | "guildRoles">; channelId: string; botUserId: string; log: Log;
+}): Promise<string | null> {
+  try {
+    const channel = await discord.getChannel(channelId);
+    if (!channel.guild_id) throw new Error("channel has no guild");
+    const roles = await discord.guildRoles(channel.guild_id);
+    const role = roles.find((r) => r.tags?.bot_id === botUserId);
+    if (!role) throw new Error("own managed role not found");
+    return role.id;
+  } catch (e) {
+    log.emit("bridge.role_lookup_failed", { error: errText(e) });
+    return null;
+  }
 }

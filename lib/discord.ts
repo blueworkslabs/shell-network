@@ -19,7 +19,9 @@ const FATAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 
 // The only Discord surface handed to bridge code: the guarded port. No raw request client is reachable through it;
 // the gateway builds its own REST for /gateway/bot.
+export interface DiscordRole { id: string; tags?: { bot_id?: string } }
 export interface DiscordRest extends DiscordPort {
+  guildRoles(guildId: string): Promise<DiscordRole[]>;
   me(): Promise<{ id: string; [k: string]: unknown }>;
 }
 const makeRest = ({ token, makeRequest, api, timeoutMs = 15_000 }: { token: string; makeRequest?: RESTOptions["makeRequest"]; api?: string; timeoutMs?: number }) =>
@@ -40,6 +42,7 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
   rest.on("rateLimited", (info) => log?.emit("discord.rate_limited", { method: info.method, route: info.route, waitMs: info.retryAfter, global: info.global }));
   const api = new API(rest);
   return Object.freeze({
+    guildRoles: (guildId: string) => api.guilds.getRoles(guildId),
     me: () => api.users.getCurrent() as unknown as Promise<{ id: string; [k: string]: unknown }>,
     // nonce + enforce_nonce: Discord returns the already-created message for a repeated nonce (dedupe window of a
     // few minutes), so a post repeated after a crash does not appear twice within that window.
@@ -53,7 +56,7 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
       api.channels.getMessages(channelId, { after: afterId, limit }) as unknown as Promise<DiscordMessage[]>,
     // a thread from a message (its id is the message id), only under an allowed channel itself (not under a thread)
     startThread: (channelId: string, messageId: string, name: string) => { parentGuard(channelId); return api.channels.createThread(channelId, { name }, messageId) as unknown as Promise<{ id: string }>; },
-    getChannel: (channelId: string) => api.channels.get(channelId) as unknown as Promise<{ id: string; parent_id?: string | null }>,
+    getChannel: (channelId: string) => api.channels.get(channelId) as unknown as Promise<{ id: string; parent_id?: string | null; guild_id?: string }>,
   });
 }
 

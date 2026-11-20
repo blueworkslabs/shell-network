@@ -184,6 +184,7 @@ export interface DiscordMessage {
   author?: { id: string; username?: string; bot?: boolean };
   content?: string;
   mentions?: { id: string }[];
+  mention_roles?: string[];
   timestamp?: string;
   message_reference?: { message_id?: string; channel_id?: string };
 }
@@ -200,7 +201,7 @@ export interface DiscordPort {
   react(channelId: string, messageId: string, emoji: string): Promise<unknown>;
   messagesAfter(channelId: string, afterId: string, limit?: number): Promise<DiscordMessage[]>;
   startThread(channelId: string, messageId: string, name: string): Promise<{ id: string }>;
-  getChannel(channelId: string): Promise<{ id: string; parent_id?: string | null }>;
+  getChannel(channelId: string): Promise<{ id: string; parent_id?: string | null; guild_id?: string }>;
 }
 
 // ---- t3 port used by the bot core (lib/t3.ts implements it) ----

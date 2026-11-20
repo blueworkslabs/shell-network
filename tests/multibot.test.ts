@@ -3,21 +3,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { makeBot } from "../lib/bot.ts";
-import { botConfig } from "../lib/bots.ts";
+import { bridgeConfig } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
 
-const CH = "shell-network";
+import { crewFile } from "./crew-fixture.ts";
 
-test("botConfig: known bots get their default instance and model, env overrides them, unknown bots need explicit values", () => {
-  assert.deepEqual(botConfig({}), { key: "gem", name: "Gem", instanceId: "crewGemClaude", model: "claude-sonnet-5-5" });
-  assert.deepEqual(botConfig({ BRIDGE_BOT: "hermes" }), { key: "hermes", name: "Hermes", instanceId: "crewHermesCodex", model: "gpt-6.1-sol" });
-  assert.equal(botConfig({ BRIDGE_BOT: "hermes", BRIDGE_MODEL: "other" }).model, "other");
-  assert.throws(() => botConfig({ BRIDGE_BOT: "iris" }), /unknown bot/);
-  assert.deepEqual(botConfig({ BRIDGE_BOT: "iris", BRIDGE_BOT_NAME: "Iris", BRIDGE_INSTANCE_ID: "i", BRIDGE_MODEL: "m" }).key, "iris");
-  for (const bad of ["Gem", "gem2", "gem:x", "", "a".repeat(21)]) assert.throws(() => botConfig({ BRIDGE_BOT: bad }), /lowercase letters only/, bad);
-});
+const CH = "shell-network";
 
 function twoBots() {
   const path = join(tempDir("multibot-"), "buffer.db");
@@ -28,7 +21,7 @@ function twoBots() {
   const t3 = fakeT3();
   const log = memoryLog();
   const mk = (key: "gem" | "hermes", userId: string, buffer = openTempBuffer(path, { now })) => {
-    const cfg = botConfig({ BRIDGE_BOT: key });
+    const cfg = bridgeConfig({ BRIDGE_BOT: key, BRIDGE_CREW_FILE: crewFile() }).bot;
     const port = { ...discord, createMessage: async (ch: string, p: Parameters<typeof discord.createMessage>[1]) => { const m = await discord.createMessage(ch, p); m.author = { id: userId, username: cfg.name, bot: true }; return m; } };
     const bot = makeBot({ name: cfg.name, conversationKey: cfg.key, channelId: CH, botUserId: userId, allowedAuthors: [HUMAN_ID], projectId: `proj-${key}`,
       modelSelection: { instanceId: cfg.instanceId, model: cfg.model }, buffer, t3, discord: port, log, now, session: () => "s1" });

@@ -2,7 +2,8 @@
 // Bridge process for one bot (any crew bot, one process each, all on one buffer DB), one Discord
 // channel, one t3 thread. Config from the environment (all required unless noted); secrets are read from files,
 // never from the environment or the command line.
-//   BRIDGE_BOT               optional, bot key (default gem; known: gem, hermes — lib/bots.ts)
+//   BRIDGE_BOT               own bot key in the crew file
+//   BRIDGE_CREW_FILE         path to a private JSON crew file (see crew.example.json)
 //   BRIDGE_CHANNEL_ID        the only channel read and written
 //   BRIDGE_DISCORD_TOKEN     path of this bot's token file
 //   BRIDGE_PROJECT_ID        t3 project of this bot's workspace (e.g. crew-<bot>)
@@ -10,11 +11,9 @@
 //   BRIDGE_LOG               event log path (JSONL)
 //   T1_MCP_URL, T1_TOKEN     t3 /mcp endpoint and the bridge's MCP token file (write path)
 //   T1_PUSH_TOKEN            WS read-only session file (projection; orchestration:read only)
-//   BRIDGE_BOT_NAME, BRIDGE_INSTANCE_ID, BRIDGE_MODEL  optional for known bots (defaults: lib/bots.ts)
 //   BRIDGE_TICK_MS           optional, step interval while a batch is open (default 3000; idle 30000)
 //   BRIDGE_ALLOWED_AUTHORS   comma-separated Discord user ids whose mentions are accepted (the user only);
 //                            everyone else is dropped before the buffer
-//   BRIDGE_ALLOWED_BOTS      optional, other crew bots whose mentions are accepted, `<key>:<user id>,...`
 //   BRIDGE_EXCHANGE_CAP      optional, bot-to-bot messages without a human message between (default 2, 0 = off)
 // Secret files must be the bridge user's own, without group/other bits, in such a directory (lib/preflight.ts).
 // Writer lock: `<directory of BRIDGE_DB>/<bot>.lock.db`, held for the life of the process (lib/lock.ts); a second
@@ -30,7 +29,7 @@ import type { DiscordGateway } from "../lib/discord.ts";
 import type { LogFields } from "../lib/types.ts";
 import { startBridge, gatewayDispatch } from "../lib/startup.ts";
 import { stepLoop } from "../lib/steploop.ts";
-import { botConfig, crewConfig } from "../lib/bots.ts";
+import { bridgeConfig } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
 import { shellWatch } from "../lib/shellwatch.ts";
 import { t3Adapter } from "../lib/t3.ts";
@@ -39,8 +38,9 @@ import { PUSH_TOKEN_PATH } from "../lib/vendor/push.mjs";
 
 const START_MS = Date.now(); // first-start history boundary (lib/bot.ts initWatermark)
 const need = (k: string): string => { const v = process.env[k]; if (!v) { console.error(`missing ${k}`); process.exit(2); } return v; };
-let cfg: ReturnType<typeof botConfig>, crew: ReturnType<typeof crewConfig>;
-try { cfg = botConfig(process.env); crew = crewConfig(process.env, cfg.key); } catch (e) { console.error((e as Error).message); process.exit(2); }
+let crew: ReturnType<typeof bridgeConfig>;
+try { crew = bridgeConfig(process.env); } catch (e) { console.error((e as Error).message); process.exit(2); }
+const cfg = crew.bot;
 // One writer per bot token (lib/lock.ts): the per-bot lock first, before any secret file is read (the preflight reads
 // them) and before anything talks to Discord. A second bridge for this bot exits here (4, "lease held"); the lock is
 // held until this process exits.
@@ -89,18 +89,19 @@ await mcp.connect();
 // writes: the channel, and threads this bot's tool created there
 const discord = discordRest({ token, allowedChannels: [channelId], alsoAllowed: (id) => buffer.isToolThread(cfg.key, id), log });
 const me = await discord.me();
+if (me.id !== cfg.id) { console.error("BRIDGE_CREW_FILE: own bot id does not match Discord token"); process.exit(2); }
 const modelSelection = { instanceId: cfg.instanceId, model: cfg.model };
 // MCP allowlist: this project, this instance, this bot's one thread (kv, set once launched/adopted)
 const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${cfg.key}:threadId`) };
 const bot = makeBot({
-  name: cfg.name, conversationKey: cfg.key, channelId, botUserId: me.id, projectId, modelSelection,
+  name: cfg.name, conversationKey: cfg.key, channelId, botUserId: cfg.id, projectId, modelSelection,
   allowedAuthors: need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean),
   allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap,
   buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log,
   // live gateway session token; set below once the gateway exists (null until then: no dispatch)
   session: () => (gateway?.state.connected ? gateway.state.gen : null),
 });
-log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: me.id, channelId, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap });
+log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, channelId, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap });
 
 // Single-flight step loop (lib/steploop.ts); a gateway message or a t3 change wakes it early, also mid-step (latched).
 const loop = stepLoop({ step: () => bot.step(), tickMs, log });

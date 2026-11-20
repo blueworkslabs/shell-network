@@ -3,35 +3,39 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { makeBot, BARE_MENTION_TEXT, HEADER_LINE_MAX, HEADER_ADDRESSED_LINE_MAX } from "../lib/bot.ts";
-import { botConfig, crewConfig } from "../lib/bots.ts";
+import { bridgeConfig } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { gatewayDispatch } from "../lib/startup.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID, STRANGER_ID, type FakeMessage } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
 
+import { crewFile, exampleCrew } from "./crew-fixture.ts";
+
 const CH = "shell-network";
 const GEM = "333333333333333333", HERMES = "444444444444444444", CODEX = "555555555555555555";
 
-function crew({ cap = 2, headerMaxMessages, headerMaxChars }: { cap?: number; headerMaxMessages?: number; headerMaxChars?: number } = {}) {
+function crew({ cap = 2, headerMaxMessages, headerMaxChars, talkOnly = false }: { talkOnly?: boolean; cap?: number; headerMaxMessages?: number; headerMaxChars?: number } = {}) {
   const path = join(tempDir("bot2bot-"), "buffer.db");
   let clock = 1_792_500_000_000;
   const now = () => clock;
   const discord = fakeDiscord({ channelId: CH, botUserId: GEM, now });
   const t3 = fakeT3();
   const log = memoryLog();
-  const mk = (key: "gem" | "hermes", userId: string, other: { id: string; name: string }) => {
-    const cfg = botConfig({ BRIDGE_BOT: key });
+  const file = crewFile([...exampleCrew, ...(talkOnly ? [{ key: "advisor", name: "Advisor", id: "666666666666666666" }] : [])]);
+  const mk = (key: "gem" | "hermes", userId: string) => {
+    const config = bridgeConfig({ BRIDGE_BOT: key, BRIDGE_CREW_FILE: file, BRIDGE_EXCHANGE_CAP: String(cap) });
+    const cfg = config.bot;
     const buffer = openTempBuffer(path, { now });
     // each bot posts as itself; Discord's `mentions` stays empty for bot posts here (the bridge must not need it)
     const port = { ...discord, createMessage: async (ch: string, p: Parameters<typeof discord.createMessage>[1]) => { const m = await discord.createMessage(ch, p); m.author = { id: userId, username: cfg.name, bot: true }; return m; } };
     const bot = makeBot({ name: cfg.name, conversationKey: cfg.key, channelId: CH, botUserId: userId, allowedAuthors: [HUMAN_ID], projectId: `proj-${key}`,
       modelSelection: { instanceId: cfg.instanceId, model: cfg.model }, buffer, t3, discord: port, log, now, session: () => "s1",
-      allowedBots: [other], exchangeCap: cap, headerMaxMessages, headerMaxChars });
+      allowedBots: config.allowedBots, exchangeCap: config.exchangeCap, headerMaxMessages, headerMaxChars });
     bot.initWatermark(clock);
     return { bot, buffer, key };
   };
-  const gem = mk("gem", GEM, { id: HERMES, name: "Hermes" });
-  const hermes = mk("hermes", HERMES, { id: GEM, name: "Gem" });
+  const gem = mk("gem", GEM);
+  const hermes = mk("hermes", HERMES);
   const both = async (m: FakeMessage) => [await gem.bot.accept(m), await hermes.bot.accept(m)];
   // a person writes in the channel; `to` = the bot user id mentioned, or null for no mention
   const person = async (text: string, to: string | null, authorId = HUMAN_ID) => {
@@ -319,16 +323,6 @@ test("WAKE: the gateway dispatch wakes the step loop for an accepted message and
   assert.equal(nudges, 3);
 });
 
-test("crewConfig: <key>:<id> of known other bots, cap default 2, 0 = off; bad values refused", () => {
-  assert.deepEqual(crewConfig({}, "gem"), { allowedBots: [], exchangeCap: 2 });
-  assert.deepEqual(crewConfig({ BRIDGE_ALLOWED_BOTS: `hermes:${HERMES}`, BRIDGE_EXCHANGE_CAP: "0" }, "gem"), { allowedBots: [{ id: HERMES, name: "Hermes" }], exchangeCap: 0 });
-  for (const [env, re] of [
-    [{ BRIDGE_ALLOWED_BOTS: `gem:${GEM}` }, /own bot/], [{ BRIDGE_ALLOWED_BOTS: "iris:1" }, /unknown bot/], [{ BRIDGE_ALLOWED_BOTS: "hermes" }, /not <key>:<user id>/],
-    [{ BRIDGE_ALLOWED_BOTS: "hermes:<@1>" }, /not <key>:<user id>/], [{ BRIDGE_EXCHANGE_CAP: "-1" }, /integer/], [{ BRIDGE_EXCHANGE_CAP: "two" }, /integer/],
-  ] as const) assert.throws(() => crewConfig(env, "gem"), re);
-  assert.throws(() => makeBot({ allowedAuthors: [HUMAN_ID], allowedBots: [{ id: "not-an-id", name: "X" }] } as never), /allowedBots/);
-});
-
 test("CAP NOTICE per episode: the next capped episode gets its own 'waiting for the user' notice", async () => {
   const w = crew({ cap: 1 });
   await w.person("start", GEM);
@@ -346,3 +340,22 @@ test("CAP NOTICE per episode: the next capped episode gets its own 'waiting for 
   assert.deepEqual(notices.map((m) => m.author.id), [GEM, HERMES]);
 });
 
+
+test("TALK-ONLY: mentions are accepted, unread messages appear in the header, unknown bots stay dropped and the cap applies", async () => {
+  const w = crew({ cap: 1, talkOnly: true });
+  const say = async (text: string, id = "666666666666666666") => {
+    const m = w.discord.userSays(text, { mention: false, bot: true, authorId: id, author: "Advisor" });
+    return w.gem.bot.accept(m);
+  };
+  assert.equal((await say("background from advisor")).reason, "no mention");
+  assert.deepEqual(await say(`<@${GEM}> first`), { accepted: true, inserted: true });
+  const turn = await w.turn(w.gem, "received");
+  assert.ok(turn.sent.includes("Advisor: background from advisor"), turn.sent);
+  assert.ok(turn.sent.includes("Advisor: first"), turn.sent);
+  assert.equal((await say(`<@${GEM}> second`)).reason, "exchange cap");
+  assert.equal((await say(`<@${GEM}> unknown`, CODEX)).reason, "bot author");
+  await w.person("resume", GEM);
+  const resumed = await w.turn(w.gem, "ok");
+  assert.ok(resumed.sent.includes("Advisor: @Gem second"), resumed.sent);
+  assert.ok(!resumed.sent.includes("unknown"), resumed.sent);
+});

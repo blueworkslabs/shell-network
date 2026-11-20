@@ -60,6 +60,7 @@ bridge user, have no group/other permission bits, and sit in a directory with th
 
 ```sh
 BRIDGE_BOT=gem \
+BRIDGE_CREW_FILE=/path/to/private/crew.json \
 BRIDGE_CHANNEL_ID=<channel id> \
 BRIDGE_ALLOWED_AUTHORS=<your Discord user id> \
 BRIDGE_DISCORD_TOKEN=/path/to/secrets/gem-discord-token \
@@ -72,12 +73,21 @@ T1_PUSH_TOKEN=/path/to/secrets/ws-session.json \
 node bin/bridge.ts
 ```
 
+Copy `crew.example.json` to a private location outside the repository and set `BRIDGE_CREW_FILE` to its path
+for every bridge process. The JSON array lists each member's unique lowercase `key`, display `name`, and Discord
+user `id` (a string). Members run by this bridge also need `instanceId` and `model`; omit both for talk-only
+members. Set `BRIDGE_BOT` to this process's member key. Its identity and model come from the file; all other
+members are allowed crew, including talk-only members. Their mentions, unread messages and exchange counts follow
+the same rules as other crew bots. The people allowlist remains `BRIDGE_ALLOWED_AUTHORS`.
+
+The file is read once at startup. Invalid members, duplicate keys or ids, a missing or talk-only own bot, and an
+own id that differs from the Discord token are refused. Restart the bridge after changing the file. Keep real crew
+files outside the repository; `crew.json` and `crew.*.json` are ignored except for the example. Remove the old
+`BRIDGE_ALLOWED_BOTS`, `BRIDGE_BOT_NAME`, `BRIDGE_INSTANCE_ID` and `BRIDGE_MODEL` settings when migrating.
+
 Optional settings:
 
-- `BRIDGE_ALLOWED_BOTS`: other bots this one takes mentions from, as `<key>:<user id>,...`.
 - `BRIDGE_EXCHANGE_CAP`: the bot-to-bot cap (default 2; 0 turns bot-to-bot off).
-- `BRIDGE_BOT_NAME`, `BRIDGE_INSTANCE_ID`, `BRIDGE_MODEL`: the bot's identity and model. These are required for bots
-  that are not in `lib/bots.ts`. The two built-in example bots there are `gem` and `hermes`.
 - `BRIDGE_TICK_MS`: the step interval.
 
 The full list of settings is in the header of each entrypoint:

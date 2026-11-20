@@ -47,17 +47,29 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
     // Activity view, full text, all pages (reconcile needs complete user_message text of the batch's run).
     async read(threadId: string): Promise<ThreadRead> {
       const items: NonNullable<ThreadRead["items"]> = [];
-      let head: ThreadRead | undefined, afterPosition: number | undefined;
+      let head: ThreadRead | undefined, afterPosition = -1;
       for (;;) {
-        const page: ThreadRead = await call("t3_thread_read", { threadId, view: "activity", limit: 100, runLimit: 50, maxCharsPerItem: 50_000, ...(afterPosition === undefined ? {} : { afterPosition }) }, "bridge-read");
+        const page: ThreadRead = await call("t3_thread_read", { threadId, view: "activity", limit: 100, runLimit: 50, maxCharsPerItem: 50_000, afterPosition }, "bridge-read");
         head ??= page;
         items.push(...(page.items ?? []));
         if (!page.hasMore) return { ...head, items };
+        if (typeof page.nextPosition !== "number" || page.nextPosition <= afterPosition) throw new Error("t3_thread_read: pagination did not advance");
         afterPosition = page.nextPosition;
       }
     },
     projection: (threadId: string) => projection(log, threadId, { tokenPath: projectionTokenPath }),
-    queue: (threadId: string): Promise<QueueList> => call("t3_queue_list", { threadId }, "bridge-queue"),
+    async queue(threadId: string): Promise<QueueList> {
+      const items: QueueList["items"] = [];
+      let cursor = 0;
+      for (;;) {
+        const page: QueueList & { nextCursor?: number | null } = await call("t3_queue", { action: "list", threadId, cursor, limit: 100 }, "bridge-queue");
+        if (!Array.isArray(page?.items)) throw new Error("t3_queue: no items array");
+        items.push(...page.items);
+        if (page.nextCursor == null) return { items };
+        if (page.nextCursor <= cursor) throw new Error("t3_queue: pagination did not advance");
+        cursor = page.nextCursor;
+      }
+    },
     send: ({ threadId, message, mode, clientRequestId }: { threadId: string; message: string; mode: string; clientRequestId: string }) => {
       if (mode !== "queue") throw new Error(`t3 send mode ${mode} refused: the bridge sends queue only`);
       return call("t3_thread_send", { threadId, message, mode, clientRequestId }, "bridge-send");

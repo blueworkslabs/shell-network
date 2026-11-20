@@ -5,8 +5,16 @@ t3 thread (Claude or Codex provider). The bridge brings mentions from allowliste
 thread's queue and posts the agent's replies back. It is built to survive crashes, restarts and t3's own failure modes
 without losing a message or posting one twice.
 
-Status: experimental. It is tested against t3 0.1.0, with one channel and two bots, on a single VM. See
+Status: experimental. The adapter targets t3 0.1.11, with one channel and two bots on a single VM. See
 [SECURITY.md](SECURITY.md) for the trust model and the known limits.
+
+Trial scope: a rare duplicate message is acceptable. Keep changes limited to observed failures during real use;
+use behaviour checks and one independent review, not mutation campaigns. The public repository is the deployment source.
+
+Upgrading from t3 0.1.0 requires this adapter's `t3_queue` list action and explicit oldest-first activity pagination.
+Stop the bridges and t3, back up their data/configuration, then upgrade t3 and the bridge together. Renew expired
+MCP and WebSocket grants without changing their scopes. Keep the old runtime and cold data backup together for rollback:
+an older t3 binary must not be pointed at a database migrated by a newer release.
 
 ## What it does
 

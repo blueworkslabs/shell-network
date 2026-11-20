@@ -7,7 +7,7 @@ import { t3Adapter } from "../lib/t3.ts";
 import { memoryLog } from "../lib/log.ts";
 
 const DEPLOYED: string[] = JSON.parse(readFileSync(new URL("./fixtures/t3-mcp-tool-names.json", import.meta.url), "utf8")).names;
-const ALLOWED = ["t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue_list", "t3_thread_send"];
+const ALLOWED = ["t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send"];
 const P = "proj-gem", I = "crewGemClaude", T = "thread-gem";
 
 type Harness = ReturnType<typeof harness>;
@@ -23,7 +23,7 @@ const ok: Record<string, Record<string, unknown>> = {
   t3_thread_launch: { projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "claude-sonnet-5-5" } },
   t3_thread_list: { projectId: P, titleContains: "Gem (bridge x)", includeSubagents: false, limit: 100, cursor: 100 },
   t3_thread_read: { threadId: T, view: "activity", limit: 100, runLimit: 50, maxCharsPerItem: 50_000, afterPosition: 7 },
-  t3_queue_list: { threadId: T },
+  t3_queue: { action: "list", threadId: T },
   t3_thread_send: { threadId: T, message: "hi", mode: "queue", clientRequestId: "bridge-gem-1" },
 };
 const denied = async (h: Harness, name: string, args: unknown, re?: RegExp) => {
@@ -32,17 +32,16 @@ const denied = async (h: Harness, name: string, args: unknown, re?: RegExp) => {
   assert.equal(h.calls.length, before, `${name} must not reach the client`);
 };
 
-test("fixture: the deployed tool list has 83 tools, including every allowed one and the named risky ones", () => {
-  assert.equal(DEPLOYED.length, 83);
-  for (const n of [...ALLOWED, "t3_thread_interrupt", "t3_queue_cancel", "t3_queue_edit", "t3_queue_reorder", "t3_queue_promote_to_steer", "t3_project_delete", "request_secret", "t3_thread_configure"]) assert.ok(DEPLOYED.includes(n), n);
+test("fixture: current t3 exposes the bridge tools and other operations", () => {
+  for (const n of [...ALLOWED, "t3_thread_interrupt", "t3_project_delete", "t3_thread_configure"]) assert.ok(DEPLOYED.includes(n), n);
 });
 
-test("DENY: every deployed tool outside the allowlist is refused before the client is called (78 tools)", async () => {
+test("DENY: every deployed tool outside the allowlist is refused before the client is called", async () => {
   const h = harness();
   const others = DEPLOYED.filter((n) => !ALLOWED.includes(n));
-  assert.equal(others.length, 78);
+  assert.ok(others.length > 0);
   for (const n of others) await denied(h, n, { threadId: T }, /tool not allowed/);
-  for (const n of ["t3_thread_interrupt", "t3_queue_promote_to_steer", "t3_project_delete", "request_secret"]) assert.ok(h.log.events.some((e) => e.event === "bridge.mcp_denied" && e.tool === n));
+  for (const n of ["t3_thread_interrupt", "t3_project_delete"]) assert.ok(h.log.events.some((e) => e.event === "bridge.mcp_denied" && e.tool === n));
 });
 
 test("NEG control: each allowed tool with the bridge's own argument shapes passes through unchanged", async () => {
@@ -86,14 +85,16 @@ test("DENY list/read/queue: other project, subagents, other or no bound thread, 
   await denied(h, "t3_thread_read", { ...ok.t3_thread_read, threadId: "other" });
   await denied(h, "t3_thread_read", { ...ok.t3_thread_read, view: "messages" });
   await denied(h, "t3_thread_read", { ...ok.t3_thread_read, itemId: "i1" }, /not allowed/);
-  await denied(h, "t3_queue_list", { threadId: "other" });
+  await denied(h, "t3_queue", { threadId: "other" });
+  await denied(h, "t3_queue", { threadId: T }, /action required/);
+  for (const action of ["cancel", "edit", "reorder", "promote_to_steer", "read"]) await denied(h, "t3_queue", { threadId: T, action });
   h.state.bound = null;
-  for (const n of ["t3_thread_read", "t3_queue_list", "t3_thread_send"]) await denied(h, n, ok[n]);
+  for (const n of ["t3_thread_read", "t3_queue", "t3_thread_send"]) await denied(h, n, ok[n]);
 });
 
 test("DENY shapes: non-object arguments and prototype names are refused; the wrapper exposes no raw client", async () => {
   const h = harness();
-  for (const args of [null, [], "x"]) await denied(h, "t3_queue_list", args);
+  for (const args of [null, [], "x"]) await denied(h, "t3_queue", args);
   for (const n of ["constructor", "__proto__", "toString", "hasOwnProperty"]) await denied(h, n, {}, /tool not allowed/);
   assert.deepEqual(Object.keys(h.mcp).sort(), ["call", "reconnect", "sessionId"]);
   assert.equal((h.mcp as unknown as Record<string, unknown>).rpc, undefined);
@@ -111,7 +112,13 @@ test("adapter: no t3 adapter without a policy; its real call shapes pass the all
       calls.push(name);
       if (name === "t3_thread_list") return args.cursor ? { threads: [{ threadId: T, title: "Gem (bridge x)" }], nextCursor: null } : { threads: [], nextCursor: 100 };
       if (name === "t3_thread_launch") return { threadId: T };
-      if (name === "t3_thread_read") return args.afterPosition === undefined ? { items: [{}], hasMore: true, nextPosition: 1 } : { items: [{}], hasMore: false };
+      if (name === "t3_thread_read") {
+        if (args.afterPosition === -1) return { items: [{ text: "earlier input" }], hasMore: true, nextPosition: 1 };
+        return { items: [{ text: "latest reply" }], hasMore: false };
+      }
+      if (name === "t3_queue") return args.cursor === 0
+        ? { items: [{ queuedRunId: "q1", text: "first", truncated: false }], nextCursor: 1 }
+        : { items: [{ queuedRunId: "q2", text: "second", truncated: false }], nextCursor: null };
       return {};
     },
   };
@@ -119,9 +126,9 @@ test("adapter: no t3 adapter without a policy; its real call shapes pass the all
   assert.equal((await a.findThreads({ projectId: P, title: "Gem (bridge x)" })).length, 1);
   await a.launch({ projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "m" } });
   bound = T;
-  assert.equal((await a.read(T)).items!.length, 2);
-  await a.queue(T);
+  assert.deepEqual((await a.read(T)).items!.map((x) => x.text), ["earlier input", "latest reply"]);
+  assert.deepEqual((await a.queue(T)).items.map((x) => x.text), ["first", "second"]);
   await a.send({ threadId: T, message: "m", mode: "queue", clientRequestId: "c" });
-  assert.deepEqual(calls, ["t3_thread_list", "t3_thread_list", "t3_thread_launch", "t3_thread_read", "t3_thread_read", "t3_queue_list", "t3_thread_send"]);
+  assert.deepEqual(calls, ["t3_thread_list", "t3_thread_list", "t3_thread_launch", "t3_thread_read", "t3_thread_read", "t3_queue", "t3_queue", "t3_thread_send"]);
   await assert.rejects(a.launch({ projectId: P, title: "again", modelSelection: { instanceId: I, model: "m" } }), /already bound/);
 });

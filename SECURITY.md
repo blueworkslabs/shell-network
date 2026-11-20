@@ -14,7 +14,8 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   boundary against an agent that has shell access as the same user.
 - **Who can reach an agent.** Only people whose Discord user ids are in `BRIDGE_ALLOWED_AUTHORS`, and the other members in
   the private `BRIDGE_CREW_FILE` (including talk-only members). Everyone else is dropped before the buffer, both live and in backfill, without a reaction.
-  Only the configured channel is read or written.
+  Only the configured channel is read or written; at startup the bridge also reads the guild's role list once, to
+  find its own managed role.
 - **Separated grants.**
   - Each bridge has its bot's Discord token, an MCP token, and a read-only WS session.
   - Only the watchdog has the `operate` session, and it has no Discord or MCP credential.

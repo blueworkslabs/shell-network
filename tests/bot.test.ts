@@ -939,7 +939,6 @@ test("OUTBOX: a reply whose text is not complete in the read is not queued until
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["partial answer"]);
 });
 
-
 const OWN_ROLE = "777777777777777777", OTHER_ROLE = "888888888888888888";
 async function roleWorld(failure?: "channel" | "roles" | "missing") {
   const requests: string[] = [];
@@ -999,7 +998,6 @@ for (const failure of ["channel", "roles", "missing"] as const) test(`MANAGED RO
   await w.bot.step();
   assert.match(w.runs().at(-1)!.text, /direct still works/);
 });
-
 
 test("MANAGED ROLE: history catch-up accepts a missed role-only mention", async () => {
   const { w } = await roleWorld();

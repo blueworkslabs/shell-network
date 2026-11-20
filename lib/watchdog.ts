@@ -39,14 +39,14 @@ const descendsFrom = (procs: Proc[], pid: number, root: number) => {
   return false;
 };
 
-export function codexAppServers(snapshot: Snapshot): Proc[] | null {
+function codexAppServers(snapshot: Snapshot): Proc[] | null {
   const root = snapshot.t3MainPid;
   if (!(root !== null && root > 0)) return null; // unknown t3 process: no claim either way
   return snapshot.processes.filter((p) => isCodexAppServer(p.args) && descendsFrom(snapshot.processes, p.pid, root));
 }
 
 // Conditions in one snapshot, keyed so two snapshots can be intersected.
-export function conditions(snapshot: Snapshot): Map<string, Finding> {
+function conditions(snapshot: Snapshot): Map<string, Finding> {
   const out = new Map<string, Finding>();
   const servers = codexAppServers(snapshot);
   for (const t of snapshot.threads ?? []) {

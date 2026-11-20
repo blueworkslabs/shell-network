@@ -310,7 +310,6 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       });
     },
 
-    exchangesSinceHuman: () => exchangesSinceHuman(),
     // Accept a bot-authored message unless its episode already holds `cap` bot messages (cap 0 = off). Check and insert
     // (or the recorded refusal) in one transaction, so two bridges cannot both pass the cap. Decisions are final: a
     // repeat of an accepted message stays accepted, a repeat of a refused one stays refused, across resets and reopens.
@@ -341,12 +340,6 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         if (m.authorKind === "human") db.prepare("INSERT OR IGNORE INTO human_message (id) VALUES (?)").run(m.id);
         db.prepare("DELETE FROM channel_message WHERE at < ?").run(now() - CHANNEL_LOG_KEEP_MS); // the header needs recent turns only
       });
-    },
-    // Channel messages after `afterId` (Discord id order), oldest first.
-    channelSince(afterId: string | null): { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number }[] {
-      return afterId === null
-        ? all("SELECT * FROM channel_message ORDER BY length(id), id")
-        : all("SELECT * FROM channel_message WHERE length(id) > length(?) OR (length(id) = length(?) AND id > ?) ORDER BY length(id), id", afterId, afterId, afterId);
     },
 
     // The unread header's bounded read (lib/bot.ts unreadHeader): of the channel messages after `afterId` that are not
@@ -426,18 +419,6 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       });
     },
 
-    // Record that the stuck alert generated for `episode` was posted. A late acknowledgement for an earlier episode
-    // is ignored ({ stale: true }) and never silences the current one.
-    markAlerted(batchId: number, episode: number): { stale: boolean; batch: BatchRow | undefined } {
-      return tx(() => {
-        const b = getBatch.get(batchId);
-        if (!b) throw new Error(`markAlerted: no batch ${batchId}`);
-        if (!Number.isInteger(episode)) throw new Error("markAlerted: episode required");
-        if (episode !== b.episode) return { stale: true, batch: b };
-        db.prepare("UPDATE batch SET alerted_episode=?, alerted_at=? WHERE id=?").run(episode, now(), batchId);
-        return { stale: false, batch: getBatch.get(batchId) };
-      });
-    },
 
     // Explicit, durable end of an escalated batch by a person or the watchdog (the only ways it stops blocking):
     // resolve = handled another way, cancel = deliberately dropped. An alert acknowledgement is neither.
@@ -591,7 +572,6 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         return one<RelayRow>("SELECT * FROM relay WHERE conversation_key = ? AND run_id = ?", r.conversationKey, r.runId)!;
       });
     },
-    relayParts: (relayId: number): { part: number; channel_message_id: string }[] => all("SELECT part, channel_message_id FROM relay_part WHERE relay_id = ? ORDER BY part", relayId),
     recordRelayPart(relayId: number, part: number, parts: number, channelMessageId: string): void {
       tx(() => {
         db.prepare("INSERT OR IGNORE INTO relay_part (relay_id, part, channel_message_id, posted_at) VALUES (?, ?, ?, ?)").run(relayId, part, String(channelMessageId), now());

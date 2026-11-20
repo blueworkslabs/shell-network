@@ -24,7 +24,8 @@ function secretValues(f: string): string[] {
   return vals.filter((v) => v.length >= 16);
 }
 
-export function preflight({ secretFiles, env = process.env, uid = process.getuid!(), stat = lstatSync }: { secretFiles: string[]; env?: Record<string, string | undefined>; uid?: number; stat?: (p: string) => Stats }): { ok: true; uid: number } {
+export function preflight({ secretFiles, env = process.env }: { secretFiles: string[]; env?: Record<string, string | undefined> }): { ok: true; uid: number } {
+  const uid = process.getuid!(), stat = lstatSync;
   const problems: string[] = [];
   if (!Array.isArray(secretFiles) || !secretFiles.length) problems.push("no secret files given");
   for (const f of secretFiles ?? []) {

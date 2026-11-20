@@ -174,5 +174,5 @@ export function makeTools(tdb: ToolDb, key: string, { now = () => Date.now() }: 
         properties: { channel: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: READ_MAX }, before: { type: "string", description: "Optional: only messages older than this message id." } } },
       call: read },
   ];
-  return { tools, send, react, thread, read, exchanges: () => exchanges(config()) };
+  return { tools, send, react, thread, read };
 }

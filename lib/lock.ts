@@ -47,9 +47,8 @@ function checkPlace(stateDir: string, path: string, uid: number, lstat: Lstat): 
   return f;
 }
 
-// uid, lstat: the owner to require and the stat call (injectable, like lib/preflight.ts, so the owner and inode
-// checks are testable without root or a race).
-export function acquireBotLock(stateDir: string, key: string, { uid = process.getuid!(), lstat = lstatSync }: { uid?: number; lstat?: Lstat } = {}): BotLock & { _db: DatabaseSync } {
+export function acquireBotLock(stateDir: string, key: string): BotLock & { _db: DatabaseSync } {
+  const uid = process.getuid!(), lstat: Lstat = lstatSync;
   const path = lockPath(stateDir, key);
   const before = checkPlace(stateDir, path, uid, lstat);
   // Create/open the file without following a symlink and note its inode; SQLite (which cannot be asked for

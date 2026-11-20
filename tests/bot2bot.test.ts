@@ -504,17 +504,6 @@ test("crewConfig: <key>:<id> of known other bots, cap default 2, 0 = off; bad va
   assert.throws(() => makeBot({ allowedAuthors: [HUMAN_ID], allowedBots: [{ id: "not-an-id", name: "X" }] } as never), /allowedBots/);
 });
 
-test("MIGRATION (older DB): inbound rows get author_kind 'human'", () => {
-  const path = join(tempDir("bot2bot-mig-"), "b.db");
-  let b = openTempBuffer(path);
-  b.accept({ source: "discord", sourceMessageId: "m1", conversationKey: "gem", author: "a", text: "one", receivedAt: 1 });
-  b.db.exec("ALTER TABLE inbound DROP COLUMN author_kind");
-  b.close();
-  b = openTempBuffer(path);
-  assert.deepEqual(b.buffered("gem").map((r) => r.author_kind), ["human"]);
-  assert.equal(b.exchangesSinceHuman().lastHumanId, "m1");
-});
-
 test("CHANNEL LOG: entries older than 7 days are dropped on the next write", () => {
   let clock = 10 * 24 * 3600_000;
   const b = openTempBuffer(join(tempDir("bot2bot-log-"), "b.db"), { now: () => clock });
@@ -610,12 +599,3 @@ test("CAP NOTICE per episode: the next capped episode gets its own 'waiting for 
   assert.deepEqual(notices.map((m) => m.author.id), [GEM, HERMES]);
 });
 
-test("MIGRATION (pre-release draft DB): human messages of the channel log become persistent resets", () => {
-  const path = join(tempDir("bot2bot-hm-"), "b.db");
-  let b = openTempBuffer(path);
-  b.recordChannelMessage({ id: "200", authorId: HUMAN_ID, authorName: "p", authorKind: "human", content: "hi", at: Date.now() });
-  b.db.exec("DELETE FROM human_message");
-  b.close();
-  b = openTempBuffer(path);
-  assert.equal(b.exchangesSinceHuman().lastHumanId, "200");
-});

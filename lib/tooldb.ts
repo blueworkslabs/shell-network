@@ -1,5 +1,5 @@
 // The Discord tool's connection to the bridge DB (not openBuffer()).
-// It never creates the file and never migrates: the bridge owns the schema, and a DB whose schema version
+// It never creates the file or the schema: the bridge owns the schema, and a DB whose schema version
 // (PRAGMA user_version) is not the one this code was built for is refused (fail closed). An authorizer confines the
 // connection to the statements the tools need: reads of the listed tables, INSERT (only) into the listed tables, never
 // inbound, batch or kv; transactions; no UPDATE/DELETE, DDL, ATTACH, writable PRAGMA or anything else.

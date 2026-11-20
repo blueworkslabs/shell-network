@@ -16,8 +16,8 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import type { AcceptInput, ActionRow, AlertRow, BatchRow, BatchStatus, InboundRow, NoticeRow, OutboxRow, RelayRow, ReplyRow, SendResult } from "./types.ts";
 
 const CHANNEL_LOG_KEEP_MS = 7 * 24 * 3600_000; // channel log retention (unread header, tool reads)
-// Schema version (PRAGMA user_version), set by openBuffer after the migrations. Openers that must not migrate (the
-// Discord tool, lib/tooldb.ts) refuse any other version. Raise it with every schema change or migration.
+// Schema version (PRAGMA user_version), set by openBuffer. Openers that must not create the schema (the Discord
+// tool, lib/tooldb.ts) refuse any other version. Raise it with every schema change.
 export const BUFFER_SCHEMA_VERSION = 1;
 
 const SCHEMA = `
@@ -199,55 +199,21 @@ const ALLOWED: Partial<Record<BatchStatus, BatchStatus[]>> = { prepared: ["escal
 
 export type Buffer = ReturnType<typeof openBuffer>;
 
-// Migrations; called by openBuffer inside its IMMEDIATE transaction, with foreign keys off.
-function migrate(db: DatabaseSync): void {
-  const columns = (table: string) => (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
-  // Older DBs: add batch.settled_at. Batches resolved/cancelled under the earlier rule (which unblocked at once)
-  // count as settled, so an existing DB does not start blocking on them.
-  if (!columns("batch").includes("settled_at")) {
-    db.exec("ALTER TABLE batch ADD COLUMN settled_at INTEGER; UPDATE batch SET settled_at = updated_at WHERE status IN ('resolved','cancelled');");
-  }
-  // Older DBs: the dedupe key becomes (source, message, conversation), so one message that mentions two bots
-  // reaches both. SQLite cannot change a constraint in place: rebuild the table, same rows and ids.
-  const inboundSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inbound'").get() as { sql: string }).sql;
-  if (!/UNIQUE\s*\(\s*source\s*,\s*source_message_id\s*,\s*conversation_key\s*\)/.test(inboundSql)) {
-    const createNew = SCHEMA.slice(SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS inbound"), SCHEMA.indexOf(");", SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS inbound")) + 2)
-      .replace("CREATE TABLE IF NOT EXISTS inbound", "CREATE TABLE inbound_new");
-    const cols = "id, source, source_message_id, conversation_key, author, text, received_at, accepted_at, state, batch_id, acked_at"; // author_kind: default
-    db.exec(`${createNew} INSERT INTO inbound_new (${cols}) SELECT ${cols} FROM inbound; DROP TABLE inbound; ALTER TABLE inbound_new RENAME TO inbound;
-      CREATE INDEX IF NOT EXISTS inbound_pending ON inbound (conversation_key, state, received_at, id);`);
-  }
-  // Older DBs: inbound rows get the author kind; everything accepted before was from a person.
-  if (!columns("inbound").includes("author_kind")) db.exec("ALTER TABLE inbound ADD COLUMN author_kind TEXT NOT NULL DEFAULT 'human' CHECK (author_kind IN ('human','bot'));");
-  // From pre-release drafts: resets came from the channel log; carry those over to human_message.
-  db.exec("INSERT OR IGNORE INTO human_message (id) SELECT id FROM channel_message WHERE author_kind = 'human';");
-  // Older DBs: notices get the bot whose bridge posts them; the first bot (gem) was the only one then. The UPDATE also repairs a DB
-  // left by an earlier non-atomic migration (column added, opener killed before the backfill): addNotice always sets
-  // the key, so a NULL can only come from there.
-  if (!columns("notice").includes("conversation_key")) db.exec("ALTER TABLE notice ADD COLUMN conversation_key TEXT;");
-  db.exec("UPDATE notice SET conversation_key = 'gem' WHERE conversation_key IS NULL;");
-}
-
 export function openBuffer(path: string, { now = () => Date.now() }: { now?: () => number } = {}) {
   const db = new DatabaseSync(path);
   // busy_timeout: the watchdog process writes to the same DB (notices, its action log)
   // busy_timeout first, so a second process opening at the same time waits instead of failing.
   db.exec("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
-  // Schema and every migration in ONE IMMEDIATE transaction: each check runs under the write lock, so
-  // two processes opening a legacy DB migrate it exactly once, and a crash or error mid-migration rolls all of it back
-  // (SQLite DDL is transactional). foreign_keys cannot change inside a transaction: off for this block, on after.
-  db.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;");
+  // The schema in one IMMEDIATE transaction, so two processes opening a new DB create it once.
+  db.exec("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;");
   try {
     db.exec(SCHEMA);
-    migrate(db);
     db.exec(`PRAGMA user_version = ${BUFFER_SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch {}
     db.close();
     throw e;
-  } finally {
-    if (db.isOpen) db.exec("PRAGMA foreign_keys = ON;");
   }
   // Re-entrant: an inner tx() joins the outer transaction (the outbox records a post and its domain row in one).
   let txDepth = 0;
@@ -578,30 +544,6 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       });
     },
     atomically: <T>(fn: () => T): T => tx(fn),
-    // Message intents of a pre-outbox version that may or may not have been posted (lib/cutover.ts): reply markers
-    // without a recorded part (not yet taken over by the outbox), alerts recorded but not confirmed, alerts whose
-    // episode ended without their follow-up, notices not marked posted, a thread alert queued ("") or a stored
-    // thread follow-up. A confirmed alert whose episode is still on carries forward safely.
-    legacyIntents(conversationKey: string): string[] {
-      const pre = `${conversationKey}:post:`;
-      const out = all<{ key: string }>(`SELECT k.key FROM kv k WHERE substr(k.key, 1, length(?1)) = ?1
-        AND NOT EXISTS (SELECT 1 FROM reply r WHERE ?1 || r.batch_id || ':' || r.part = k.key)
-        AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.conversation_key = ?2 AND substr(o.key, 1, 6) = 'reply:' AND ?1 || substr(o.key, 7) = k.key)
-        ORDER BY k.key`, pre, conversationKey).map((r) => `reply marker ${r.key}`);
-      for (const a of all<{ batch_id: number; episode: number; channel_message_id: string | null; batch_episode: number }>(`SELECT a.batch_id, a.episode, a.channel_message_id, b.episode AS batch_episode
-        FROM alert a JOIN batch b ON b.id = a.batch_id WHERE b.conversation_key = ? AND a.cleared_at IS NULL ORDER BY a.batch_id, a.episode`, conversationKey)) {
-        if (a.channel_message_id === null) out.push(`alert ${a.batch_id}/${a.episode} not confirmed`);
-        else if (a.batch_episode !== a.episode) out.push(`alert ${a.batch_id}/${a.episode} ended without its follow-up`);
-      }
-      for (const n of all<{ key: string }>("SELECT key FROM notice WHERE conversation_key = ? AND posted_at IS NULL ORDER BY id", conversationKey)) out.push(`notice ${n.key} not marked posted`);
-      const ta = one<{ value: string }>("SELECT value FROM kv WHERE key = ?", `${conversationKey}:threadAlert`)?.value;
-      if (ta) {
-        const st = JSON.parse(ta) as { msg: string | null; clear?: unknown };
-        if (st.msg === "") out.push("thread alert queued, not confirmed");
-        if (st.clear) out.push("thread alert follow-up due");
-      }
-      return out;
-    },
     outboxEntry: (conversationKey: string, key: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND key = ?", conversationKey, key),
     // The newest post in the bot's channel, or (threadId) in one of its tool threads: entries posted into a
     // thread carry meta { channel: <thread id>, thread: 1 }; everything else is a channel post.

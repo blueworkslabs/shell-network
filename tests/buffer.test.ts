@@ -220,28 +220,8 @@ test("PREFIX on an existing DB: no switch while any batch is open (old format ke
   assert.equal(next.client_request_id, `bridge-c1-${prefix}-${next.id}`, "switched once nothing was open");
 });
 
-// ---- settlement before release, migration, watchdog tables ----
+// ---- settlement before release, watchdog tables ----
 
-test("MIGRATION: an older DB gets settled_at; batches resolved/cancelled under the old rule count as settled", () => {
-  const path = fresh();
-  let b = openTempBuffer(path);
-  b.accept(msg("m1", "a", 1));
-  const old = b.createBatch("c1")!;
-  b.recordSend(old.id, { ok: true, messageId: "m", runId: "r", delivery: "queued" });
-  b.setStatus(old.id, "escalated");
-  b.resolve(old.id, { by: "operator", note: "done by hand" });
-  b.accept(msg("x1", "b", 2, "c2"));
-  const open = b.createBatch("c2")!; // still open, must stay open
-  b.db.exec("ALTER TABLE batch DROP COLUMN settled_at"); // the older schema
-  b.close();
-  b = openTempBuffer(path);
-  assert.ok(b.batch(old.id)!.settled_at !== null, "old resolution counts as settled");
-  assert.deepEqual(b.openBatches("c1"), []);
-  assert.deepEqual(b.openBatches("c2").map((x) => x.id), [open.id]);
-  b.close();
-  b = openTempBuffer(path); // idempotent
-  assert.deepEqual(b.openBatches("c1"), []);
-});
 
 test("NEG settle: only resolved/cancelled batches can be marked settled; a second call changes nothing", () => {
   const b = openTempBuffer(fresh());

@@ -9,10 +9,9 @@ kill run is in `tests/fixtures/stress-run3-held.json`.
 If the Codex app-server dies during a turn, the run stays `running` (or `preparing`/`waiting`) indefinitely. t3 does
 not notice that the process is gone, and every message after it waits behind that run.
 
-What the code does: the watchdog flags `codex-wedged` when a Codex instance's run is active and no Codex app-server
-runs under t3's main process, in two snapshots at least 60 s apart. A controlled t3 restart is the only way out
-that was verified. It happens at most once per 10 minutes, and only when no other thread has an active turn
-(`lib/watchdog.ts`, `lib/watchdog-run.ts`).
+Fixed upstream before t3 0.1.11: killing the app-server during a run now fails the run within milliseconds, and the
+next message in the thread runs normally (checked on staging, 2026-11-20). The watchdog's t3 restart for this case
+was removed.
 
 ## 2. A failed run holds the queue (pingdotgg/t3code#22423)
 

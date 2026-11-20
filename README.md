@@ -30,8 +30,7 @@ an older t3 binary must not be pointed at a database migrated by a newer release
 - **Bot-to-bot with a cap.** Bots may hand work to each other by mention. After `BRIDGE_EXCHANGE_CAP` bot messages
   without a person in between, the bridge stops and posts one "waiting for the user" notice.
 - **Completion relay.** Runs that no batch started (background wakes, scheduled tasks) also reach the channel.
-- **Watchdog.** A separate process holds t3's `operate` grant. It resumes held queues and restarts t3 when a Codex
-  session is wedged (see [LESSONS.md](LESSONS.md)).
+- **Watchdog.** A separate process holds t3's `operate` grant. It resumes held queues (see [LESSONS.md](LESSONS.md)).
 - **Discord tool for the agent.** `bin/discord-tool.ts` is a stdio MCP server the provider spawns. It offers
   `discord_send`, `discord_react`, `discord_thread` and `discord_read`. It holds no token: it writes into the bridge's
   outbox through a confined DB connection, and the bridge does the posting.
@@ -84,8 +83,7 @@ Optional settings:
 The full list of settings is in the header of each entrypoint:
 
 - `bin/bridge.ts`: one bot. A second bridge for the same bot exits with status 4, "lease held".
-- `bin/watchdog.ts`: settings `WATCHDOG_DB`, `WATCHDOG_LOG`, `WATCHDOG_OPERATE_TOKEN`, `WATCHDOG_SETTINGS` and
-  `WATCHDOG_T3_UNIT`.
+- `bin/watchdog.ts`: settings `WATCHDOG_DB`, `WATCHDOG_LOG` and `WATCHDOG_OPERATE_TOKEN`.
 - `bin/discord-tool.ts`: configured in the t3 provider instance with `DISCORD_TOOL_BOT` and `DISCORD_TOOL_DB`. It
   refuses to start if any of the bridge's secret variables are in its environment.
 

@@ -4,9 +4,8 @@
 
 ## How it was checked
 
-- [ ] `npm test` (or `sh scripts/test.sh`) passes: strict `tsc`, then all offline tests
-- [ ] New behaviour has a test, and a negative control that fails without the change
-- [ ] Crash/restart paths considered (buffer, outbox head, reconcile) where the change touches them
+- [ ] `npm run typecheck` and the touched tests pass locally; CI runs the full suite (`npm test`)
+- [ ] A behaviour change has a behaviour test; superseded tests are deleted (CONTRIBUTING.md)
 
 ## Safety
 

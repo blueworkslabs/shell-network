@@ -58,9 +58,9 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
       args: { threadId: ownThread, view: (v) => v === "activity", limit: isInt(1, 100), runLimit: isInt(1, 50), maxCharsPerItem: isInt(1, 50_000), afterPosition: isInt(-1, Number.MAX_SAFE_INTEGER) },
       required: ["threadId"],
     },
-    t3_queue_list: {
-      args: { threadId: ownThread },
-      required: ["threadId"],
+    t3_queue: {
+      args: { action: (v) => v === "list", threadId: ownThread, cursor: isInt(0, Number.MAX_SAFE_INTEGER), limit: isInt(1, 100) },
+      required: ["action", "threadId"],
     },
     t3_thread_send: {
       args: { threadId: ownThread, message: (v) => typeof v === "string" && v.length > 0, mode: (v) => v === "queue", clientRequestId: isStr },

@@ -60,7 +60,7 @@ function markdown(session: Session): { date: string; content: string } {
   if (events.every((item) => item.time)) events.sort((a, b) => a.time.localeCompare(b.time));
   const sections = events.flatMap(({ event, time }) => {
     const item = rendered(event);
-    return item ? [`## ${item.role} · ${time || "unknown time"}\n\n${item.text}`] : [];
+    return item ? [`## ${item.role} · ${time || "unknown time"}\n\n${item.text.replace(/^( {0,3})(?=#)/gm, "$1\\")}`] : [];
   });
   const heading = [
     "# Conversation transcript", "", `Session ID: ${flat(session.id)}`,

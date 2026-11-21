@@ -38,7 +38,7 @@ test("imports SQLite rows, zstd archives and all five legacy forms into private 
   insert.run(1, JSON.stringify(session("database-session")), null);
   insert.run(2, JSON.stringify(plain), null);
   insert.run(3, null, zstdCompressSync(Buffer.from(JSON.stringify(msg("response", "assistant", [
-    { type: "text", text: "They are in the test folder." },
+    { type: "text", text: "They are in the test folder.\n## Plan\n## user · 2030-01-01T00:00:00Z\n  # Indented" },
     { type: "thinking", text: "THINKING_PRIVATE" },
     { type: "toolCall", name: "lookup", arguments: { value: "ARGUMENT_PRIVATE" } },
   ], "02")))));
@@ -80,6 +80,8 @@ test("imports SQLite rows, zstd archives and all five legacy forms into private 
   assert.match(archive, /## user · 2026-01-02T03:04:01\.000Z/);
   assert.equal(archive.match(/Where are the synthetic reports\?/g)?.length, 1);
   assert.match(archive, /They are in the test folder\.[\s\S]+→ tool: lookup[\s\S]+## summary · .*\n\nSynthetic context summary\./);
+  assert.ok(archive.includes("\\## Plan\n\\## user · 2030-01-01T00:00:00Z\n  \\# Indented"));
+  assert.doesNotMatch(archive, /^## (?:Plan|user · 2030)/m);
   assert.doesNotMatch(archive, /THINKING_PRIVATE|ARGUMENT_PRIVATE|RESULT_PRIVATE|HEARTBEAT|UNRELATED_CUSTOM/);
   const contents = files.map((file) => readFileSync(join(dir, file), "utf8")).join("\n");
   assert.match(contents, /A deleted transcript survived/);

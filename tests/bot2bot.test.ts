@@ -87,8 +87,8 @@ test("NEG crew bots: a bot outside the allowlist, an allowed bot without a menti
   assert.deepEqual(w.discord.writes.filter((x) => x.kind === "message").at(-1)!.payload!.allowed_mentions, { parse: [] });
 });
 
-test("EXCHANGE CAP 2: the third bot-to-bot message is held back, one 'waiting for the user' notice that wakes the loop; a person's message resets the count", async () => {
-  const w = crew({ cap: 2 });
+test("EXCHANGE CAP 2: the third bot-to-bot message is held back, one pause notice that wakes the loop; a person's message resets the count", async () => {
+  const w = crew({ cap: 2, talkOnly: true });
   await w.person("you two sort it out", GEM);
   await w.turn(w.gem, `<@${HERMES}> one`);         // exchange 1
   await w.turn(w.hermes, `<@${GEM}> two`);         // exchange 2
@@ -101,7 +101,7 @@ test("EXCHANGE CAP 2: the third bot-to-bot message is held back, one 'waiting fo
   await w.hermes.bot.step();
   const notices = w.discord.messages.filter((m) => m.content.startsWith("⏸"));
   assert.equal(notices.length, 1);
-  assert.match(notices[0].content, /^⏸ Waiting for the user: Hermes and Gem have had 2 exchanges without the user, so I stopped here\. Mention one of us to go on \(a bare @mention is enough\)\.$/);
+  assert.match(notices[0].content, /^⏸ Exchange cap reached: Hermes and Gem have had 2 exchanges since the last message from a person or talk-only member\./);
   assert.equal(notices[0].author.id, HERMES);
   await w.gem.bot.step();
   assert.equal(w.discord.messages.filter((m) => m.content.startsWith("⏸")).length, 1, "Gem does not post a second one");

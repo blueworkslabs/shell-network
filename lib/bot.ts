@@ -164,7 +164,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})` : "none pending"}`,
-      `Bot-to-bot messages since the user's last message: ${exchangeCap > 0 ? `${n} of ${exchangeCap}` : `${n} (no cap)`}`].join("\n");
+      `Bot-to-bot messages since the last message from a person or talk-only member: ${exchangeCap > 0 ? `${n} of ${exchangeCap}` : `${n} (no cap)`}`].join("\n");
   }
   const isBusy = (read: ThreadRead) => Boolean(read.thread?.activeRunId) || (read.recentRuns ?? []).some((r) => !TERMINAL.has(r.status));
   // Advances the reset as far as it can in this step. Returns the limit for batching, or a result that ends the step.
@@ -250,7 +250,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const b = buffer.acceptFromBot(input, exchangeCap);
       if ("capped" in b) {
         // the cap is reached: not delivered; one notice per episode (key = last human message), whichever bot sees it first
-        buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Waiting for the user: ${[name, ...bots.values()].join(" and ")} have had ${b.count} exchanges without the user, so I stopped here. Mention one of us to go on (a bare @mention is enough).`, conversationKey);
+        const bridgeBots = [name, ...allowedBots.filter((b) => !b.talkOnly).map((b) => b.name)].join(" and ");
+        buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${b.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
         log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: b.count, cap: exchangeCap });
         return { accepted: false, reason: "exchange cap", wake: true };
       }

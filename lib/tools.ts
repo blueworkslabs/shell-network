@@ -136,7 +136,7 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
       const addressesBot = c.crew.some((b) => !b.talkOnly && users.includes(b.id));
       if (addressesBot && c.exchange_cap > 0) {
         const n = exchanges(c);
-        if (n >= c.exchange_cap) throw new ToolError(`exchange cap reached: ${n} bot-to-bot messages since the user's last message (cap ${c.exchange_cap}); wait for the user`);
+        if (n >= c.exchange_cap) throw new ToolError(`exchange cap reached: ${n} bot-to-bot messages since the last message from a person or talk-only member (cap ${c.exchange_cap}). Wait for a message from a person or talk-only member.`);
       }
       // last, after every check: the copies are the only side effect outside the transaction
       let staged: StagedFile[] = [];

@@ -79,6 +79,36 @@ The first batch of the fresh thread starts with a line telling the agent to read
 while one is pending is ignored. Nothing is force-cut: a turn that never ends keeps the reset waiting. Archived threads
 stay readable and searchable in t3; there is no `/resume` or unarchive yet.
 
+## Slash commands (`lib/commands.ts`)
+
+Each bot application registers two global, guild-only commands without options: `/new` (the reset above) and `/status`
+(this bot in this channel: thread title and state, open batch, waiting messages, pending `/new`, bot-to-bot count and
+cap). Discord shows one entry per bot, so choosing the entry chooses the bot. The text `@Bot /new` keeps working.
+
+- **Registration** runs in the background after startup. The application id is read from Discord's
+  application data (`GET /oauth2/applications/@me`), never assumed to be the bot user's. The set's hash is kept in kv
+  per application (key `<bot>:commandsHash:<application id>`, the id is also in the hash): while it is unchanged no
+  command request is made. Otherwise the application's global commands are read and brought to
+  exactly this set: missing ones created, different ones edited, every other one (foreign commands, other types, stale
+  names) deleted. The hash is stored only after a complete success; a failure only logs and is retried at the next start.
+- **Handling** (`INTERACTION_CREATE`, bridge-level, then the bot of the interaction's channel): the callback is the first
+  thing done, within Discord's 3 seconds. Another channel, a user outside `BRIDGE_ALLOWED_AUTHORS` or an unknown command
+  gets one ephemeral refusal and nothing else happens. Otherwise the reply is deferred (ephemeral) and then edited with
+  the result. An expired interaction (10062) is swallowed; an error edits the placeholder into a short failure line.
+- **`/new` by interaction** is the same state machine with the interaction id as the command id and source
+  `interaction`: an interaction id is not a message, so no reaction or reply reference points at it. The confirmation
+  still goes through the outbox, as a plain message. The command also records a reset boundary (`human_message`) like a person's message, so the cap
+  resets on both sides: the receiving count and the Discord tool's budget agree.
+- An expired interaction (10062) and one delivered twice (Discord answers the second defer with 40060) are logged and
+  dropped: the reset is durable (kv and the buffer) and its channel confirmation goes through the outbox, so neither an
+  expired token nor a restart loses or repeats it. Interaction tokens are never stored or logged, errors included
+  (they are redacted before logging).
+- The REST client has only this application's command routes and the callback routes; nothing here posts in a channel.
+- **Rollback.** Reverting the code leaves the registered commands visible with nothing to answer them. Remove them first
+  (or after) with the new release's `bin/clear-commands.ts`, for each bot: `BRIDGE_BOT=<key> BRIDGE_DISCORD_TOKEN=<token
+  file> BRIDGE_DB=<buffer path> node bin/clear-commands.ts`. It deletes every global command of that application and
+  stores the empty set's hash, so the next start of this code registers `/new` and `/status` again.
+
 ## Output: one outbox per bot
 
 Every message a bot posts goes into the `outbox` table, and one worker posts the entries strictly head first. This

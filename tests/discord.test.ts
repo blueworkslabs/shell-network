@@ -227,3 +227,47 @@ test("gateway on the real WebSocketManager + local Gateway: /gateway/bot answers
     await lg.close();
   }
 });
+
+test("REST commands and interactions: the application id comes from Discord, only that application's routes are used, callbacks are ephemeral, malformed ids never reach the wire", async () => {
+  const seen: { path: string; method: string; body: any }[] = [];
+  const makeRequest = async (url: string, init: any) => {
+    const path = new URL(url).pathname.replace("/api/v10", "");
+    seen.push({ path, method: init.method, body: init.body ? JSON.parse(String(init.body)) : undefined });
+    if (path === "/oauth2/applications/@me") return json({ id: "700000000000000001" }); // not the bot user's id
+    if (path.endsWith("/commands") && init.method === "GET") return json([{ id: "5", name: "old" }]);
+    if (path.includes("/callback")) return json({});
+    return json({ id: "9" });
+  };
+  const rest = discordRest({ token: "t", allowedChannels: ["c"], makeRequest });
+  assert.deepEqual(await rest.application(), { id: "700000000000000001" });
+  const body = { name: "new", description: "d", type: 1 as const, contexts: [0], integration_types: [0], options: [] as never[], default_member_permissions: null, nsfw: false as const };
+  await rest.listCommands();
+  await rest.createCommand(body);
+  await rest.editCommand("5", body);
+  await rest.deleteCommand("5");
+  await rest.interactions.defer("800000000000000001", "tok_en-1");
+  await rest.interactions.reply("800000000000000002", "tok_en-2", "x".repeat(3000));
+  await rest.interactions.edit("tok_en-1", "done");
+  assert.deepEqual(seen.map((s) => `${s.method} ${s.path}`), [
+    "GET /oauth2/applications/@me", // read once, then remembered
+    "GET /applications/700000000000000001/commands",
+    "POST /applications/700000000000000001/commands",
+    "PATCH /applications/700000000000000001/commands/5",
+    "DELETE /applications/700000000000000001/commands/5",
+    "POST /interactions/800000000000000001/tok_en-1/callback",
+    "POST /interactions/800000000000000002/tok_en-2/callback",
+    "PATCH /webhooks/700000000000000001/tok_en-1/messages/%40original" // the same route, @ percent-encoded,
+  ]);
+  assert.deepEqual(seen[5].body, { type: 5, data: { flags: 64 } });
+  assert.equal(seen[6].body.type, 4);
+  assert.equal(seen[6].body.data.flags, 64);
+  assert.ok(seen[6].body.data.content.length <= 1901, "long text is cut");
+  assert.deepEqual(seen[6].body.data.allowed_mentions, { parse: [] });
+  assert.equal(seen[7].body.content, "done");
+  const before = seen.length;
+  assert.throws(() => rest.interactions.defer("../x", "tok"), /malformed/);
+  assert.throws(() => rest.interactions.reply("8", "tok/../x", "x"), /malformed/);
+  await assert.rejects(rest.interactions.edit("tok/../x", "x"), /malformed/);
+  await assert.rejects(rest.editCommand("5/../6", body), /malformed/);
+  assert.equal(seen.length, before, "nothing was sent for malformed ids");
+});

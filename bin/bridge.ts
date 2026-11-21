@@ -24,6 +24,7 @@ import { openBuffer } from "../lib/buffer.ts";
 import { acquireBotLock, LockHeldError, type BotLock } from "../lib/lock.ts";
 import { makeBot } from "../lib/bot.ts";
 import { discordRest, discordGateway } from "../lib/discord.ts";
+import { commandsHashKey, interactionDispatch, reconcileCommands } from "../lib/commands.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import type { LogFields } from "../lib/types.ts";
@@ -118,11 +119,13 @@ log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, chann
 const loop = stepLoop({ step: stepAll(bots, log, channelIds), tickMs, log });
 const nudge = loop.nudge;
 
+// Slash commands (`/new`, `/status`): answered per interaction, by the bot of the interaction's channel (lib/commands.ts).
+const interact = interactionDispatch({ port: discord.interactions, bots: new Map(bots.map((b, i) => [channelIds[i], b])), allowedAuthors, nudge, log });
 // Catch-up runs inside the step loop (single flight); every new live session (READY/RESUMED) closes the dispatch
 // gate until a catch-up has completed within it.
 var gateway: DiscordGateway = discordGateway({
   token, log,
-  onDispatch: ((ds) => (type: string, d: unknown) => { for (const f of ds) void f(type, d); })(bots.map((bot, i) => gatewayDispatch({ bot, channelId: channelIds[i], nudge, log }))),
+  onDispatch: ((ds) => (type: string, d: unknown) => { for (const f of ds) void f(type, d); void interact(type, d); })(bots.map((bot, i) => gatewayDispatch({ bot, channelId: channelIds[i], nudge, log }))),
   onFatal: (code) => { log.emit("bridge.fatal", { code }); shutdown(3); },
 });
 // t3 thread changes wake the loop early (relayed completions of runs no batch started); the idle tick stays
@@ -147,3 +150,7 @@ try {
 }
 for (const w of watches) w.start();
 loop.start();
+// This application's slash commands, brought to our set in the background: a failure only logs (the text `/new` still
+// works) and is tried again at the next start, because the set's hash is stored only after a complete reconcile.
+void reconcileCommands({ port: discord, buffer, hashKey: commandsHashKey(cfg.key), log })
+  .catch((e) => log.emit("bridge.commands_failed", { error: errText(e) }));

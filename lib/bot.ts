@@ -99,7 +99,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // in a crash are retried by step(). A message that no longer exists (404) counts as acknowledged.
   async function ack(row: InboundRow): Promise<void> {
     try {
-      await discord.react(channelId, row.source_message_id, "👀");
+      if (row.source === "discord") await discord.react(channelId, row.source_message_id, "👀"); // an interaction is answered by its own reply
       buffer.markAcked(row.id);
     } catch (e) {
       const status = (e as { status?: number } | null)?.status;
@@ -119,7 +119,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   //   confirm  the fresh thread is bound: one confirmation (outbox `new:<id>`), reset done (kv `resetSeen`)
   // A `/new` ignored while one is pending is recorded in kv `resetSeen` (the newest `/new` id handled or ignored).
   // A crash between the t3 call and the transaction repeats the archive call; t3 refuses it, and a thread that reads as archived counts as done.
-  type Reset = { id: string; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string };
+  type Reset = { id: string; source?: "discord" | "interaction"; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string };
   const maxId = (a: string | null, b: string): string => (a !== null && BigInt(a) > BigInt(b) ? a : b);
   const resetState = (): Reset | null => { const v = buffer.kvGet(K("reset")); return v ? (JSON.parse(v) as Reset) : null; };
   const saveReset = (r: Reset) => buffer.kvSet(K("reset"), JSON.stringify(r));
@@ -127,24 +127,41 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const noUser = String(msg.content ?? "").replace(mentionRe(), "");
     return (botRoleId ? noUser.replace(roleRe(), "") : noUser).trim() === "/new";
   }
-  function acceptNew(msg: DiscordMessage & { id: string }): AcceptResult {
+  // `/new` as a message (source "discord", id = the message) or as a slash command (source "interaction", id = the
+  // interaction): the same reset either way. An interaction id is not a message, so nothing replies to it or reacts on it.
+  function requestNew(cmd: { id: string; author: string; receivedAt: number; source: "discord" | "interaction" }): AcceptResult {
     const seen = buffer.kvGet(K("resetSeen"));
     const cur = resetState();
-    if (cur?.id !== msg.id) {
-      if (seen && BigInt(msg.id) <= BigInt(seen)) return { accepted: false, reason: "new already handled" };
+    if (cur?.id !== cmd.id) {
+      if (seen && BigInt(cmd.id) <= BigInt(seen)) return { accepted: false, reason: "new already handled" };
       if (cur) { // ignored while one is pending, and remembered, so a replay after it finished does not start another
-        buffer.kvSet(K("resetSeen"), maxId(seen, msg.id));
+        buffer.kvSet(K("resetSeen"), maxId(seen, cmd.id));
         return { accepted: false, reason: "new pending" };
       }
     }
     // state and row together; a redelivery of the same message finds both (or completes whichever is missing)
     const r = buffer.atomically(() => {
-      if (!cur) saveReset({ id: msg.id, stage: "drain" });
-      return buffer.accept({ source: "discord", sourceMessageId: msg.id, conversationKey, author: msg.author?.username ?? "user", text: NEW_WRAPUP_TEXT,
-        receivedAt: Date.parse(msg.timestamp as string) || now(), channelId });
+      if (!cur) saveReset({ id: cmd.id, source: cmd.source, stage: "drain" });
+      // a command is a person's word like a message: it resets the exchange cap, also for the Discord tool's budget
+      if (cmd.source === "interaction") buffer.recordResetBoundary(cmd.id, channelId);
+      return buffer.accept({ source: cmd.source, sourceMessageId: cmd.id, conversationKey, author: cmd.author, text: NEW_WRAPUP_TEXT, receivedAt: cmd.receivedAt, channelId });
     });
-    log.emit("bridge.new_command", { bot: name, sourceMessageId: msg.id, inserted: r.inserted });
+    log.emit("bridge.new_command", { bot: name, sourceMessageId: cmd.id, source: cmd.source, inserted: r.inserted });
     return { accepted: true, inserted: r.inserted };
+  }
+  const acceptNew = (msg: DiscordMessage & { id: string }): AcceptResult =>
+    requestNew({ id: msg.id, author: msg.author?.username ?? "user", receivedAt: Date.parse(msg.timestamp as string) || now(), source: "discord" });
+  // `/status`: what this bot is doing in this channel, for the person who asked (an ephemeral reply). No ids or paths.
+  async function status(): Promise<string> {
+    const threadId = buffer.kvGet(K("threadId")), title = buffer.kvGet(K("threadTitle"));
+    let state = "not started";
+    if (threadId) state = await t3.read(threadId).then((r) => (isBusy(r) ? "busy" : "idle"), () => "unknown (t3 not reachable)");
+    const open = buffer.openBatches(conversationKey)[0], rs = resetState(), n = buffer.exchangeCount(channelId);
+    return [`**${name}** in #${channelName ?? channelId}`,
+      `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
+      `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
+      `/new: ${rs ? `pending (${rs.stage})` : "none pending"}`,
+      `Bot-to-bot messages since the user's last message: ${exchangeCap > 0 ? `${n} of ${exchangeCap}` : `${n} (no cap)`}`].join("\n");
   }
   const isBusy = (read: ThreadRead) => Boolean(read.thread?.activeRunId) || (read.recentRuns ?? []).some((r) => !TERMINAL.has(r.status));
   // Advances the reset as far as it can in this step. Returns the limit for batching, or a result that ends the step.
@@ -186,7 +203,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (threadId === rs.oldThread) return { done: { phase: "new" } }; // the fresh thread is not bound yet
       const r = rs;
       buffer.atomically(() => {
-        buffer.enqueue(conversationKey, { key: `new:${r.id}`, content: `🆕 New session started. The previous one is archived${r.oldTitle ? ` (t3 thread "${r.oldTitle}")` : ""}.`, nonce: `s${r.id}`, replyTo: r.id });
+        buffer.enqueue(conversationKey, { key: `new:${r.id}`, content: `🆕 New session started. The previous one is archived${r.oldTitle ? ` (t3 thread "${r.oldTitle}")` : ""}.`, nonce: `s${r.id}`, replyTo: r.source === "interaction" ? null : r.id });
         buffer.kvSet(K("resetSeen"), maxId(buffer.kvGet(K("resetSeen")), r.id));
         buffer.kvDelete(K("reset"));
       });
@@ -552,7 +569,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     for (let i = 0; i < parts.length; i++) {
       if (done.has(i) || buffer.outboxEntry(conversationKey, `reply:${b.id}:${i}`)) continue;
       buffer.enqueue(conversationKey, { key: `reply:${b.id}:${i}`, content: parts[i], nonce: `b${b.id}p${i}`,
-        replyTo: i === 0 ? first.source_message_id : null, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
+        replyTo: i === 0 && first.source === "discord" ? first.source_message_id : null, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
     }
     return true;
   }
@@ -783,5 +800,5 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { phase: "sent", batchId: b.id };
   }
 
-  return { accept, backfill, initWatermark, step, ensureThread, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
+  return { accept, backfill, initWatermark, step, ensureThread, requestNew, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
 }

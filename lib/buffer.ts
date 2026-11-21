@@ -601,6 +601,12 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     batchOfMessage: (conversationKey: string, sourceMessageId: string): BatchRow | undefined => one<BatchRow>(
       "SELECT b.* FROM batch b JOIN inbound i ON i.batch_id = b.id WHERE i.conversation_key = ? AND i.source_message_id = ?", conversationKey, sourceMessageId),
 
+    // A person's action that is not a channel message (a slash command) cuts the channel's episode like a message does:
+    // the receiving side (inbound) and the Discord tool's budget (human_message) both read this boundary.
+    recordResetBoundary: (id: string, channelId: string): void => { db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(id, channelId); },
+    // Bot-to-bot messages accepted since the newest message of a person in the channel: what the cap counts on the receiving side.
+    exchangeCount: (channelId: string): number => episodeOf("9".repeat(30), channelId).count,
+
     openBatches(conversationKey: string): BatchRow[] {
       return all<BatchRow>(`SELECT * FROM batch WHERE conversation_key = ? AND ${OPEN_SQL} ORDER BY id`, conversationKey);
     },

@@ -15,7 +15,7 @@ import { openTempBuffer, tempDir, track } from "./tmp.ts";
 const CH = "shell-network";
 const BOT = "333333333333333333", HERMES = "444444444444444444";
 
-function world({ nonceWindow = false, allowedBots = [{ id: HERMES, name: "Hermes" }] }: { nonceWindow?: boolean; allowedBots?: { id: string; name: string }[] } = {}) {
+function world({ nonceWindow = false, allowedBots = [{ id: HERMES, name: "Hermes" }] }: { nonceWindow?: boolean; allowedBots?: { id: string; name: string; talkOnly?: boolean }[] } = {}) {
   const path = join(tempDir("toolpost-"), "buffer.db");
   let clock = 1_792_500_000_000;
   const now = () => clock;
@@ -227,4 +227,32 @@ test("TOOL REACT RECORDED: one reaction is PUT once and recorded in the same ste
   assert.equal(calls, 1, "one PUT");
   await w.steps(2);
   assert.equal(calls, 1, "not repeated by later steps");
+});
+
+test("TALK-ONLY tool budget: reset from intake, free sends to advisor, active exchanges still capped across restart", async () => {
+  const advisor = "666666666666666666";
+  const w = world({ allowedBots: [{ id: HERMES, name: "Hermes" }, { id: advisor, name: "Advisor", talkOnly: true }] });
+  await w.human("start");
+  const send = (to: string, key: string) => w.tools().send({ channel: CH, content: `<@${to}> ${key}`, idempotency_key: key });
+  send(HERMES, "one");
+  send(HERMES, "two");
+  assert.throws(() => send(HERMES, "blocked"), /exchange cap reached/);
+  send(advisor, "free-at-cap");
+  await w.steps(1);
+  // Feed outgoing posts back as the gateway does, so the log (not just reservations) is checked.
+  for (const m of w.discord.botPosts()) await w.bot.accept(m);
+  assert.throws(() => send(HERMES, "still-blocked"), /exchange cap reached/);
+  w.tick(1000);
+  const reset = w.discord.userSays("continue", { mention: false, bot: true, authorId: advisor, author: "Advisor" });
+  assert.equal((await w.bot.accept(reset)).reason, "no mention");
+  w.restart();
+  send(advisor, "free1");
+  send(advisor, "free2");
+  await w.steps(1);
+  for (const m of w.discord.botPosts()) await w.bot.accept(m);
+  send(HERMES, "three");
+  send(HERMES, "four");
+  assert.throws(() => send(HERMES, "blocked-again"), /exchange cap reached/);
+  await w.steps(1);
+  assert.ok(w.discord.botPosts().some((m) => m.content === `<@${advisor}> free-at-cap`));
 });

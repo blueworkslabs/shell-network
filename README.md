@@ -77,8 +77,9 @@ Copy `crew.example.json` to a private location outside the repository and set `B
 for every bridge process. The JSON array lists each member's unique lowercase `key`, display `name`, and Discord
 user `id` (a string). Members run by this bridge also need `instanceId` and `model`; omit both for talk-only
 members. Set `BRIDGE_BOT` to this process's member key. Its identity and model come from the file; all other
-members are allowed crew, including talk-only members. Their mentions, unread messages and exchange counts follow
-the same rules as other crew bots. The people allowlist remains `BRIDGE_ALLOWED_AUTHORS`.
+members are allowed crew, including talk-only members. Talk-only messages reset the exchange cap like allowlisted
+human messages; a bare mention from them resumes a bot. Only exchanges between bridge-run members consume the cap.
+Their unread messages follow the same rules as other crew bots. The people allowlist remains `BRIDGE_ALLOWED_AUTHORS`.
 
 The file is read once at startup. Invalid members, duplicate keys or ids, a missing or talk-only own bot, and an
 own id that differs from the Discord token are refused. Restart the bridge after changing the file. Keep real crew

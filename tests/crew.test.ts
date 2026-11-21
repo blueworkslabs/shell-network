@@ -10,7 +10,7 @@ const config = (members: unknown, extra = {}) => bridgeConfig({ BRIDGE_BOT: "gem
 test("crew file selects identity, includes talk-only members, and keeps cap settings", () => {
   const c = config([...exampleCrew, { key: "advisor", name: "Advisor", id: "666666666666666666" }]);
   assert.deepEqual(c.bot, exampleCrew[0]);
-  assert.deepEqual(c.allowedBots, [{ id: exampleCrew[1].id, name: "Hermes" }, { id: "666666666666666666", name: "Advisor" }]);
+  assert.deepEqual(c.allowedBots, [{ id: exampleCrew[1].id, name: "Hermes" }, { id: "666666666666666666", name: "Advisor", talkOnly: true }]);
   assert.equal(c.exchangeCap, 2);
   assert.equal(config(exampleCrew, { BRIDGE_EXCHANGE_CAP: "0" }).exchangeCap, 0);
   for (const cap of ["-1", "two"]) assert.throws(() => config(exampleCrew, { BRIDGE_EXCHANGE_CAP: cap }), /BRIDGE_EXCHANGE_CAP/);

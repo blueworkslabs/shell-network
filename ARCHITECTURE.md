@@ -82,13 +82,13 @@ the tool's sends, reactions and threads.
 
 - A bot takes its identity from `BRIDGE_CREW_FILE` and accepts mentions from the other members, including
   talk-only members without a t3 instance. The crew file is validated once at startup.
-- An episode runs from one message of an allowlisted person to the next. Within an episode, at most
-  `BRIDGE_EXCHANGE_CAP` bot-to-bot messages are accepted. After that, one "waiting for the user" notice is posted
+- An episode runs from one message of an allowlisted person or talk-only crew member to the next. Talk-only status comes from the absence of both instanceId and model in the crew file; it is retained in the tool configuration. Talk-only messages reset the cap even without a mention, and bare mentions from them resume a bot. Their channel log entries remain bot-authored; accepted inputs use the same cap-reset classification as human inputs. Within an episode, at most
+  `BRIDGE_EXCHANGE_CAP` messages between bridge-run bots are accepted. Talk-only messages do not consume this budget. After that, one "waiting for the user" notice is posted
   right away: a capped message wakes the step loop. A mention from the user, even a bare one, resumes the bots, and
   the capped handoff reaches the resumed bot through its unread header.
 - Cap decisions are final: they are stored in `bot_capped` and give the same answer on redelivery or replay.
 - Episode boundaries live in `human_message`, which is never pruned, unlike the 7-day channel log.
-- The tool's `discord_send` reserves from the same, channel-wide budget before it inserts a send that names a bot. The
+- The tool's `discord_send` reserves from the same, channel-wide budget before it inserts a send that names another bridge-run bot. Sends addressed only to talk-only members do not consume the budget. The
   count includes queued sends from every bot.
 
 ## Completion relay

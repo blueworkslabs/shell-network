@@ -30,7 +30,7 @@ const PREFIX: Record<Op, string> = { send: "tool", react: "react", thread: "thre
 const NONCE: Record<Op, string> = { send: "t", react: "x", thread: "h" };
 export const READ_MAX = 50;
 
-interface Config { channel_id: string; bot_user_id: string; crew: { id: string; name: string }[]; exchange_cap: number }
+interface Config { channel_id: string; bot_user_id: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchange_cap: number }
 const after = (col: string) => `(length(${col}) > length(?) OR (length(${col}) = length(?) AND ${col} > ?))`;
 const names = (content: string, id: string) => content.includes(`<@${id}>`) || content.includes(`<@!${id}>`);
 
@@ -54,25 +54,26 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
   }
   const inLog = (id: string, channelId: string) => one<{ id: string }>("SELECT id FROM channel_message WHERE id = ? AND channel_id = ?", id, channelId) !== undefined;
 
-  // Bot-to-bot messages in the current episode (since the newest message of a person) plus reservations.
+  // Exchanges between bridge-run bots since the latest person/talk-only reset, plus reservations.
   function exchanges(c: Config): number {
     // The reset boundary is durable (human_message is never pruned, as on the receiving side), not the 7-day
     // channel log; its time is the snowflake's.
     const hid = one<{ id: string }>("SELECT id FROM human_message WHERE channel_id = ? ORDER BY length(id) DESC, id DESC LIMIT 1", c.channel_id)?.id;
     const human = hid === undefined ? undefined : { id: hid, at: Number((BigInt(hid) >> 22n) + 1420070400000n) };
-    const bots = [...c.crew.map((b) => b.id), c.bot_user_id];
+    const bots = [...c.crew.filter((b) => !b.talkOnly).map((b) => b.id), c.bot_user_id];
     const rows = db.prepare(`SELECT author_id, content FROM channel_message WHERE author_kind = 'bot' AND channel_id = ?${human ? ` AND ${after("id")}` : ""}`)
       .all(c.channel_id, ...(human ? [human.id, human.id, human.id] : [])) as { author_id: string; content: string }[];
-    const logged = rows.filter((m) => bots.some((id) => id !== m.author_id && names(m.content, id))).length;
+    const logged = rows.filter((m) => bots.includes(m.author_id) && bots.some((id) => id !== m.author_id && names(m.content, id))).length;
     // R1: the budget belongs to the channel conversation, not to one bot, so every bot's
     // queued bot-addressed tool sends count (one shared DB), in the channel and in tool threads.
     // A send in the same millisecond as the human message counts (ties go to the cap).
     // Scoped to this channel: sends whose meta.channel is the channel itself or one of the tool threads under it.
-    const reserved = one<{ n: number }>(`SELECT count(*) n FROM outbox WHERE substr(key, 1, 5) = 'tool:'
+    const reservations = db.prepare(`SELECT users FROM outbox WHERE substr(key, 1, 5) = 'tool:'
       AND json_extract(meta, '$.addressesBot') = 1 AND created_at >= ?1 AND state != 'dropped'
       AND (json_extract(meta, '$.channel') = ?2 OR (json_extract(meta, '$.thread') = 1 AND json_extract(meta, '$.channel') IN
         (SELECT t.reply_to FROM outbox t WHERE substr(t.key, 1, 7) = 'thread:' AND t.state = 'posted' AND json_extract(t.meta, '$.channel') = ?2)))
-      AND (channel_message_id IS NULL OR channel_message_id NOT IN (SELECT id FROM channel_message))`, human?.at ?? 0, c.channel_id)!.n;
+      AND (channel_message_id IS NULL OR channel_message_id NOT IN (SELECT id FROM channel_message))`).all(human?.at ?? 0, c.channel_id) as { users: string }[];
+    const reserved = reservations.filter((r) => (JSON.parse(r.users) as string[]).some((id) => bots.includes(id))).length;
     return logged + reserved;
   }
 
@@ -123,11 +124,12 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
       if (content.length > MAX_CONTENT) throw new ToolError(`content is ${content.length} characters; at most ${MAX_CONTENT}`);
       if (replyTo !== null && (!SNOWFLAKE.test(replyTo) || !inLog(replyTo, c.channel_id))) throw new ToolError(`reply_to ${replyTo} is not a message of the channel`);
       const users = c.crew.filter((b) => names(content, b.id)).map((b) => b.id);
-      if (users.length && c.exchange_cap > 0) {
+      const addressesBot = c.crew.some((b) => !b.talkOnly && users.includes(b.id));
+      if (addressesBot && c.exchange_cap > 0) {
         const n = exchanges(c);
         if (n >= c.exchange_cap) throw new ToolError(`exchange cap reached: ${n} bot-to-bot messages since the user's last message (cap ${c.exchange_cap}); wait for the user`);
       }
-      return { content, replyTo, users, meta: { channel, ...(thread ? { thread: 1 } : {}), ...(users.length ? { addressesBot: 1 } : {}) } };
+      return { content, replyTo, users, meta: { channel, ...(thread ? { thread: 1 } : {}), ...(addressesBot ? { addressesBot: 1 } : {}) } };
     }, { threadOk: true });
   }
 

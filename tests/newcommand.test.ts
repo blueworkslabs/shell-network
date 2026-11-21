@@ -135,7 +135,9 @@ test("NEW REDELIVERY: the same /new again, a second /new while one is pending, a
   const { m, r } = await w.cmd();
   assert.deepEqual(r, { accepted: true, inserted: true });
   assert.deepEqual(await w.bot.accept(m), { accepted: true, inserted: false });
-  assert.equal((await w.cmd()).r.reason, "new pending");
+  const second = await w.cmd();
+  assert.equal(second.r.reason, "new pending");
+  assert.equal((await w.bot.accept(m)).inserted, false, "the pending one is still accepted idempotently after the second arrived");
   await w.steps(2);
   const t1 = w.thread();
   assert.equal(w.sentTo(t1).length, 1, "one wrap-up batch");
@@ -143,11 +145,15 @@ test("NEW REDELIVERY: the same /new again, a second /new while one is pending, a
   await w.steps(5);
   assert.deepEqual(w.archives(), [t1]);
   assert.equal((await w.bot.accept(m)).reason, "new already handled");
+  assert.equal((await w.bot.accept(second.m)).reason, "new already handled", "the ignored second /new is not replayed into a new reset");
+  w.restart();
+  assert.equal((await w.bot.accept(second.m)).reason, "new already handled", "also after a restart");
   await w.steps(3);
   assert.deepEqual(w.archives(), [t1]);
   assert.equal(w.t3.threads.size, 2);
   assert.equal(w.confirmations().length, 1);
-  // a new /new later is a new reset
+  assert.equal(w.buffer.kvGet(`${KEY}:reset`), null);
+  // a /new after both is a new reset
   assert.equal((await w.cmd()).r.accepted, true);
 });
 

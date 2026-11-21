@@ -117,8 +117,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   //            transaction record it (kv `archived`), set the replacement title, mark the session fresh and clear the
   //            binding; the next ensureThread() launches the new thread by that title (crash-safe like any launch)
   //   confirm  the fresh thread is bound: one confirmation (outbox `new:<id>`), reset done (kv `resetSeen`)
+  // A `/new` ignored while one is pending is recorded in kv `resetSeen` (the newest `/new` id handled or ignored).
   // Archiving twice is assumed to be harmless: a crash between the t3 call and the transaction repeats it.
   type Reset = { id: string; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string };
+  const maxId = (a: string | null, b: string): string => (a !== null && BigInt(a) > BigInt(b) ? a : b);
   const resetState = (): Reset | null => { const v = buffer.kvGet(K("reset")); return v ? (JSON.parse(v) as Reset) : null; };
   const saveReset = (r: Reset) => buffer.kvSet(K("reset"), JSON.stringify(r));
   function isNewCommand(msg: DiscordMessage): boolean {
@@ -127,9 +129,14 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   }
   function acceptNew(msg: DiscordMessage & { id: string }): AcceptResult {
     const seen = buffer.kvGet(K("resetSeen"));
-    if (seen && BigInt(msg.id) <= BigInt(seen)) return { accepted: false, reason: "new already handled" };
     const cur = resetState();
-    if (cur && cur.id !== msg.id) return { accepted: false, reason: "new pending" };
+    if (cur?.id !== msg.id) {
+      if (seen && BigInt(msg.id) <= BigInt(seen)) return { accepted: false, reason: "new already handled" };
+      if (cur) { // ignored while one is pending, and remembered, so a replay after it finished does not start another
+        buffer.kvSet(K("resetSeen"), maxId(seen, msg.id));
+        return { accepted: false, reason: "new pending" };
+      }
+    }
     // state and row together; a redelivery of the same message finds both (or completes whichever is missing)
     const r = buffer.atomically(() => {
       if (!cur) saveReset({ id: msg.id, stage: "drain" });
@@ -173,7 +180,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const r = rs;
       buffer.atomically(() => {
         buffer.enqueue(conversationKey, { key: `new:${r.id}`, content: `🆕 New session started. The previous one is archived${r.oldTitle ? ` (t3 thread "${r.oldTitle}")` : ""}.`, nonce: `s${r.id}`, replyTo: r.id });
-        buffer.kvSet(K("resetSeen"), r.id);
+        buffer.kvSet(K("resetSeen"), maxId(buffer.kvGet(K("resetSeen")), r.id));
         buffer.kvDelete(K("reset"));
       });
       log.emit("bridge.session_new", { bot: name, threadId, resetMessageId: r.id });

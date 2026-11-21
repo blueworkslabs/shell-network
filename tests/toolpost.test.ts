@@ -156,6 +156,29 @@ test("NO_REPLY after text: a reply that ends with the sentinel posts the text wi
   assert.equal(w.discord.botPosts().length, 3);
 });
 
+test("NO_REPLY after a capped tool send: preserve the handoff, omit the trailing control line, and resume after restart", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("start"));
+  await w.steps(1);
+  const t = w.tools();
+  t.send({ channel: CH, content: `<@${HERMES}> first`, idempotency_key: "cap1" });
+  t.send({ channel: CH, content: `<@${HERMES}> second`, idempotency_key: "cap2" });
+  assert.throws(() => t.send({ channel: CH, content: `<@${HERMES}> third`, idempotency_key: "cap3" }), /exchange cap reached/);
+  const handoff = "h".repeat(1900);
+  const run = w.t3.threads.get(w.thread())!.runs.at(-1)!;
+  w.t3.complete(w.thread(), run.runId, handoff + "\n\nNO_REPLY");
+  await w.steps(3);
+  assert.deepEqual(w.discord.botPosts().map((p) => p.content), [`<@${HERMES}> first`, `<@${HERMES}> second`, handoff]);
+  w.restart();
+  await w.steps(2);
+  await w.bot.accept(w.discord.userSays("continue"));
+  await w.steps(1);
+  w.t3.complete(w.thread(), w.t3.threads.get(w.thread())!.runs.at(-1)!.runId, "continued");
+  await w.steps(2);
+  assert.equal(w.discord.botPosts().at(-1)!.content, "continued");
+  assert.equal(w.discord.botPosts().length, 4, "no replay or blocked next turn");
+});
+
 for (const point of ["before", "after"] as const) {
   test(`TOOL THREAD EXACTLY ONCE: killed ${point} the create, the thread exists once after the restart (looked up before any new create); a send into it goes to the thread`, async () => {
     const w = world();

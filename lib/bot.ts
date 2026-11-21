@@ -50,7 +50,7 @@ const PART = 1900;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
-export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(^|\s)NO_REPLY\s*$/, "");
+export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(?:^|\r?\n)[ \t]*NO_REPLY\s*$/, "");
 const splitReply = (text: unknown): string[] => {
   const t = String(text ?? "").trim() || "(finished without a text reply)";
   const parts: string[] = [];

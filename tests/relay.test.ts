@@ -215,3 +215,17 @@ test("PENDING INTENT unknown: no message is posted in that step (no notice eithe
   assert.ok(w.discord.botPosts().some((m) => m.content === "🔧 a notice"));
   assert.equal(w.discord.botPosts().filter((m) => m.content === "background done").length, 1);
 });
+
+test("RELAY: a trailing NO_REPLY control line is removed before splitting; inline mentions remain", async () => {
+  const w = world();
+  await chat(w, "hi", "hello");
+  const handoff = "r".repeat(1900);
+  w.t3.complete(w.thread(), w.t3.wake(w.thread()).runId, handoff + "\n\nNO_REPLY");
+  await w.steps(2);
+  assert.deepEqual(w.posts(), ["hello", handoff]);
+  w.restart();
+  await w.steps(2);
+  w.t3.complete(w.thread(), w.t3.wake(w.thread()).runId, "Explain NO_REPLY");
+  await w.steps(2);
+  assert.deepEqual(w.posts(), ["hello", handoff, "Explain NO_REPLY"]);
+});

@@ -65,7 +65,9 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
       // the bound thread: the activity view only, as before; an archived thread: the messages view (with continuation) only
       when: (a) => ownThread(a.threadId)
         ? (a.view === "activity" || a.view === undefined) && a.itemId === undefined && a.textOffset === undefined ? null : "the bound thread is read in the activity view only"
-        : a.view === "messages" ? null : "an archived thread is read in the messages view only",
+        : a.view !== "messages" ? "an archived thread is read in the messages view only"
+        : typeof a.maxCharsPerItem === "number" && a.maxCharsPerItem > 20_000 ? "an archived thread is read at most 20000 characters per item"
+        : null,
     },
     t3_queue: {
       args: { action: (v) => v === "list", threadId: ownThread, cursor: isInt(0, Number.MAX_SAFE_INTEGER), limit: isInt(1, 100) },

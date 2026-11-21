@@ -179,6 +179,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // finds an existing file by its session id: a crash between the write and the marker repeats an unchanged write, still
   // one file. A thread that yields no messages is a failure, not an empty export. Runs beside the step loop, single flight, only while no reset is pending; a failure waits (backoff) and is
   // retried, and shows in /status. The log carries counts and thread ids, never text.
+  class ExportError extends Error {}
   const exportState: { running: Promise<void> | null; failures: number; nextAt: number; lastError: string | null } = { running: null, failures: 0, nextAt: 0, lastError: null };
   const pendingExports = (): string[] => (notesRoot ? (JSON.parse(buffer.kvGet(K("archived")) ?? "[]") as { threadId: string }[]).map((a) => a.threadId).filter((id) => !buffer.kvGet(K(`exported:${id}`))) : []);
   function exportArchived(): void {
@@ -187,12 +188,17 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!todo.length) return;
     exportState.running = (async () => {
       for (const threadId of todo) {
-        const archive = await readArchivedTranscript({ threadId, projectId }, (args) => t3.readArchived(args));
+        let archive;
+        try { archive = await readArchivedTranscript({ threadId, projectId }, (args) => t3.readArchived(args)); }
+        catch (e) { throw new ExportError(/archived top-level|Invalid archive|continuation|cursor|item ID/.test(errText(e)) ? "unexpected t3 answer" : "t3 read failed"); }
         const messages = archive.events.filter((e) => e.type === "message").length;
         // an archived thread always holds at least the /new wrap-up turn: zero means every item was filtered out (an
         // answer shape we do not know), so it stays pending and shows instead of being marked done
-        if (!messages) throw new Error("no messages kept from the archived thread (unexpected t3 answer shape?)");
-        importTranscripts({ output: notesRoot, t3Archives: [archive] });
+        if (!messages) throw new ExportError("no messages kept (unexpected t3 answer)");
+        let written;
+        try { written = importTranscripts({ output: notesRoot, t3Archives: [archive] }); } catch { throw new ExportError("writing sessions/ failed"); }
+        // the importer leaves out a session that renders no turn: then nothing was exported, so no marker either
+        if (written.written + written.unchanged < 1) throw new ExportError("nothing to write (no rendered turns)");
         buffer.kvSet(K(`exported:${threadId}`), String(messages));
         log.emit("bridge.session_exported", { bot: name, threadId, messages });
       }
@@ -201,7 +207,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     })().catch((e) => {
       exportState.failures++;
       exportState.nextAt = now() + Math.min(3_600_000, 30_000 * 2 ** (exportState.failures - 1));
-      exportState.lastError = errText(e).slice(0, 160);
+      // fixed categories only: an error from t3 or the filesystem could carry text of the conversation
+      exportState.lastError = e instanceof ExportError ? e.message : "export failed";
       log.emit("bridge.session_export_failed", { bot: name, error: exportState.lastError, failures: exportState.failures });
     }).finally(() => { exportState.running = null; });
   }

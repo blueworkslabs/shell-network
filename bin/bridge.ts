@@ -32,13 +32,12 @@ import { commandsHashKey, interactionDispatch, reconcileCommands } from "../lib/
 import { sweepStaging } from "../lib/attachments.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
-import type { LogFields } from "../lib/types.ts";
 import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch } from "../lib/startup.ts";
 import { stepLoop } from "../lib/steploop.ts";
 import { bridgeConfig, conversationKeyFor } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
 import { shellWatch } from "../lib/shellwatch.ts";
-import { t3Adapter } from "../lib/t3.ts";
+import { mcpCallLog, t3Adapter } from "../lib/t3.ts";
 import { McpClient, loadToken } from "../lib/vendor/mcp.mjs";
 import { PUSH_TOKEN_PATH } from "../lib/vendor/push.mjs";
 
@@ -93,7 +92,7 @@ const tickMs = Number(process.env.BRIDGE_TICK_MS ?? 3000);
 // The vendored client logs every tool result; the bridge reads the whole thread every tick, so read-type results
 // are reduced to their size (sends and launches stay in full: they are the evidence of what the bridge did).
 const KEEP = new Set(["t3_thread_send", "t3_thread_launch"]);
-const mcpLog = { emit: (e: string, d: LogFields = {}) => log.emit(e, e === "call.end" && !KEEP.has(d.tool as string) ? { ...d, result: `[${JSON.stringify(d.result ?? null).length} bytes]` } : d) };
+const mcpLog = mcpCallLog(log, KEEP);
 const mcp = new McpClient({ log: mcpLog, token: loadToken(), clientName: "t3-crew-bridge" });
 await mcp.connect();
 const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
@@ -128,7 +127,8 @@ for (const [i, channelId] of conversations.entries()) {
   // MCP allowlist: this project, this instance, this conversation's one thread (kv, set once launched/adopted)
   const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`),
     // the conversation's own archived threads (its /new ledger), readable for the export only
-    archivedThreads: () => (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) };
+    // only with the export on (BRIDGE_NOTES_DIR): otherwise no archived thread is readable at all
+    archivedThreads: () => (notesRoot ? (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) : []) };
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
     allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, dm, notesRoot,

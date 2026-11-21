@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { type Buffer } from "../lib/buffer.ts";
 import { makeBot } from "../lib/bot.ts";
 import { allowlistRules, checkCall } from "../lib/allowlist.ts";
+import { mcpCallLog } from "../lib/t3.ts";
 import { conversationKeyFor } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
@@ -100,16 +101,17 @@ test("EXPORT after a crash between the write and the marker: the repeat finds th
 
 test("EXPORT failure: the fresh session goes on, /status shows it, and a later step retries after the backoff", async () => {
   const w = world();
-  w.t3.archiveReadError = "t3 is restarting";
+  w.t3.archiveReadError = "t3 is restarting; the user said: amber secret";
   const t1 = await resetOnce(w);
   assert.equal(w.files().length, 0);
   await w.bot.accept(w.discord.userSays("first question in the fresh session"));
   await w.steps(1);
   assert.match(w.t3.sends().at(-1)!.message!, /first question in the fresh session/, "the fresh session was not held up");
   assert.equal(w.t3.sends().at(-1)!.threadId, w.thread());
-  assert.match(await w.bot.status(), /Archive export: 1 pending; last error: t3 is restarting/);
+  assert.match(await w.bot.status(), /Archive export: 1 pending; last error: t3 read failed$/m);
   assert.equal(w.discord.botPosts().filter((m) => m.content.startsWith("🆕")).length, 1, "the reset was confirmed while the export is pending");
   assert.ok(w.log.events.some((e) => e.event === "bridge.session_export_failed"));
+  assert.ok(!JSON.stringify(w.log.events).includes("amber secret") && !(await w.bot.status()).includes("amber"), "a raw error never reaches the log or /status");
   w.t3.archiveReadError = null;
   const reads = w.reads();
   await w.steps(2);
@@ -140,6 +142,7 @@ test("ALLOWLIST: an archived ledger thread is readable in the messages view only
   assert.throws(read({ threadId: "bound", view: "messages" }), /activity view only/);
   assert.throws(read({ threadId: "bound", view: "activity", itemId: "x" }), /activity view only/);
   assert.throws(read({ threadId: "someone-else", view: "messages" }), /threadId outside/);
+  assert.throws(read({ threadId: "old", view: "messages", maxCharsPerItem: 50_000 }), /20000 characters/, "the archive reader's bounds, not the bound thread's");
   const noLedger = allowlistRules({ projectId: "p", instanceId: "i", boundThread: () => "bound" });
   assert.throws(() => checkCall(noLedger, "t3_thread_read", { threadId: "old", view: "messages" }), /threadId outside/);
 });
@@ -152,9 +155,31 @@ test("EXPORT of a thread that yields no messages is a failure: no marker, shown 
   const t1 = await resetOnce(w);
   assert.equal(w.files().length, 0);
   assert.equal(w.buffer.kvGet(`${KEY}:exported:${t1}`), null, "not marked done");
-  assert.match(await w.bot.status(), /Archive export: 1 pending; last error: no messages kept/);
+  assert.match(await w.bot.status(), /Archive export: 1 pending; last error: no messages kept \(unexpected t3 answer\)/);
   w.t3.readArchived = original;
   w.tick(60_000);
   await w.steps(2);
   assert.equal(w.files().length, 1, "once the answer is readable, it is exported");
+});
+
+test("EXPORT of a thread whose messages render no turn: the importer writes nothing, so no marker", async () => {
+  const w = world();
+  const original = w.t3.readArchived.bind(w.t3);
+  w.t3.readArchived = async (args) => { const page = await original(args) as { items: Record<string, unknown>[] }; return { ...page, items: page.items.map((i) => ({ ...i, text: "   " })) }; };
+  const t1 = await resetOnce(w);
+  assert.equal(w.files().length, 0);
+  assert.equal(w.buffer.kvGet(`${KEY}:exported:${t1}`), null);
+  assert.match(await w.bot.status(), /last error: nothing to write \(no rendered turns\)/);
+});
+
+test("MCP LOG: archive reads are logged by size only, a failure with a fixed text; other reads keep their old treatment", () => {
+  const events: { e: string; d: Record<string, unknown> }[] = [];
+  const log = mcpCallLog({ emit: (e, d = {}) => { events.push({ e, d }); } }, new Set(["t3_thread_send"]));
+  log.emit("call.end", { tool: "t3_thread_read", label: "bridge-archive-read", result: { items: [{ text: "amber secret" }] } });
+  log.emit("call.error", { tool: "t3_thread_read", label: "bridge-archive-read", error: "failed near: amber secret" });
+  log.emit("call.error", { tool: "t3_thread_read", label: "bridge-archive-read", result: { isError: true, text: "amber secret" } });
+  log.emit("call.end", { tool: "t3_thread_send", label: "bridge-send", result: { runId: "r" } });
+  assert.ok(!JSON.stringify(events).includes("amber"));
+  assert.equal(events[1].d.error, "[archive read failed]");
+  assert.deepEqual(events[3].d.result, { runId: "r" }, "kept tools stay in full");
 });

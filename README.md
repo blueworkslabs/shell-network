@@ -143,6 +143,18 @@ Live check: after a fresh session, ask about a fact kept only in an old note. Ve
 and answers with the matching file and line. Automated tests cover that search through a fresh stdio tool process;
 they do not substitute for the provider's live tool configuration and recall check.
 
+### Hybrid search (full text plus meaning)
+
+With `DISCORD_TOOL_MEMORY_INDEX` (a SQLite path outside the notes) `memory_search` uses an index instead of the file walk
+(`lib/memindex.ts`): Markdown chunks of about 300 words cut at headings, FTS5 full text, and embeddings from an
+OpenAI-compatible endpoint (`DISCORD_TOOL_EMBED_URL`, `DISCORD_TOOL_EMBED_MODEL`, `DISCORD_TOOL_EMBED_KEY` as a key file,
+optional `DISCORD_TOOL_EMBED_DIMENSIONS`), merged by reciprocal rank fusion. Each match says how it matched (`text`,
+`semantic` or `both`); `semantic: false` with a `reason` means text only (no endpoint, or it failed). A note is found by
+text right after it is written; embeddings follow in the background (at tool start and every
+`DISCORD_TOOL_INDEX_EVERY_MS`, default 10 minutes; `unembedded` counts what is still waiting). Only new or changed
+text is embedded. For the first big import run `node bin/index-memory.ts` with the same settings once. Rollback: unset
+`DISCORD_TOOL_MEMORY_INDEX` (the plain walk comes back) and delete the index file if wanted; the notes are never written.
+
 ## Tests
 
 ```sh

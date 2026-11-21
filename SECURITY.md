@@ -28,6 +28,10 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
     Discord) and answer an interaction by its id and token (checked for format); an interaction is answered only if it
     comes from an allowlisted person in one of the bot's channels, otherwise with an ephemeral refusal. Interaction
     tokens are never stored or logged.
+- **Hybrid memory search.** With an embedding endpoint configured, the Discord tool sends note chunks and queries to
+  that endpoint (the one network connection it makes). The key is a file passed by path (checked like the bridge's
+  secrets), sent only in the Authorization header, and never put into errors or logs; error texts never include the
+  endpoint's answer body. The index lives outside the notes directory and holds copies of the note text.
 - **Memory search.** Optional `DISCORD_TOOL_NOTES` scopes read-only search to one bot's notes directory. The tool
   accepts text queries, never caller-supplied paths; it skips symlinks, hardlinks, hidden and non-note files, checks
   canonical paths and bounds reads/results. This is filesystem hygiene under the trusted-VM model, not isolation

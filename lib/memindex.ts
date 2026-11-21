@@ -111,9 +111,10 @@ export function httpEmbedder({ baseUrl, model, key, dimensions, fetchImpl = fetc
 }): Embedder {
   const url = `${baseUrl.replace(/\/+$/, "")}/embeddings`;
   const clean = (s: string) => (key ? s.split(key).join("[key]") : s);
-  // the vector space: model, dimensions and endpoint (the same model name elsewhere may be another model)
+  // the vector space: model, dimensions and endpoint (the same model name at another endpoint may be another model)
   return {
-    model: `${model}@${dimensions ?? "default"}@${new URL(url).host}`,
+    // the endpoint as a short hash of its normalized URL: a change of host or path is another space, and the URL is not stored
+    model: `${model}@${dimensions ?? "default"}@${createHash("sha256").update(new URL(url).href).digest("hex").slice(0, 12)}`,
     async embed(texts) {
       for (let attempt = 0; ; attempt++) {
         let res: Response | null = null, failure = "";

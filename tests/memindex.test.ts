@@ -222,8 +222,12 @@ test("MODEL CHANGE: vectors of another model or dimensions are dropped and re-em
   const again = openMemIndex({ root: w.notes, indexPath: join(w.dir, "index.db"), embedder: other });
   assert.deepEqual(await again.embedPending(), { embedded: 1 }, "the new space is embedded from scratch");
   assert.deepEqual((again.db.prepare("SELECT DISTINCT model FROM vector").all() as { model: string }[]).map((r) => r.model), ["fake-4@2"], "the old space is gone");
-  assert.equal(httpEmbedder({ baseUrl: "https://x.example/v1", model: "m", key: "k", dimensions: 512 }).model, "m@512@x.example");
-  assert.equal(httpEmbedder({ baseUrl: "https://y.example/v1", model: "m", key: "k" }).model, "m@default@y.example", "another endpoint is another space");
+  const space = (baseUrl: string, dimensions?: number) => httpEmbedder({ baseUrl, model: "m", key: "k", dimensions }).model;
+  assert.match(space("https://x.example/v1", 512), /^m@512@[0-9a-f]{12}$/);
+  assert.notEqual(space("https://x.example/a"), space("https://x.example/b"), "another path on the same host is another space");
+  assert.notEqual(space("https://x.example/v1"), space("https://y.example/v1"));
+  assert.equal(space("https://x.example/v1/"), space("https://x.example/v1"), "a trailing slash is the same endpoint");
+  assert.ok(!space("https://x.example/v1").includes("x.example"), "the URL itself is not stored");
   assert.equal(minSimilarityFromEnv({}), MIN_SIMILARITY);
   assert.equal(minSimilarityFromEnv({ DISCORD_TOOL_EMBED_MIN_SIMILARITY: "0.2" }), 0.2);
   assert.throws(() => minSimilarityFromEnv({ DISCORD_TOOL_EMBED_MIN_SIMILARITY: "high" }), /-1 to 1/);

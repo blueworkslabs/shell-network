@@ -69,7 +69,8 @@ the channel sees it) starts a reset of that bot's session in that channel. State
    archives the old thread (`t3_thread_organize`, archive only). Then, in one transaction, it records the old thread
    in kv `archived`, stores the replacement title, marks the session fresh and clears the thread binding.
    `ensureThread()` launches the new thread by that title, so a crash around the launch is adopted, not repeated.
-   A crash between the t3 call and the transaction repeats the archive call, which is assumed harmless.
+   A crash between the t3 call and the transaction repeats the archive call; t3 then answers "is already archived",
+   which counts as done. Any other archive failure leaves the binding in place and is retried on the next step.
 4. **confirm**: once the fresh thread is bound, one confirmation (outbox `new:<message id>`, a reply to the `/new`)
    names the archived thread's title, and `resetSeen` keeps a replay of the same `/new` from starting another reset.
 

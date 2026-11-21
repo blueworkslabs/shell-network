@@ -118,7 +118,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   //            binding; the next ensureThread() launches the new thread by that title (crash-safe like any launch)
   //   confirm  the fresh thread is bound: one confirmation (outbox `new:<id>`), reset done (kv `resetSeen`)
   // A `/new` ignored while one is pending is recorded in kv `resetSeen` (the newest `/new` id handled or ignored).
-  // Archiving twice is assumed to be harmless: a crash between the t3 call and the transaction repeats it.
+  // A crash between the t3 call and the transaction repeats the archive call; t3 answers "already archived", taken as done.
   type Reset = { id: string; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string };
   const maxId = (a: string | null, b: string): string => (a !== null && BigInt(a) > BigInt(b) ? a : b);
   const resetState = (): Reset | null => { const v = buffer.kvGet(K("reset")); return v ? (JSON.parse(v) as Reset) : null; };
@@ -161,7 +161,12 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       saveReset(rs);
     }
     if (rs.stage === "archive") {
-      await t3.archive(rs.oldThread!);
+      try { await t3.archive(rs.oldThread!); } catch (e) {
+        // t3 refuses a second archive of the same thread ("... is already archived"): after a crash between the call and
+        // the transaction below that answer means done. Any other failure stops here and is retried next step.
+        if (!/is already archived/i.test(errText(e))) throw e;
+        log.emit("bridge.archive_already", { bot: name, threadId: rs.oldThread });
+      }
       const r = rs;
       buffer.atomically(() => {
         const list = JSON.parse(buffer.kvGet(K("archived")) ?? "[]") as { threadId: string; title: string | null; resetMessageId: string }[];

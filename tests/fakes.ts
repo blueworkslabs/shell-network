@@ -19,7 +19,8 @@ export interface FakeT3 {
   projection(threadId: string): Promise<Projection>;
   queue(threadId: string): Promise<QueueList>;
   send(args: SendArgs): Promise<{ messageId: string; runId?: string; delivery?: string; status?: string }>;
-  archive(threadId: string): Promise<{ archived: true }>; // idempotent, like t3
+  archiveError: string | null; // test control: archive fails with this message (once)
+  archive(threadId: string): Promise<{ archived: true }>; // like t3: a second archive of a thread is an error
   complete(threadId: string, runId: string, text: string | null): void;
   fail(threadId: string, runId: string, opts?: { holdQueue?: boolean }): void;
   resume(threadId: string): void; // t3's queue.resume: clears queueHeld on every queued run, then starts the next
@@ -92,8 +93,12 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       if (crash.send === "after") die("send");
       return { messageId, runId: run.runId, delivery, status: run.status };
     },
+    archiveError: null,
     async archive(threadId) {
       calls.push({ tool: "archive", threadId });
+      if (api.archiveError) { const m = api.archiveError; api.archiveError = null; throw new Error(m); }
+      // the real answer (seen live): orchestration_error ... is already archived.
+      if (th(threadId).archived) throw new Error(`orchestration_error: Thread '${threadId}' is already archived.`);
       th(threadId).archived = true;
       if (crash.archive === "after") die("archive");
       return { archived: true };

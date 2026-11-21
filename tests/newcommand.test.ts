@@ -176,8 +176,28 @@ for (const point of ["archive", "launch"] as const) {
     assert.equal(w.buffer.kvGet(`${KEY}:reset`), null);
     assert.equal(w.sentTo(t2).filter((s) => s.includes(FRESH_SESSION_TEXT)).length, 1);
     assert.match(w.sentTo(t2)[0], /after the cut/);
+    if (point === "archive") {
+      assert.deepEqual(w.archives(), [t1, t1], "the repeated call got t3's real 'already archived' answer, taken as done");
+      assert.ok(w.log.events.some((e) => e.event === "bridge.archive_already"));
+    }
   });
 }
+
+test("NEW ARCHIVE FAILS: any other archive error leaves the binding and the reset in place and is retried; nothing is launched or confirmed meanwhile", async () => {
+  const w = world();
+  const { t1 } = await toWrapup(w);
+  w.finish(t1, "NO_REPLY");
+  w.t3.archiveError = "orchestration_error: t3 is busy";
+  await assert.rejects(w.steps(4), /t3 is busy/);
+  assert.equal(w.thread(), t1, "binding intact");
+  assert.equal(JSON.parse(w.buffer.kvGet(`${KEY}:reset`)!).stage, "archive");
+  assert.equal(w.t3.threads.size, 1);
+  assert.equal(w.confirmations().length, 0);
+  await w.steps(6);
+  assert.deepEqual(w.archives(), [t1, t1]);
+  assert.equal(w.t3.threads.size, 2);
+  assert.equal(w.confirmations().length, 1);
+});
 
 test("NEW CRASH between the redelivered /new and its state: the redelivery completes whatever is missing", async () => {
   const w = world();

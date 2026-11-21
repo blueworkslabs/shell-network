@@ -158,6 +158,31 @@ text right after it is written; embeddings follow in the background (at tool sta
 text is embedded. For the first big import run `node bin/index-memory.ts` with the same settings once. Rollback: unset
 `DISCORD_TOOL_MEMORY_INDEX` (the plain walk comes back) and delete the index file if wanted; the notes are never written.
 
+## Importing conversation history
+
+Run the importer on the same machine as a private, consistent copy of the source database and any legacy transcript
+directories. Keep the inputs and output outside the repository. Choose a private output directory under the agent's
+notes root so `memory_search` can find the resulting `sessions/` archive.
+
+```sh
+node bin/import-transcripts.ts --database /private/copy.sqlite \
+  --jsonl-dir /private/legacy-copy --output /private/agent-notes
+```
+
+Supply the database, one or more `--jsonl-dir` options, or both. Use a SQLite backup or a consistent snapshot that
+includes committed WAL data. The importer opens the database read-only and never changes the transcripts. It reads
+plain and zstd database events, zstd transcript archives, and supported legacy JSONL variants. It merges duplicates
+by session and event ID. Markdown preserves user and assistant text, timestamps, tool names, and compaction
+summaries. Tool arguments, tool results, thinking and standard heartbeat polls are dropped. Archives still contain
+private conversation text, including anything participants pasted into messages.
+
+The command prints counts for unique sessions, written files, and unchanged files. Reuse the same output directory
+with a complete copy of the sources to update changed sessions. Existing filenames are retained for stable references,
+and files for sessions missing from later input stay in place. Keep the generated archive as importer-owned output.
+An unparseable source fails the import before any output is written. Decompressed zstd records and archives are
+limited to 128 MiB each. For the migration check, compare the count against the unique source session count and
+spot-check five sessions before enabling archive search.
+
 ## Tests
 
 ```sh

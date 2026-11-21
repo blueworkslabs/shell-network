@@ -224,6 +224,6 @@ export interface T3Port {
   projection(threadId: string): Promise<Projection>;
   queue(threadId: string): Promise<QueueList>;
   send(args: { threadId: string; message: string; mode: "queue"; clientRequestId: string }): Promise<{ messageId?: string; runId?: string; delivery?: string }>;
-  // /new: archive the bot's own (bound) thread; archived threads stay readable and searchable
+  // /new: archive the bot's own (bound) thread; archived threads stay readable by id (native search excludes them)
   archive(threadId: string): Promise<unknown>;
 }

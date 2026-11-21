@@ -77,7 +77,33 @@ the channel sees it) starts a reset of that bot's session in that channel. State
 
 The first batch of the fresh thread starts with a line telling the agent to read its daily notes. A second `/new`
 while one is pending is ignored. Nothing is force-cut: a turn that never ends keeps the reset waiting. Archived threads
-stay readable and searchable in t3; there is no `/resume` or unarchive yet.
+stay readable by id in t3, but are excluded from its native search; there is no `/resume` or unarchive yet.
+
+## Conversation history (t3 0.1.11, checked 2026-11-21)
+
+`t3_thread_search` searches non-archived threads by title/branch/PR/project and message text, not only titles.
+Its schema describes the search as non-exhaustive, skips subagent threads, and has no archive-inclusion option.
+Queries default to the caller's project inside a thread; pass `projectId` when a different project is intended.
+A live content-only marker returned an assistant-message hit. Two known archived conversations returned no hits
+for their content markers or exact unique title suffixes, although both remained readable by id.
+`t3_thread_list` also omitted those archived conversations and exposes no archive-inclusion option.
+
+`t3_thread_read` can retrieve an archived thread without resuming it. Use `view: "messages"` for conversation text;
+`activity` also includes tool/activity items. Explicitly start with `afterPosition: -1`, then page using
+`nextPosition` while `hasMore`. Complete truncated items using `itemId`, `textOffset: nextTextOffset` and
+`textTruncated`; do not silently export just the first fragment. The schema caps `limit` at 100 items,
+`runLimit` at 50 and `maxCharsPerItem` at 20,000 characters. A sampled default read returned 10 messages,
+500-character text fragments and about 11 KB of JSON, not a complete transcript. One-item reads with 100-character
+fragments were about 2 KB; size depends on metadata as well as text. Both page and text continuation were checked live.
+Reading a child's final result can mark it delivered; archive export should target the bridge's own conversation
+threads, not unrelated subagents.
+
+**Consequence:** native search is not an archive-search replacement. The importer needs a t3 source that writes
+archived conversations under `sessions/` in the agent's notes root for hybrid indexing. Discover `/new` archives
+from the bridge's per-conversation `archived` ledger (thread id, title, reset message id), or an explicit operator
+manifest for older archives; neither native search nor list is a complete archive inventory. Export using the read
+API with both pagination levels, stable thread/item ids, and idempotent reruns. Do not launch old conversations or
+write directly into t3's database. This source is required work, not implemented by this documentation.
 
 ## Direct messages
 

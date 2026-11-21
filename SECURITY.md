@@ -38,8 +38,8 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   same properties. Otherwise the process does not start (`lib/preflight.ts`). Stuck alerts and notices never include
   ids, paths or raw error text.
 - **Direct messages.** Only DMs of `BRIDGE_DM_USERS`, a subset of the people allowlist, are read, each in its own
-  conversation; other people's DMs are dropped and logged without their text. The bot's own Discord tool can still
-  reach the DM from its other conversations (see ARCHITECTURE.md).
+  conversation; other people's DMs are dropped and logged without their text. A DM belongs to the same agent as its
+  channels (shared tool, notes and memory), by design; see ARCHITECTURE.md.
 - **Files.** An agent can attach only files inside its workspace (`DISCORD_TOOL_WORKSPACE`; the path is resolved
   through symlinks and the target opened without following one). The Discord tool copies them into a staging directory
   and has no credential; the bridge validates the staged copies again before uploading them, so a tampered outbox

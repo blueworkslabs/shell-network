@@ -66,7 +66,7 @@ test("imports SQLite rows, zstd archives and all five legacy forms into private 
 
   const first = run(output, ...args);
   assert.equal(first.status, 0, first.stderr);
-  assert.deepEqual(JSON.parse(first.stdout), { sessions: 7, written: 7, unchanged: 0 });
+  assert.deepEqual(JSON.parse(first.stdout), { sessions: 7, written: 7, unchanged: 0, corruptLines: 0 });
   assert.deepEqual(readFileSync(database), originalDb);
   assert.deepEqual(readFileSync(legacyFile), originalLegacy);
   const dir = join(output, "sessions");
@@ -91,25 +91,28 @@ test("imports SQLite rows, zstd archives and all five legacy forms into private 
   const mtimes = files.map((file) => statSync(join(dir, file)).mtimeMs);
   const again = run(output, ...args);
   assert.equal(again.status, 0, again.stderr);
-  assert.deepEqual(JSON.parse(again.stdout), { sessions: 7, written: 0, unchanged: 7 });
+  assert.deepEqual(JSON.parse(again.stdout), { sessions: 7, written: 0, unchanged: 7, corruptLines: 0 });
   assert.deepEqual(files.map((file) => statSync(join(dir, file)).mtimeMs), mtimes);
 
   writeFileSync(legacyFile, jsonl(session("legacy-0-session"), msg("note", "user", "Updated legacy text")));
   writeFileSync(join(legacy, "new.jsonl"), jsonl(session("new-session"), msg("new", "user", "New session text")));
   const updated = run(output, ...args);
   assert.equal(updated.status, 0, updated.stderr);
-  assert.deepEqual(JSON.parse(updated.stdout), { sessions: 8, written: 2, unchanged: 6 });
+  assert.deepEqual(JSON.parse(updated.stdout), { sessions: 8, written: 2, unchanged: 6, corruptLines: 0 });
   assert.deepEqual(readFileSync(dbFile, "utf8"), archive);
   assert.equal(readdirSync(dir).length, 8);
 });
 
-test("malformed transcript input fails without echoing the transcript", () => {
-  const legacy = tempDir("legacy-");
-  writeFileSync(join(legacy, "broken.jsonl"), jsonl(session("broken-session")) + 'PRIVATE_SYNTHETIC_INVALID_JSON');
-  const result = run(tempDir("output-"), "--jsonl-dir", legacy);
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /Invalid transcript JSON/);
+test("counts corrupt lines after a session header and keeps later turns", () => {
+  const legacy = tempDir("legacy-"), output = tempDir("output-");
+  writeFileSync(join(legacy, "broken.jsonl"), jsonl(session("broken-session")) + 'PRIVATE_SYNTHETIC_INVALID_JSON\n' +
+    '{"noType":true}\n' + jsonl(msg("good", "user", "Still readable")));
+  const result = run(output, "--jsonl-dir", legacy);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { sessions: 1, written: 1, unchanged: 0, corruptLines: 2 });
   assert.doesNotMatch(result.stderr, /PRIVATE_SYNTHETIC/);
+  const dir = join(output, "sessions");
+  assert.match(readFileSync(join(dir, readdirSync(dir)[0]), "utf8"), /Still readable/);
 });
 
 
@@ -122,7 +125,7 @@ test("skips legacy sidecars and headerless files by name and continues importing
   writeFileSync(join(legacy, "valid.jsonl"), jsonl(session("good"), msg("x", "user", "Preserved")));
   const result = run(output, "--jsonl-dir", legacy);
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), { sessions: 1, written: 1, unchanged: 0 });
+  assert.deepEqual(JSON.parse(result.stdout), { sessions: 1, written: 1, unchanged: 0, corruptLines: 0 });
   for (const name of [...sidecars, "headerless.jsonl", "garbage.jsonl"]) assert.ok(result.stderr.includes(JSON.stringify(name)));
   assert.doesNotMatch(result.stderr, /SYNTHETIC_DO_NOT_LOG|Missing header/);
 });
@@ -178,5 +181,26 @@ test("leaves sessions without rendered turns out of the archive and count", () =
   const result = importOne(msg("poll", "user", "[OpenClaw heartbeat poll] More text"),
     msg("answer", "assistant", "HEARTBEAT_OK"), msg("tool", "assistant", [{ type: "toolCall", name: "only" }]));
   assert.deepEqual(result.files, []);
-  assert.deepEqual(result.counts, { sessions: 0, written: 0, unchanged: 0 });
+  assert.deepEqual(result.counts, { sessions: 0, written: 0, unchanged: 0, corruptLines: 0 });
+});
+
+test("restores keys from both session-store filename forms", () => {
+  const legacy = tempDir("legacy-"), output = tempDir("output-");
+  for (const [i, name] of ["sessions.json.pre-synthetic.bak", "legacy-store.sessions.json.imported-2"].entries()) {
+    const key = `agent:sample:discord:channel:${200 + i}`;
+    writeFileSync(join(legacy, name), JSON.stringify({ [key]: { sessionId: `stored-${i}` } }));
+    writeFileSync(join(legacy, `${i}.jsonl`), jsonl(session(`stored-${i}`), msg("prompt", "user", "Retained session")));
+  }
+  const result = run(output, "--jsonl-dir", legacy);
+  assert.equal(result.status, 0, result.stderr);
+  const dir = join(output, "sessions");
+  for (const i of [0, 1]) assert.match(readFileSync(join(dir, `2026-01-02--agent-sample-discord-channel-${200 + i}--stored-${i}.md`), "utf8"),
+    new RegExp(`Session key: agent:sample:discord:channel:${200 + i}`));
+});
+
+test("uses the first user cron marker as a fallback key and filename", () => {
+  const { files, text } = importOne(msg("prompt", "user", [{ type: "text", text: "[cron:fake-id Weekly check] Check dependencies." }]),
+    msg("reply", "assistant", "All clear."));
+  assert.deepEqual(files, ["2026-01-02--cron-weekly-check--legacy-i.md"]);
+  assert.match(text, /Session key: cron:Weekly check/);
 });

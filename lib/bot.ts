@@ -39,7 +39,7 @@ const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)
 export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
 type Found = { status: "found"; message: DiscordMessage } | { status: "absent" } | { status: "unknown" };
 export interface BotOptions {
-  name: string; conversationKey: string; channelId: string; threadLabel?: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
+  name: string; conversationKey: string; channelId: string; channelName?: string; threadLabel?: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
   buffer: Buffer; t3: T3Port; discord: DiscordPort; log: Log; now?: () => number;
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
@@ -60,7 +60,7 @@ const PAGE = 100;
 const DISCORD_EPOCH = 1420070400000n;
 const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) ) - DISCORD_EPOCH) << 22n;
 
-export function makeBot({ name, conversationKey, channelId, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
+export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
   allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000 }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
@@ -608,7 +608,9 @@ export function makeBot({ name, conversationKey, channelId, threadLabel, botUser
     const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId });
     const newest = [...(win.newestId ? [win.newestId] : []), ...rows.map((r) => r.source_message_id)].sort((a, b) => byId({ id: a }, { id: b })).at(-1);
     if (newest) buffer.kvSet(K("headerSince"), newest);
-    const hint = [...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`);
+    // which channel this conversation is (the Discord tool needs it on every call), then how to address the crew
+    const hint = [`[Discord channel: #${channelName ?? channelId} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`,
+      ...[...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`)];
     const toEntry = (addressed: boolean) => (m: { author_name: string; content: string }) =>
       ({ addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
     const entries = [...win.addressed.map((m) => ({ m, e: toEntry(true)(m) })), ...win.unaddressed.map((m) => ({ m, e: toEntry(false)(m) }))]
@@ -621,7 +623,7 @@ export function makeBot({ name, conversationKey, channelId, threadLabel, botUser
       entries.splice(i >= 0 ? i : 0, 1);
     }
     const lines = entries.map((e) => e.line);
-    if (!lines.length) return hint.length ? hint.join("\n") + "\n" : "";
+    if (!lines.length) return hint.join("\n") + "\n";
     const left = total - lines.length;
     return [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
   }

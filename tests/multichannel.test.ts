@@ -53,7 +53,7 @@ test("TWO CHANNELS: each channel's mentions go to its own t3 thread, and each re
   assert.deepEqual(w.discord.botPosts().map((m) => [m.channel_id, m.content]).sort(), [[A, "done in A"], [B, "done in B"]]);
 });
 
-test("TWO CHANNELS: the unread header shows only the bot's own channel", async () => {
+test("TWO CHANNELS: the batch names its channel for the Discord tool, and the unread header shows only that channel", async () => {
   const w = gemInTwoChannels();
   await w.deliver(w.discord.userSays("secret plan for project A", { channel: A, mention: false }));
   await w.deliver(w.discord.userSays("chatter in B", { channel: B, mention: false }));
@@ -62,6 +62,7 @@ test("TWO CHANNELS: the unread header shows only the bot's own channel", async (
   const sent = w.t3.sends().find((s) => s.threadId === w.thread(B))!.message!;
   assert.match(sent, /chatter in B/, "control: the header shows B's unread line");
   assert.doesNotMatch(sent, /secret plan/);
+  assert.ok(sent.includes(`(id ${B}); pass this id as \`channel\``) && !sent.includes(`id ${A}`), "the batch names its own channel");
 });
 
 test("TWO CHANNELS: the bot-to-bot cap counts per channel", () => {

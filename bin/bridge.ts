@@ -107,7 +107,7 @@ for (const [i, channelId] of channelIds.entries()) {
   // MCP allowlist: this project, this instance, this conversation's one thread (kv, set once launched/adopted)
   const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`) };
   bots.push(makeBot({
-    name: cfg.name, conversationKey, channelId, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
+    name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
     allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap,
     buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));

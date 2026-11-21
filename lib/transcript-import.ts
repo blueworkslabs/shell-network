@@ -8,9 +8,10 @@ type RecordData = Record<string, unknown>;
 type Event = RecordData & { type: string };
 type Session = { id: string; key?: string; label?: string; events: Event[]; seen: Set<string> };
 type ImportOptions = { database?: string; jsonlDirectories?: string[]; output: string; onSkip?: (filename: string) => void };
-type ImportResult = { sessions: number; written: number; unchanged: number };
+type ImportResult = { sessions: number; written: number; unchanged: number; corruptLines: number };
 
 const LEGACY = /\.jsonl(?:\.(?:reset\..+|bak\..+|deleted\..+\.zst|imported-\d+))?$/;
+const SESSION_STORE = /^(?:sessions\.json\.pre-.*bak|legacy-store\.sessions\.json\.imported-.+)$/;
 const NON_TRANSCRIPT = /(?:\.trajectory\.jsonl.*|\.trajectory-path\.json)$|^legacy-store\.sessions\.json.*$/;
 const FILE_KEY = /^agent_([a-z0-9_-]+)_discord_(channel|direct)_(\d+)\.[^.]+\.jsonl(?:\.|$)/i;
 const channelId = (key: string) => /:discord:(?:channel|direct):([^:]+)$/.exec(key)?.[1];
@@ -32,8 +33,27 @@ function parseEvent(line: string): Event {
   if (typeof event.type !== "string") throw new Error("event has no type");
   return event as Event;
 }
-function* parseLines(text: string): Generator<Event> {
-  for (const line of text.split(/\r?\n/)) if (line.trim()) yield parseEvent(line);
+function* nonblankLines(text: string): Generator<string> {
+  for (const line of text.split(/\r?\n/)) if (line.trim()) yield line;
+}
+
+function tryEvent(line: string): Event | undefined {
+  try {
+    const data = obj(JSON.parse(line));
+    return typeof data.type === "string" ? data as Event : undefined;
+  } catch (e) {
+    if (e instanceof SyntaxError) return;
+    throw e;
+  }
+}
+
+function recoveredCronKey(session: Session): string | undefined {
+  const first = session.events.find((e) => e.type === "message" && obj(e.message).role === "user");
+  const content = obj(first?.message).content;
+  const text = typeof content === "string" ? content :
+    Array.isArray(content) ? content.map(obj).filter((part) => part.type === "text").map((part) => str(part.text)).join("\n") : "";
+  const name = /^\[cron:[^\s\]]+ +([^\]\r\n]+)\]/.exec(text.trimStart())?.[1]?.trim();
+  return name ? `cron:${name}` : undefined;
 }
 
 function rendered(event: Event): { role: string; text: string } | undefined {
@@ -81,6 +101,8 @@ export function importTranscripts({ database, jsonlDirectories = [], output, onS
   if (!database && !jsonlDirectories.length) throw new Error("at least one copied input is required");
   const sessions = new Map<string, Session>();
   const channels = new Map<string, string>();
+  const storeKeys = new Map<string, string>();
+  let corruptLines = 0;
   const get = (id: string): Session => {
     if (!id || flat(id) !== id) throw new Error("invalid session ID");
     const session = sessions.get(id) ?? { id, events: [], seen: new Set<string>() };
@@ -94,6 +116,13 @@ export function importTranscripts({ database, jsonlDirectories = [], output, onS
     session.seen.add(key);
     session.events.push(event);
   };
+  function addLines(session: Session, lines: Iterable<string>): void {
+    for (const line of lines) {
+      const event = tryEvent(line);
+      if (event) add(session, event);
+      else corruptLines++;
+    }
+  }
   if (database) {
     if (!lstatSync(database).isFile()) throw new Error("database copy must be a regular file");
     const db = new DatabaseSync(database, { readOnly: true });
@@ -115,7 +144,7 @@ export function importTranscripts({ database, jsonlDirectories = [], output, onS
       for (const row of db.prepare("SELECT session_id, archive_blob, encoding FROM session_transcript_archives ORDER BY session_id").iterate()) {
         if (row.encoding !== "zstd") throw new Error("unsupported transcript archive encoding");
         const session = get(str(row.session_id));
-        for (const event of parseLines(decode(row.archive_blob))) add(session, event);
+        addLines(session, nonblankLines(decode(row.archive_blob)));
       }
       for (const session of sessions.values()) {
         const meta = metadata.get(session.id);
@@ -127,24 +156,34 @@ export function importTranscripts({ database, jsonlDirectories = [], output, onS
     if (!lstatSync(directory).isDirectory()) throw new Error("JSONL source must be a directory copy");
     for (const file of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       if (!file.isFile()) continue;
+      if (SESSION_STORE.test(file.name)) {
+        const store = obj(JSON.parse(readFileSync(join(directory, file.name), "utf8")));
+        for (const key of Object.keys(store).sort()) {
+          const id = str(obj(store[key]).sessionId);
+          if (id && key.startsWith("agent:") && !storeKeys.has(id)) storeKeys.set(id, key);
+        }
+        continue;
+      }
       if (NON_TRANSCRIPT.test(file.name)) { onSkip(file.name); continue; }
       if (!LEGACY.test(file.name)) continue;
       const data = readFileSync(join(directory, file.name));
-      const events = parseLines(file.name.endsWith(".zst") ? decode(data) : data.toString("utf8"));
-      let header: Event | undefined;
-      try { header = events.next().value; } catch (e) {
-        if (!(e instanceof SyntaxError) && !(e instanceof Error && e.message === "event has no type")) throw e;
-      }
+      const lines = nonblankLines(file.name.endsWith(".zst") ? decode(data) : data.toString("utf8"));
+      const first = lines.next();
+      const header = first.done ? undefined : tryEvent(first.value);
       const id = str(header?.id);
       if (header?.type !== "session" || !id || flat(id) !== id) { onSkip(file.name); continue; }
       const session = get(id);
       add(session, header);
       const match = FILE_KEY.exec(file.name);
       if (match && !session.key) session.key = `agent:${match[1]}:discord:${match[2]}:${match[3]}`;
-      const channel = channelId(session.key ?? "");
-      if (channel && !session.label) session.label = channels.get(channel);
-      for (const event of events) add(session, event);
+      addLines(session, lines);
     }
+  }
+
+  for (const session of sessions.values()) {
+    session.key ||= storeKeys.get(session.id) || recoveredCronKey(session);
+    const channel = channelId(session.key ?? "");
+    if (channel && !session.label) session.label = channels.get(channel);
   }
 
   const dir = join(output, "sessions");
@@ -177,5 +216,5 @@ export function importTranscripts({ database, jsonlDirectories = [], output, onS
       written++;
     } finally { rmSync(temp, { force: true }); }
   }
-  return { sessions: written + unchanged, written, unchanged };
+  return { sessions: written + unchanged, written, unchanged, corruptLines };
 }

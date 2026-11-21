@@ -56,7 +56,7 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
       api.channels.getMessages(channelId, { after: afterId, limit }) as unknown as Promise<DiscordMessage[]>,
     // a thread from a message (its id is the message id), only under an allowed channel itself (not under a thread)
     startThread: (channelId: string, messageId: string, name: string) => { parentGuard(channelId); return api.channels.createThread(channelId, { name }, messageId) as unknown as Promise<{ id: string }>; },
-    getChannel: (channelId: string) => api.channels.get(channelId) as unknown as Promise<{ id: string; parent_id?: string | null; guild_id?: string }>,
+    getChannel: (channelId: string) => api.channels.get(channelId) as unknown as Promise<{ id: string; name?: string; parent_id?: string | null; guild_id?: string }>,
   });
 }
 

@@ -1,5 +1,5 @@
 // Watchdog actions. Detection stays in lib/watchdog.ts (two snapshots >= graceMs apart); this acts on findings
-// for the bots' own threads only (kv `<bot>:threadId`; other threads are never touched):
+// for the bots' own threads only (kv `<conversation>:threadId`, one per bot and channel; other threads are never touched):
 //   held-queue   -> `queue.resume` for that thread (operate grant, lib/operate.ts), at most `maxResumes` times per
 //                   finding, `resumeRetryMs` apart; then a notice for a person.
 // t3 settles a run whose Codex app-server died by itself since 0.1.11 (pingdotgg/t3code#22422), so the watchdog no
@@ -22,7 +22,8 @@ export interface WatchdogDeps {
   resumeRetryMs?: number;
   maxResumes?: number;
 }
-const label = (bot: string) => bot.charAt(0).toUpperCase() + bot.slice(1);
+// bot = a conversation key (`<bot>.<channel id>`, lib/bots.ts): the notice names the bot only
+const label = (bot: string) => bot.charAt(0).toUpperCase() + bot.split(".")[0].slice(1);
 
 export function makeWatchdog({ snapshot, resumeQueue, store, log, now = () => Date.now(), newId = () => crypto.randomUUID(),
   graceMs = 60_000, resumeRetryMs = 2 * 60_000, maxResumes = 3 }: WatchdogDeps) {

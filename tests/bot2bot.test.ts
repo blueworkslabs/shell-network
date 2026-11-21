@@ -126,11 +126,11 @@ test("UNREAD HEADER: what the bot missed since its last turn, without its own po
   const w = crew({ cap: 0, headerMaxMessages: 3, headerMaxChars: 2000 });
   await w.person("gem, first question", GEM);
   const g1 = await w.turn(w.gem, "answer one");
-  assert.ok(g1.sent.startsWith(`[To address Hermes, write <@${HERMES}>.]\n`), "first batch: nothing missed yet, only the address hint");
+  assert.ok(g1.sent.startsWith(`[Discord channel: #${CH} (id ${CH}); pass this id as \`channel\` to the Discord tools.]\n[To address Hermes, write <@${HERMES}>.]\n`), "first batch: nothing missed yet, only the channel and address hints");
   await w.person("aside for everyone", null);
   await w.person("hermes, what do you think?", HERMES);
   const h1 = await w.turn(w.hermes, "I agree");
-  assert.match(h1.sent, /^\[Channel since your last turn, 3 messages, oldest first:\]\nuser1: @Gem gem, first question\nGem: answer one\nuser1: aside for everyone\n\[To address Gem, write <@333333333333333333>\.\]\n\[New messages for you:\]\n/);
+  assert.match(h1.sent, /^\[Channel since your last turn, 3 messages, oldest first:\]\nuser1: @Gem gem, first question\nGem: answer one\nuser1: aside for everyone\n\[Discord channel: #shell-network \(id shell-network\); pass this id as `channel` to the Discord tools\.\]\n\[To address Gem, write <@333333333333333333>\.\]\n\[New messages for you:\]\n/);
   assert.ok(!/hermes, what do you think/.test(h1.sent.split("[New messages for you:]")[0]), "the batch's own message is not repeated in the header");
   await w.person("x1", null); await w.person("x2", null); await w.person("x3", null); await w.person("x4", null);
   await w.person("gem again", GEM);

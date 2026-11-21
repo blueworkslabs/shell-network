@@ -5,7 +5,7 @@ t3 thread (Claude or Codex provider). The bridge brings mentions from allowliste
 thread's queue and posts the agent's replies back. It is built to survive crashes, restarts and t3's own failure modes
 without losing a message or posting one twice.
 
-Status: experimental. The adapter targets t3 0.1.11, with one channel and two bots on a single VM. See
+Status: experimental. The adapter targets t3 0.1.11, with two bots on a single VM, each in one or more channels. See
 [SECURITY.md](SECURITY.md) for the trust model and the known limits.
 
 Trial scope: a rare duplicate message is acceptable. Keep changes limited to observed failures during real use;
@@ -54,14 +54,14 @@ npm ci --omit=dev        # runtime: @discordjs/core, rest, ws and their dependen
 
 ## Run
 
-There is one bridge process per bot. All bots share one buffer DB, and one watchdog serves all of them. Settings come
+There is one bridge process per bot, serving all of the bot's channels. All bots share one buffer DB, and one watchdog serves all of them. Settings come
 from the environment. Secrets are always given as file paths and never as values. Each secret file must belong to the
 bridge user, have no group/other permission bits, and sit in a directory with the same properties.
 
 ```sh
 BRIDGE_BOT=gem \
 BRIDGE_CREW_FILE=/path/to/private/crew.json \
-BRIDGE_CHANNEL_ID=<channel id> \
+BRIDGE_CHANNEL_IDS=<channel id>,<another channel id> \
 BRIDGE_ALLOWED_AUTHORS=<your Discord user id> \
 BRIDGE_DISCORD_TOKEN=/path/to/secrets/gem-discord-token \
 BRIDGE_PROJECT_ID=<t3 project id> \
@@ -84,6 +84,12 @@ The file is read once at startup. Invalid members, duplicate keys or ids, a miss
 own id that differs from the Discord token are refused. Restart the bridge after changing the file. Keep real crew
 files outside the repository; `crew.json` and `crew.*.json` are ignored except for the example. Remove the old
 `BRIDGE_ALLOWED_BOTS`, `BRIDGE_BOT_NAME`, `BRIDGE_INSTANCE_ID` and `BRIDGE_MODEL` settings when migrating.
+
+Each channel in `BRIDGE_CHANNEL_IDS` is its own conversation (key `<bot>.<channel id>`): one t3 thread, one unread
+header, one input queue and one exchange cap per channel; nothing said in one channel reaches the bot's context in
+another. The bot's workspace (its t3 project) is shared across its channels. The Discord tool takes the channel on every
+call and accepts only the bot's channels (and threads its tool created there). A bridge started with a different set
+of channels needs a fresh buffer DB; there is no migration from the single-channel schema.
 
 At startup the bridge discovers its own managed Discord role by reading the channel's guild and finding the role
 whose `tags.bot_id` matches its own user id. Mentions of that role in `mention_roles` count as mentions of the bot;

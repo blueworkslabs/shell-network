@@ -12,8 +12,9 @@ Discord ──gateway/REST──▶ bridge (one per bot) ──MCP (write) / WS 
                       discord-tool (stdio MCP, spawned by the agent's provider)
 ```
 
-- **Bridge** (`bin/bridge.ts`, core in `lib/bot.ts`): one process per bot, with one Discord channel and one t3 thread.
-  It is the only writer for its bot token. One step runs at a time (`lib/steploop.ts`). Gateway messages, t3 changes
+- **Bridge** (`bin/bridge.ts`, core in `lib/bot.ts`): one process per bot, serving one or more Discord channels with one t3
+  thread per channel (conversation `<bot>.<channel id>`, one bot core each). It is the only writer for its bot token.
+  One step runs at a time (`lib/steploop.ts`); a step goes through every channel, and a failing channel does not stop the others. Gateway messages, t3 changes
   and queued notices wake the loop early. A wake that arrives while a step runs is remembered, so the loop steps again
   right away instead of waiting for its timer.
 - **Watchdog** (`bin/watchdog.ts`, `lib/watchdog.ts` + `lib/watchdog-run.ts`): the only holder of t3's
@@ -28,7 +29,7 @@ schema change before the trial verdict means a fresh DB.
 
 ## Input: accept, batch, send
 
-1. **Accept.** A message is accepted only if it is in the configured channel, mentions the bot, and comes from an
+1. **Accept.** A message is accepted only if it is in one of the bot's channels (each its own conversation), mentions the bot, and comes from an
    allowlisted person or an allowed bot. The bridge commits it to `inbound`, and only then acknowledges it with a
    reaction. Lost acknowledgements are redone. Everything else is dropped before the buffer. A person's bare mention
    (no text) counts as "go on": the batch carries an explicit bridge note instead of invented text. A bot's bare
@@ -116,10 +117,11 @@ t3 `thread.updated` events, and the idle tick stays as a fallback.
   - no UPDATE, DELETE, DDL, ATTACH or writable PRAGMA.
 - Each mutating call requires an idempotency key. Replaying a call with the same arguments returns the first result;
   replaying with different arguments is refused.
-- Targets must be messages in the bridge's channel log. A tool thread may be used only if it was created by this bot's
-  tool under the channel.
+- Every call names its channel, which must be one of the bot's channels (a `tool_config` row per bot and channel).
+  Targets must be messages in that channel's log. A tool thread may be used only if it was created by this bot's
+  tool under one of its channels.
 - The bridge checks channel, target and mentions again right before the POST.
-- `discord_read` reads only the bridge's channel log, with no network access.
+- `discord_read` reads only the named channel's log, with no network access.
 
 ## Code layout
 

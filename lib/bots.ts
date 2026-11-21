@@ -1,5 +1,8 @@
 import { readFileSync } from "node:fs";
 
+// One conversation per bot and channel: its buffer rows, kv prefix, t3 thread, outbox and tool config.
+export const conversationKeyFor = (bot: string, channelId: string): string => `${bot}.${channelId}`;
+
 export interface CrewMember { key: string; name: string; id: string; instanceId?: string; model?: string }
 export interface BotConfig extends CrewMember { instanceId: string; model: string }
 

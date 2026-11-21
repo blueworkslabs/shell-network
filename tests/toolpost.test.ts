@@ -8,6 +8,7 @@ import { makeBot } from "../lib/bot.ts";
 import { memoryLog } from "../lib/log.ts";
 import { openToolDb } from "../lib/tooldb.ts";
 import { makeTools } from "../lib/tools.ts";
+import { conversationKeyFor } from "../lib/bots.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir, track } from "./tmp.ts";
 
@@ -37,12 +38,12 @@ function world({ nonceWindow = false, allowedBots = [{ id: HERMES, name: "Hermes
       w.buffer = openTempBuffer(path, { now });
       t3.crash.buffer = w.buffer;
       discord.crash.buffer = w.buffer;
-      w.bot = makeBot({ name: "Gem", conversationKey: "gem", channelId: CH, botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem",
+      w.bot = makeBot({ name: "Gem", conversationKey: conversationKeyFor("gem", CH), channelId: CH, botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem",
         modelSelection: { instanceId: "crewGemClaude", model: "m" }, buffer: w.buffer, t3, discord, log, now, session: () => "s1", allowedBots });
       return w;
     },
     restart() { try { w.buffer.close(); } catch {} return w.start(); },
-    thread: () => w.buffer.kvGet("gem:threadId") as string,
+    thread: () => w.buffer.kvGet(`${conversationKeyFor("gem", CH)}:threadId`) as string,
     steps: async (n = 3) => { for (let i = 0; i < n; i++) { await w.bot.step(); clock += 1000; } },
     tick: (ms: number) => (clock += ms),
     // a message of the user in the channel, seen by the bridge (so it is in the channel log)
@@ -62,7 +63,7 @@ test("TOOL POST: a tool send goes out through the outbox with pings limited to t
   const t = w.tools();
   const k = ref(t.send({ channel: CH, content: `<@${HERMES}> please check @everyone <@&999>`, reply_to: m.id, idempotency_key: "p1" }));
   await w.steps(1);
-  const e = w.buffer.outboxEntry("gem", k)!;
+  const e = w.buffer.outboxEntry(conversationKeyFor("gem", CH), k)!;
   const posts = w.messagesWith(e.nonce);
   assert.equal(posts.length, 1);
   assert.deepEqual(posts[0].payload!.allowed_mentions, { parse: [], users: [HERMES], replied_user: false });
@@ -85,14 +86,14 @@ test("TOOL POST EXACTLY ONCE: bridge killed between intent and POST: after the r
 test("TOOL REACT: the bridge adds the reaction; killed before the PUT it is repeated once; a deleted target does not fail the step", async () => {
   const w = world();
   const m = await w.human("nice work");
-  ref(w.tools().react({ message_id: m.id, emoji: "🎉", idempotency_key: "r1" }));
+  ref(w.tools().react({ channel: CH, message_id: m.id, emoji: "🎉", idempotency_key: "r1" }));
   w.discord.crash.react = "before";
   await assert.rejects(w.bot.step(), /CRASH|not open/);
   w.restart();
   await w.steps(1);
   assert.deepEqual(w.discord.reactions.filter((r) => r.emoji === "🎉").map((r) => r.messageId), [m.id]);
   const gone = await w.human("soon deleted");
-  ref(w.tools().react({ message_id: gone.id, emoji: "👍", idempotency_key: "r2" }));
+  ref(w.tools().react({ channel: CH, message_id: gone.id, emoji: "👍", idempotency_key: "r2" }));
   const real = w.discord.react;
   w.discord.react = async () => { throw Object.assign(new Error("Unknown Message"), { status: 404 }); };
   await w.steps(1);
@@ -102,7 +103,7 @@ test("TOOL REACT: the bridge adds the reaction; killed before the PUT it is repe
 test("TOOL ORDER: a tool send queued behind an unsettled head waits for it (one ordered outbox)", async () => {
   const w = world();
   await w.human("hi");
-  w.buffer.enqueue("gem", { key: "notice:1", content: "first", nonce: "n1" });
+  w.buffer.enqueue(conversationKeyFor("gem", CH), { key: "notice:1", content: "first", nonce: "n1" });
   ref(w.tools().send({ channel: CH, content: "second", idempotency_key: "o1" }));
   w.discord.crash.post = "before";
   await assert.rejects(w.bot.step(), /CRASH|not open/);
@@ -139,7 +140,7 @@ for (const point of ["before", "after"] as const) {
     const w = world();
     const m = await w.human("let's split this out");
     const t = w.tools();
-    ref(t.thread({ message_id: m.id, name: "split", idempotency_key: `th-${point}` }));
+    ref(t.thread({ channel: CH, message_id: m.id, name: "split", idempotency_key: `th-${point}` }));
     w.discord.crash.thread = point;
     await assert.rejects(w.bot.step(), /CRASH|not open/);
     w.restart();
@@ -164,16 +165,16 @@ test("TOOL THREAD: a thread that already exists for the message (Discord 160004)
   const w = world();
   const m = await w.human("one starter");
   w.discord.threads.set(m.id, { id: m.id, parent_id: CH, name: "made elsewhere" });
-  const k = ref(w.tools().thread({ message_id: m.id, name: "second", idempotency_key: "dup" }));
+  const k = ref(w.tools().thread({ channel: CH, message_id: m.id, name: "second", idempotency_key: "dup" }));
   await w.steps(1);
-  assert.equal(w.buffer.outboxEntry("gem", k)!.state, "posted");
+  assert.equal(w.buffer.outboxEntry(conversationKeyFor("gem", CH), k)!.state, "posted");
   assert.equal(w.discord.threads.get(m.id)!.name, "made elsewhere");
 });
 
 test("TOOL REACT RECORDED: one reaction is PUT once and recorded in the same step (a drain that never records it would PUT again and again)", async () => {
   const w = world();
   const m = await w.human("record me");
-  ref(w.tools().react({ message_id: m.id, emoji: "✅", idempotency_key: "rec" }));
+  ref(w.tools().react({ channel: CH, message_id: m.id, emoji: "✅", idempotency_key: "rec" }));
   const real = w.discord.react.bind(w.discord);
   let calls = 0;
   w.discord.react = async (ch, id, emoji) => { if (++calls > 3) throw new Error(`react repeated ${calls} times`); return real(ch, id, emoji); };

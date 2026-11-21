@@ -18,7 +18,7 @@ import type { AcceptInput, ActionRow, AlertRow, BatchRow, BatchStatus, InboundRo
 const CHANNEL_LOG_KEEP_MS = 7 * 24 * 3600_000; // channel log retention (unread header, tool reads)
 // Schema version (PRAGMA user_version), set by openBuffer. Openers that must not create the schema (the Discord
 // tool, lib/tooldb.ts) refuse any other version. Raise it with every schema change.
-export const BUFFER_SCHEMA_VERSION = 1;
+export const BUFFER_SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS inbound (
@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS inbound (
   batch_id          INTEGER REFERENCES batch(id),
   acked_at          INTEGER,                    -- upstream acknowledgement (reaction) done, always after the commit
   author_kind       TEXT NOT NULL DEFAULT 'human' CHECK (author_kind IN ('human','bot')), -- bot-to-bot
+  channel_id        TEXT NOT NULL DEFAULT '',   -- Discord channel the message was posted in (cap episodes are per channel)
   UNIQUE (source, source_message_id, conversation_key) -- one message may address several bots
 );
 CREATE TABLE IF NOT EXISTS batch (
@@ -87,7 +88,8 @@ CREATE TABLE IF NOT EXISTS channel_message (      -- what allowed authors and th
   author_name       TEXT NOT NULL,
   author_kind       TEXT NOT NULL,                -- 'human' | 'bot'
   content           TEXT NOT NULL,
-  at                INTEGER NOT NULL
+  at                INTEGER NOT NULL,
+  channel_id        TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS relay (                -- completion relay: runs no batch started (Monitor/background
   id                INTEGER PRIMARY KEY AUTOINCREMENT, -- wakes, scheduled tasks) whose final text goes to the channel
@@ -127,7 +129,8 @@ CREATE TABLE IF NOT EXISTS outbox (               -- every message this bot post
 );
 CREATE INDEX IF NOT EXISTS outbox_open ON outbox (conversation_key, state, id);
 CREATE TABLE IF NOT EXISTS human_message (        -- ids of the allowlisted people's channel messages: the exchange
-  id                TEXT PRIMARY KEY              -- cap's episode boundaries. Never pruned, unlike the channel
+  id                TEXT PRIMARY KEY,             -- cap's episode boundaries. Never pruned, unlike the channel
+  channel_id        TEXT NOT NULL DEFAULT ''
 );                                              -- log: a reset must not expire.
 CREATE TABLE IF NOT EXISTS bot_capped (           -- bot messages held back by the exchange cap, kept so a
   source            TEXT NOT NULL,              -- redelivery or replay gets the same answer
@@ -272,22 +275,17 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
   // mention) cut the channel into episodes, in Discord id order. A bot message belongs to the episode its id falls in,
   // whenever it arrives (late or replayed messages are counted where they were posted, not where they
   // arrive). Snowflakes compare by length, then text.
-  const HUMANS = "SELECT source_message_id id FROM inbound WHERE author_kind = 'human' UNION SELECT id FROM human_message";
+  // Per channel: humans and bot messages of other channels never cut or fill this channel's episodes.
+  const HUMANS = "SELECT source_message_id id FROM inbound WHERE author_kind = 'human' AND channel_id = ? UNION SELECT id FROM human_message WHERE channel_id = ?";
   const before = (col: string) => `(length(${col}) < length(?) OR (length(${col}) = length(?) AND ${col} < ?))`;
   const after = (col: string) => `(length(${col}) > length(?) OR (length(${col}) = length(?) AND ${col} > ?))`;
-  const episodeOf = (messageId: string): { start: string | null; count: number } => {
-    const start = one<{ id: string }>(`SELECT id FROM (${HUMANS}) WHERE ${before("id")} ORDER BY length(id) DESC, id DESC LIMIT 1`, messageId, messageId, messageId)?.id ?? null;
-    const end = one<{ id: string }>(`SELECT id FROM (${HUMANS}) WHERE ${after("id")} ORDER BY length(id), id LIMIT 1`, messageId, messageId, messageId)?.id ?? null;
+  const episodeOf = (messageId: string, channelId: string): { start: string | null; count: number } => {
+    const start = one<{ id: string }>(`SELECT id FROM (${HUMANS}) WHERE ${before("id")} ORDER BY length(id) DESC, id DESC LIMIT 1`, channelId, channelId, messageId, messageId, messageId)?.id ?? null;
+    const end = one<{ id: string }>(`SELECT id FROM (${HUMANS}) WHERE ${after("id")} ORDER BY length(id), id LIMIT 1`, channelId, channelId, messageId, messageId, messageId)?.id ?? null;
     const where = [start === null ? null : after("source_message_id"), end === null ? null : before("source_message_id")].filter(Boolean);
     const args = [...(start === null ? [] : [start, start, start]), ...(end === null ? [] : [end, end, end])];
-    const n = one<{ n: number }>(`SELECT count(DISTINCT source_message_id) n FROM inbound WHERE author_kind = 'bot'${where.map((w) => ` AND ${w}`).join("")}`, ...args)!.n;
+    const n = one<{ n: number }>(`SELECT count(DISTINCT source_message_id) n FROM inbound WHERE author_kind = 'bot' AND channel_id = ?${where.map((w) => ` AND ${w}`).join("")}`, channelId, ...args)!.n;
     return { start, count: n };
-  };
-  // The current episode: after the newest human message.
-  const exchangesSinceHuman = (): { count: number; lastHumanId: string | null } => {
-    const last = one<{ id: string }>(`SELECT id FROM (${HUMANS}) ORDER BY length(id) DESC, id DESC LIMIT 1`)?.id ?? null;
-    const n = one<{ n: number }>(`SELECT count(DISTINCT source_message_id) n FROM inbound WHERE author_kind = 'bot'${last === null ? "" : ` AND ${after("source_message_id")}`}`, ...(last === null ? [] : [last, last, last]))!.n;
-    return { count: n, lastHumanId: last };
   };
 
   return {
@@ -296,7 +294,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
 
     // Durable accept. Returns { inserted, id }. A repeated delivery of the same upstream message is a no-op that
     // returns the original row id, so the caller may ack again without duplicating input.
-    accept({ source, sourceMessageId, conversationKey, author, text, receivedAt, authorKind = "human" }: AcceptInput): { inserted: boolean; id: number } {
+    accept({ source, sourceMessageId, conversationKey, author, text, receivedAt, authorKind = "human", channelId = "" }: AcceptInput): { inserted: boolean; id: number } {
       for (const [k, v] of Object.entries({ source, sourceMessageId, conversationKey, author, text })) {
         if (typeof v !== "string" || (k !== "text" && !v)) throw new Error(`accept: ${k} must be a non-empty string`);
       }
@@ -304,8 +302,8 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       return tx(() => {
         const prior = one<{ id: number }>("SELECT id FROM inbound WHERE source = ? AND source_message_id = ? AND conversation_key = ?", source, sourceMessageId, conversationKey);
         if (prior) return { inserted: false, id: prior.id };
-        const r = db.prepare("INSERT INTO inbound (source, source_message_id, conversation_key, author, text, received_at, accepted_at, author_kind) VALUES (?,?,?,?,?,?,?,?)")
-          .run(source, sourceMessageId, conversationKey, author, text, receivedAt, now(), authorKind);
+        const r = db.prepare("INSERT INTO inbound (source, source_message_id, conversation_key, author, text, received_at, accepted_at, author_kind, channel_id) VALUES (?,?,?,?,?,?,?,?,?)")
+          .run(source, sourceMessageId, conversationKey, author, text, receivedAt, now(), authorKind, channelId);
         return { inserted: true, id: Number(r.lastInsertRowid) };
       });
     },
@@ -321,23 +319,23 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
           input.source, input.sourceMessageId, input.conversationKey);
         if (refused) return { capped: true as const, count: refused.count, lastHumanId: refused.episode_start };
         const seen = one<{ n: number }>("SELECT count(*) n FROM inbound WHERE source = ? AND source_message_id = ?", input.source, input.sourceMessageId)!.n > 0;
-        const ep = episodeOf(input.sourceMessageId);
+        const ep = episodeOf(input.sourceMessageId, input.channelId ?? "");
         if (cap > 0 && !seen && ep.count >= cap) {
           db.prepare("INSERT INTO bot_capped (source, source_message_id, conversation_key, episode_start, count, capped_at) VALUES (?, ?, ?, ?, ?, ?)")
             .run(input.source, input.sourceMessageId, input.conversationKey, ep.start, ep.count, now());
           return { capped: true as const, count: ep.count, lastHumanId: ep.start };
         }
-        const r = db.prepare("INSERT INTO inbound (source, source_message_id, conversation_key, author, text, received_at, accepted_at, author_kind) VALUES (?,?,?,?,?,?,?,'bot')")
-          .run(input.source, input.sourceMessageId, input.conversationKey, input.author, input.text, input.receivedAt, now());
+        const r = db.prepare("INSERT INTO inbound (source, source_message_id, conversation_key, author, text, received_at, accepted_at, author_kind, channel_id) VALUES (?,?,?,?,?,?,?,'bot',?)")
+          .run(input.source, input.sourceMessageId, input.conversationKey, input.author, input.text, input.receivedAt, now(), input.channelId ?? "");
         return { inserted: true, id: Number(r.lastInsertRowid) };
       });
     },
 
     // Channel log for the unread header: only what the bridge was allowed to read (allowlisted authors, bots).
-    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number }): void {
+    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number; channelId?: string }): void {
       tx(() => {
-        db.prepare("INSERT OR IGNORE INTO channel_message (id, author_id, author_name, author_kind, content, at) VALUES (?, ?, ?, ?, ?, ?)").run(m.id, m.authorId, m.authorName, m.authorKind, m.content, m.at);
-        if (m.authorKind === "human") db.prepare("INSERT OR IGNORE INTO human_message (id) VALUES (?)").run(m.id);
+        db.prepare("INSERT OR IGNORE INTO channel_message (id, author_id, author_name, author_kind, content, at, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?)").run(m.id, m.authorId, m.authorName, m.authorKind, m.content, m.at, m.channelId ?? "");
+        if (m.authorKind === "human") db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(m.id, m.channelId ?? "");
         db.prepare("DELETE FROM channel_message WHERE at < ?").run(now() - CHANNEL_LOG_KEEP_MS); // the header needs recent turns only
       });
     },
@@ -347,17 +345,17 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // is null) and the newest `limit` that do not, oldest first, plus how many such messages there are in all, and the
     // newest message id after `afterId` of any author. Only these can survive a header of at most `limit` lines, so the
     // read stays bounded however long the unread log is.
-    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number }) {
+    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit, channelId = "" }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number; channelId?: string }) {
       const after = afterId === null ? "1" : "(length(id) > length(?1) OR (length(id) = length(?1) AND id > ?1))";
-      const base = `${after} AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))`;
-      const mention = "(instr(content, '<@' || ?4 || '>') > 0 OR instr(content, '<@!' || ?4 || '>') > 0)";
-      const params = [afterId ?? "", selfId, JSON.stringify(excludeIds), addressedId ?? ""] as SQLInputValue[];
+      const base = `${after} AND channel_id = ?4 AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))`;
+      const mention = "(instr(content, '<@' || ?5 || '>') > 0 OR instr(content, '<@!' || ?5 || '>') > 0)";
+      const params = [afterId ?? "", selfId, JSON.stringify(excludeIds), channelId, addressedId ?? ""] as SQLInputValue[];
       type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
-      const newest = (cond: string) => all<Row>(`SELECT * FROM channel_message WHERE ${base} AND ${cond} ORDER BY length(id) DESC, id DESC LIMIT ?5`, ...params, limit).reverse();
+      const newest = (cond: string) => all<Row>(`SELECT * FROM channel_message WHERE ${base} AND ${cond} ORDER BY length(id) DESC, id DESC LIMIT ?6`, ...params, limit).reverse();
       const addressed = addressedId === null ? [] : newest(mention);
       const unaddressed = newest(addressedId === null ? "1" : `NOT ${mention}`);
-      const total = (one<{ n: number }>(`SELECT count(*) AS n FROM channel_message WHERE ${base}`, ...params.slice(0, 3)) as { n: number }).n; // ?1..?3 only
-      const last = one<{ id: string }>(`SELECT id FROM channel_message WHERE ${after} ORDER BY length(id) DESC, id DESC LIMIT 1`, ...(afterId === null ? [] : [afterId]));
+      const total = (one<{ n: number }>(`SELECT count(*) AS n FROM channel_message WHERE ${base}`, ...params.slice(0, 4)) as { n: number }).n; // ?1..?4 only
+      const last = one<{ id: string }>(`SELECT id FROM channel_message WHERE ${after} AND channel_id = ?4 ORDER BY length(id) DESC, id DESC LIMIT 1`, afterId ?? "", null, null, channelId);
       return { addressed, unaddressed, total, newestId: last?.id ?? null };
     },
 
@@ -562,7 +560,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         exchange_cap = excluded.exchange_cap, updated_at = excluded.updated_at`).run(conversationKey, c.channelId, c.botUserId, JSON.stringify(c.crew), c.exchangeCap, now());
     },
     // A message of the channel log (allowlisted people, allowed crew bots, this bot): tool targets must be one.
-    channelMessage: (id: string): { id: string; author_id: string; author_kind: string; content: string } | undefined => one("SELECT id, author_id, author_kind, content FROM channel_message WHERE id = ?", id),
+    channelMessage: (id: string): { id: string; author_id: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).
     relayOf: (conversationKey: string, runId: string): RelayRow | undefined => one<RelayRow>("SELECT * FROM relay WHERE conversation_key = ? AND run_id = ?", conversationKey, runId),

@@ -142,6 +142,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     // state and row together; a redelivery of the same message finds both (or completes whichever is missing)
     const r = buffer.atomically(() => {
       if (!cur) saveReset({ id: cmd.id, source: cmd.source, stage: "drain" });
+      // a command is a person's word like a message: it resets the exchange cap, also for the Discord tool's budget
+      if (cmd.source === "interaction") buffer.recordResetBoundary(cmd.id, channelId);
       return buffer.accept({ source: cmd.source, sourceMessageId: cmd.id, conversationKey, author: cmd.author, text: NEW_WRAPUP_TEXT, receivedAt: cmd.receivedAt, channelId });
     });
     log.emit("bridge.new_command", { bot: name, sourceMessageId: cmd.id, source: cmd.source, inserted: r.inserted });

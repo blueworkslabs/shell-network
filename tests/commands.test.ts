@@ -8,7 +8,9 @@ import { conversationKeyFor } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID, STRANGER_ID } from "./fakes.ts";
 import { type Buffer } from "../lib/buffer.ts";
-import { openTempBuffer, tempDir } from "./tmp.ts";
+import { openToolDb } from "../lib/tooldb.ts";
+import { makeTools } from "../lib/tools.ts";
+import { openTempBuffer, tempDir, track } from "./tmp.ts";
 
 // ---- reconcile ----
 // what Discord returns for one of our commands: ours plus the fields it adds
@@ -96,10 +98,10 @@ test("RECONCILE failure: the rest is still done, the error surfaces, no hash is 
 });
 
 // ---- interactions ----
-const CH = "100000000000000001", OTHER_CH = "100000000000000002", BOT = "333333333333333333";
+const CH = "100000000000000001", OTHER_CH = "100000000000000002", BOT = "333333333333333333", HERMES = "444444444444444444";
 const KEY = conversationKeyFor("gem", CH);
 type IxOpts = { channel?: string; user?: string; type?: number };
-function world() {
+function world({ cap = 12 }: { cap?: number } = {}) {
   const path = join(tempDir("slash-"), "buffer.db");
   let clock = 1_792_500_000_000;
   const now = () => clock;
@@ -125,12 +127,13 @@ function world() {
       w.buffer = openTempBuffer(path, { now });
       t3.crash.buffer = w.buffer;
       w.bot = makeBot({ name: "Gem", conversationKey: KEY, channelId: CH, channelName: "shell-network", botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem",
-        modelSelection: { instanceId: "crewGemClaude", model: "m" }, buffer: w.buffer, t3, discord, log, now, session: () => "s1", exchangeCap: 12 });
+        modelSelection: { instanceId: "crewGemClaude", model: "m" }, buffer: w.buffer, t3, discord, log, now, session: () => "s1", exchangeCap: cap, allowedBots: [{ id: HERMES, name: "Hermes" }] });
       w.dispatch = interactionDispatch({ port, bots: new Map([[CH, w.bot]]), allowedAuthors: [HUMAN_ID], nudge: () => { nudges++; }, log, now });
       return w;
     },
     restart() { try { w.buffer.close(); } catch {} return w.start(); },
     thread: () => w.buffer.kvGet(`${KEY}:threadId`) as string,
+    tools: () => makeTools(track(openToolDb(path)), "gem", { now }),
     steps: async (k = 3) => { for (let i = 0; i < k; i++) { await w.bot.step(); clock += 1000; } },
     interaction: (name: string, { channel = CH, user = HUMAN_ID, type = 2 }: IxOpts = {}) => {
       const id = snow();
@@ -295,4 +298,26 @@ test("INTERACTION tokens never reach the log or the database, not even through a
     ...w.buffer.db.prepare("SELECT text FROM batch").all(), ...w.buffer.db.prepare("SELECT content FROM outbox").all()]);
   for (const t of [i.token, j.token, k.token]) { const at = dump.indexOf(t); assert.ok(at < 0, `a token is stored or logged: ...${dump.slice(Math.max(0, at - 120), at + 60)}`); }
   assert.ok(w.log.events.some((e) => e.event === "bridge.interaction_error" && String(e.error).includes("[token]")), "control: the errors were logged, redacted");
+});
+
+test("INTERACTION /new resets the Discord tool's budget too: /status and discord_send agree, also after a restart", async () => {
+  const w = world({ cap: 2 });
+  await w.bot.accept(w.discord.userSays("start"));
+  await w.steps(1);
+  const send = (key: string) => w.tools().send({ channel: CH, content: `<@${HERMES}> ${key}`, idempotency_key: key });
+  send("one");
+  send("two");
+  assert.throws(() => send("blocked"), /exchange cap reached/);
+  await w.steps(2);
+  for (const m of w.discord.botPosts()) await w.bot.accept(m); // the posts come back through the gateway, into the channel log
+  assert.throws(() => send("still-blocked"), /exchange cap reached/);
+  await w.steps(1);
+  await w.run("new");
+  await w.run("status");
+  assert.match(w.calls.at(-1)!, /0 of 2$/, "the receiving side counts from the command");
+  send("after-one");
+  send("after-two");
+  assert.throws(() => send("blocked-again"), /exchange cap reached/, "the budget is the same size again, from the command on");
+  w.restart();
+  assert.throws(() => send("blocked-after-restart"), /exchange cap reached/);
 });

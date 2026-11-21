@@ -97,7 +97,8 @@ cap). Discord shows one entry per bot, so choosing the entry chooses the bot. Th
   the result. An expired interaction (10062) is swallowed; an error edits the placeholder into a short failure line.
 - **`/new` by interaction** is the same state machine with the interaction id as the command id and source
   `interaction`: an interaction id is not a message, so no reaction or reply reference points at it. The confirmation
-  still goes through the outbox, as a plain message.
+  still goes through the outbox, as a plain message. The command also records a reset boundary (`human_message`) like a person's message, so the cap
+  resets on both sides: the receiving count and the Discord tool's budget agree.
 - An expired interaction (10062) and one delivered twice (Discord answers the second defer with 40060) are logged and
   dropped: the reset is durable (kv and the buffer) and its channel confirmation goes through the outbox, so neither an
   expired token nor a restart loses or repeats it. Interaction tokens are never stored or logged, errors included

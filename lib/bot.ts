@@ -49,6 +49,8 @@ export interface BotOptions {
 const PART = 1900;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
+// A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
+export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(^|\s)NO_REPLY\s*$/, "");
 const splitReply = (text: unknown): string[] => {
   const t = String(text ?? "").trim() || "(finished without a text reply)";
   const parts: string[] = [];
@@ -448,7 +450,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       log.emit("bridge.reply_none", { bot: name, batchId: b.id });
       return true;
     }
-    const parts = splitReply(last?.text);
+    const parts = splitReply(withoutNoReply(last?.text));
     const first = buffer.inboundOf(b.id)[0];
     if (!first) throw new Error(`batch ${b.id} has no inbound rows`);
     const done = new Set(buffer.postedParts(b.id).map((p) => p.part));
@@ -583,10 +585,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const last = (read.items ?? []).filter((i) => i.runId === c.runId && i.type === "assistant_message").at(-1);
     if (last && (last.textTruncated !== false || (last.nextTextOffset ?? null) !== null)) { log.emit("bridge.relay_incomplete", { bot: name, ordinal: c.ordinal }); return false; }
     const row = buffer.relayOf(conversationKey, c.runId) ?? buffer.addRelay({ conversationKey, threadId, runId: c.runId, ordinal: c.ordinal, origin: c.origin });
-    const text = String(last?.text ?? "").trim();
-    if ((!text || isNoReply(text)) && !buffer.outboxEntry(conversationKey, `relay:${row.id}:0`)) {
+    const text = withoutNoReply(last?.text).trim();
+    if (!text && !buffer.outboxEntry(conversationKey, `relay:${row.id}:0`)) {
       buffer.markRelayEmpty(row.id);
-      log.emit("bridge.relay_empty", { bot: name, relayId: row.id, ordinal: c.ordinal, ...(text ? { noReply: true } : {}) });
+      log.emit("bridge.relay_empty", { bot: name, relayId: row.id, ordinal: c.ordinal, ...(isNoReply(last?.text) ? { noReply: true } : {}) });
       return true;
     }
     const parts = splitReply(text);

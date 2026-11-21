@@ -72,7 +72,7 @@ the tool's sends, reactions and threads.
   POST. Replies are split into parts of at most 1900 characters.
 - The default for mentions is none. Allowed bots can be pinged by name (`allowed_mentions.users`), and replied users
   are never pinged.
-- A final text of exactly `NO_REPLY` posts nothing. The agent may already have answered through the tool.
+- A final text of exactly `NO_REPLY` posts nothing. The agent may already have answered through the tool. A final that ends with `NO_REPLY` after real text posts the text without the sentinel.
 - Invariant: the bot token has exactly one writer, this bridge. `lib/lock.ts` enforces this with an exclusive fcntl
   lock (a SQLite lock DB in the state directory, `locking_mode=EXCLUSIVE`, an open `BEGIN EXCLUSIVE`). The lock is
   taken before any secret is read. A second bridge exits with status 4, and a lost lock makes the bridge exit 4

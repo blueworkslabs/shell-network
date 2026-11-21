@@ -135,6 +135,27 @@ test("NO_REPLY: a batch whose final text is exactly NO_REPLY posts nothing and d
   assert.equal(w.discord.botPosts().at(-1)!.content, "NO_REPLY, but here is more", "control: only an exact NO_REPLY is dropped");
 });
 
+test("NO_REPLY after text: a reply that ends with the sentinel posts the text without it, also when the sentinel lands in a second part (a capped send, then the answer in the final)", async () => {
+  const w = world();
+  const run = () => w.t3.threads.get(w.thread())!.runs.at(-1)!.runId;
+  await w.bot.accept(w.discord.userSays("hand it over"));
+  await w.steps(1);
+  // 1898 characters of answer + the sentinel: the sentinel is exactly what spills into part 2 (PART = 1900)
+  const answer = "a".repeat(1898);
+  w.t3.complete(w.thread(), run(), `${answer}\n\nNO_REPLY`);
+  await w.steps(2);
+  assert.deepEqual(w.discord.botPosts().map((p) => p.content), [answer], "one post, no sentinel");
+  await w.bot.accept(w.discord.userSays("again, short"));
+  await w.steps(1);
+  w.t3.complete(w.thread(), run(), "done.\n\nNO_REPLY");
+  await w.steps(2);
+  assert.equal(w.discord.botPosts().at(-1)!.content, "done.");
+  w.t3.complete(w.thread(), w.t3.wake(w.thread()).runId, "relayed.\nNO_REPLY");
+  await w.steps(2);
+  assert.equal(w.discord.botPosts().at(-1)!.content, "relayed.", "relay too");
+  assert.equal(w.discord.botPosts().length, 3);
+});
+
 for (const point of ["before", "after"] as const) {
   test(`TOOL THREAD EXACTLY ONCE: killed ${point} the create, the thread exists once after the restart (looked up before any new create); a send into it goes to the thread`, async () => {
     const w = world();

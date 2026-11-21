@@ -31,8 +31,8 @@ an older t3 binary must not be pointed at a database migrated by a newer release
   entry). `/new` makes the bot write its daily note, archive its t3 thread in that channel and start a fresh one; the
   old thread stays readable in t3. `/status` shows what the bot is doing. `@Bot /new` as text still works. See
   ARCHITECTURE.md.
-- **Bot-to-bot with a cap.** Bots may hand work to each other by mention. After `BRIDGE_EXCHANGE_CAP` bot messages
-  without a person in between, the bridge stops and posts one "waiting for the user" notice.
+- **Bot-to-bot with a cap.** Bots may hand work to each other by mention. After `BRIDGE_EXCHANGE_CAP` exchanges
+  between bridge-run bots, the bridge posts one pause notice. A message from a person or talk-only member resets the cap.
 - **Completion relay.** Runs that no batch started (background wakes, scheduled tasks) also reach the channel.
 - **Watchdog.** A separate process holds t3's `operate` grant. It resumes held queues (see [LESSONS.md](LESSONS.md)).
 - **Discord tool for the agent.** `bin/discord-tool.ts` is a stdio MCP server the provider spawns. It offers

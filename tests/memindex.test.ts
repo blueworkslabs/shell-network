@@ -253,3 +253,23 @@ test("LONG LINES and private answers: a 12,000-word line becomes chunks of at mo
     fetchImpl: (async () => new Response("{ private transcript excerpt", { status: 200 })) as unknown as typeof fetch });
   await assert.rejects(e.embed(["a"]), (err: Error) => err.message === "embeddings: invalid JSON in the answer");
 });
+
+test("ONE TOKEN: a hash, id or path query puts its text hits ahead of meaning-only hits; a query with spaces is fused as before", async () => {
+  // an embedder that puts every text close to the query: meaning alone would rank anything
+  // meaning alone puts every note next to the query and the release note far from it
+  const near: Embedder = { model: "near", async embed(texts) { return texts.map((t) => Float32Array.from(t.startsWith("# Release") ? [0, 1] : [1, 0])); } };
+  const dir = tempDir("memidx-tok-");
+  const notes = join(dir, "notes");
+  mkdirSync(notes);
+  for (let i = 0; i < 6; i++) writeFileSync(join(notes, `n${i}.md`), `# N${i}\nunrelated pricing note ${i}\n`);
+  writeFileSync(join(notes, "release.md"), "# Release\nshipped as a1b2c3d\n");
+  const index = openMemIndex({ root: notes, indexPath: join(dir, "index.db"), embedder: near, minSimilarity: 0.5 });
+  index.syncText({ force: true });
+  await index.embedPending();
+  const r = (await index.tool.call({ query: "a1b2c3d", max_results: 3 })).structuredContent as MemResult;
+  assert.equal(r.matches[0].file, "release.md", JSON.stringify(r.matches));
+  assert.equal(r.matches[0].match, "text");
+  assert.ok(r.matches.slice(1).every((m) => m.match === "semantic"), "meaning-only hits follow");
+  const fused = (await index.tool.call({ query: "a1b2c3d shipped", max_results: 3 })).structuredContent as MemResult;
+  assert.ok(fused.matches.some((m) => m.file === "release.md"), "control: with spaces the fusion still finds it");
+});

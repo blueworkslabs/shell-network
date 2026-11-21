@@ -55,3 +55,34 @@ export function stepAll(bots: { step(): Promise<{ phase: string }> }[], log: Log
     return { phase: idle ? "idle" : "open" };
   };
 }
+
+// Direct messages (BRIDGE_DM_USERS): only allowlisted people, each DM its own conversation. Refuses ids outside the
+// people allowlist, so a DM never admits anyone the channels would not.
+export function dmUsers(value: string | undefined, allowedAuthors: string[]): string[] {
+  const ids = (value ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  if (ids.some((id) => !/^\d{1,25}$/.test(id))) throw new Error("BRIDGE_DM_USERS: comma-separated Discord user ids");
+  const outside = ids.filter((id) => !allowedAuthors.includes(id));
+  if (outside.length) throw new Error("BRIDGE_DM_USERS: every id must also be in BRIDGE_ALLOWED_AUTHORS");
+  return [...new Set(ids)];
+}
+// The DM channel per user, from Discord (POST /users/@me/channels answers with the same channel every time). A user whose
+// DM cannot be opened is logged and left out; the guild channels go on without it.
+export async function openDms({ discord, users, log }: { discord: Pick<DiscordRest, "openDm">; users: string[]; log: Log }): Promise<{ userId: string; channelId: string }[]> {
+  const out: { userId: string; channelId: string }[] = [];
+  for (const userId of users) {
+    try {
+      const ch = await discord.openDm(userId);
+      if (typeof ch?.id !== "string" || !/^\d{1,25}$/.test(ch.id) || (ch.type !== undefined && ch.type !== 1)) throw new Error("not a DM channel");
+      out.push({ userId, channelId: ch.id });
+    } catch (e) { log.emit("bridge.dm_open_failed", { error: errText(e) }); }
+  }
+  return out;
+}
+// A DM that no conversation owns (someone else writing to the bot) is dropped like any other channel's message; this
+// logs it, without its text.
+export function dmIgnoredDispatch({ known, log }: { known: Set<string>; log: Log }): (type: string, d: any) => void {
+  return (type, d) => {
+    if (type !== "MESSAGE_CREATE" || d?.guild_id || typeof d?.channel_id !== "string" || known.has(d.channel_id) || d?.author?.bot) return;
+    log.emit("bridge.dm_ignored", { channelId: d.channel_id, authorId: typeof d?.author?.id === "string" ? d.author.id : null });
+  };
+}

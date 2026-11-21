@@ -15,6 +15,8 @@
 //   BRIDGE_ALLOWED_AUTHORS   comma-separated Discord user ids whose mentions are accepted (the user only);
 //                            everyone else is dropped before the buffer
 //   BRIDGE_EXCHANGE_CAP      optional, bot-to-bot messages without a human message between (default 2, 0 = off)
+//   BRIDGE_DM_USERS          optional, comma-separated user ids (each also in BRIDGE_ALLOWED_AUTHORS) whose DMs this bot
+//                            serves, each DM as its own conversation; other people's DMs are ignored and logged
 // Secret files must be the bridge user's own, without group/other bits, in such a directory (lib/preflight.ts).
 // Writer lock: `<directory of BRIDGE_DB>/<bot>.lock.db`, held for the life of the process (lib/lock.ts); a second
 // bridge for the same bot exits with status 4 ("lease held"). Ops starts the successor once the holder has exited.
@@ -29,7 +31,7 @@ import { sweepStaging } from "../lib/attachments.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import type { LogFields } from "../lib/types.ts";
-import { startBridge, gatewayDispatch, managedRole, stepAll } from "../lib/startup.ts";
+import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch } from "../lib/startup.ts";
 import { stepLoop } from "../lib/steploop.ts";
 import { bridgeConfig, conversationKeyFor } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
@@ -92,13 +94,20 @@ const KEEP = new Set(["t3_thread_send", "t3_thread_launch"]);
 const mcpLog = { emit: (e: string, d: LogFields = {}) => log.emit(e, e === "call.end" && !KEEP.has(d.tool as string) ? { ...d, result: `[${JSON.stringify(d.result ?? null).length} bytes]` } : d) };
 const mcp = new McpClient({ log: mcpLog, token: loadToken(), clientName: "t3-crew-bridge" });
 await mcp.connect();
-const keys = channelIds.map((ch) => conversationKeyFor(cfg.key, ch));
-// writes: the bot's channels, and threads its tool created there
-const discord = discordRest({ token, allowedChannels: channelIds, alsoAllowed: (id) => keys.some((k) => buffer.isToolThread(k, id)), log });
+const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
+let dmUserIds: string[];
+try { dmUserIds = dmUsers(process.env.BRIDGE_DM_USERS, allowedAuthors); } catch (e) { console.error((e as Error).message); process.exit(2); }
+// writes: the bot's channels, its DM channels (opened below), and threads its tool created in a channel
+const dmChannels = new Set<string>();
+const keys: string[] = channelIds.map((ch) => conversationKeyFor(cfg.key, ch));
+const discord = discordRest({ token, allowedChannels: channelIds, alsoAllowed: (id) => dmChannels.has(id) || keys.some((k) => buffer.isToolThread(k, id)), log });
 const me = await discord.me();
 if (me.id !== cfg.id) { console.error("BRIDGE_CREW_FILE: own bot id does not match Discord token"); process.exit(2); }
+// Every conversation: the guild channels, then one per DM (the user's DM channel, from Discord).
+const dms = await openDms({ discord, users: dmUserIds, log });
+for (const d of dms) { dmChannels.add(d.channelId); keys.push(conversationKeyFor(cfg.key, d.channelId)); }
+const conversations = [...channelIds, ...dms.map((d) => d.channelId)];
 const modelSelection = { instanceId: cfg.instanceId, model: cfg.model };
-const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
 // live gateway session token; set below once the gateway exists (null until then: no dispatch)
 const session = () => (gateway?.state.connected ? gateway.state.gen : null);
 // Files of tool posts are staged here by the Discord tool and uploaded by this bridge (lib/attachments.ts); copies nobody
@@ -107,31 +116,33 @@ const attachmentsDir = join(dirname(dbPath), "attachments");
 const swept = sweepStaging({ stagingDir: attachmentsDir, inUse: (id) => buffer.stagedInUse(id) });
 if (swept) log.emit("bridge.staging_swept", { removed: swept });
 const bots: ReturnType<typeof makeBot>[] = [];
-for (const [i, channelId] of channelIds.entries()) {
+for (const [i, channelId] of conversations.entries()) {
   const conversationKey = keys[i];
-  const botRoleId = await managedRole({ discord, channelId, botUserId: cfg.id, log });
-  const channelName = await discord.getChannel(channelId).then((c) => c.name ?? channelId, () => channelId);
+  const dm = dmChannels.has(channelId);
+  const botRoleId = dm ? null : await managedRole({ discord, channelId, botUserId: cfg.id, log });
+  const channelName = dm ? "dm" : await discord.getChannel(channelId).then((c) => c.name ?? channelId, () => channelId);
   // MCP allowlist: this project, this instance, this conversation's one thread (kv, set once launched/adopted)
   const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`) };
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, dm,
     buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
 }
-log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, channelIds, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap });
+log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap });
 
 // Single-flight step loop (lib/steploop.ts); a gateway message or a t3 change wakes it early, also mid-step (latched).
-const loop = stepLoop({ step: stepAll(bots, log, channelIds), tickMs, log });
+const loop = stepLoop({ step: stepAll(bots, log, conversations), tickMs, log });
 const nudge = loop.nudge;
 
 // Slash commands (`/new`, `/status`): answered per interaction, by the bot of the interaction's channel (lib/commands.ts).
-const interact = interactionDispatch({ port: discord.interactions, bots: new Map(bots.map((b, i) => [channelIds[i], b])), allowedAuthors, nudge, log });
+const interact = interactionDispatch({ port: discord.interactions, bots: new Map(bots.map((b, i) => [conversations[i], b])), allowedAuthors, nudge, log });
+const dmIgnored = dmIgnoredDispatch({ known: new Set(conversations), log });
 // Catch-up runs inside the step loop (single flight); every new live session (READY/RESUMED) closes the dispatch
 // gate until a catch-up has completed within it.
 var gateway: DiscordGateway = discordGateway({
   token, log,
-  onDispatch: ((ds) => (type: string, d: unknown) => { for (const f of ds) void f(type, d); void interact(type, d); })(bots.map((bot, i) => gatewayDispatch({ bot, channelId: channelIds[i], nudge, log }))),
+  onDispatch: ((ds) => (type: string, d: unknown) => { for (const f of ds) void f(type, d); void interact(type, d); dmIgnored(type, d); })(bots.map((bot, i) => gatewayDispatch({ bot, channelId: conversations[i], nudge, log }))),
   onFatal: (code) => { log.emit("bridge.fatal", { code }); shutdown(3); },
 });
 // t3 thread changes wake the loop early (relayed completions of runs no batch started); the idle tick stays

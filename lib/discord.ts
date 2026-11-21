@@ -6,7 +6,8 @@
 //     every close) for the bridge's catch-up gate;
 //   - fatal close codes (and a rejected token at connect) stop the gateway and call onFatal; everything else is the
 //     library's reconnect/resume (heartbeat, zombie detection, invalid session).
-// Intents: GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT (privileged; must be enabled for the bot in the developer portal).
+// Intents: GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT (privileged; must be enabled for the bot in the developer portal) |
+// DIRECT_MESSAGES (not privileged: the user's DMs, when BRIDGE_DM_USERS is set).
 import { API, GatewayIntentBits, type RESTPostAPIChannelMessageJSONBody } from "@discordjs/core";
 import { REST, type RESTOptions } from "@discordjs/rest";
 import { WebSocketManager, WebSocketShardEvents } from "@discordjs/ws";
@@ -14,7 +15,7 @@ import { errText } from "./log.ts";
 import type { CommandBody, CommandsPort, ExistingCommand, InteractionPort } from "./commands.ts";
 import type { CreateMessagePayload, DiscordMessage, DiscordPort, Log } from "./types.ts";
 
-export const INTENTS = GatewayIntentBits.Guilds | GatewayIntentBits.GuildMessages | GatewayIntentBits.MessageContent;
+export const INTENTS = GatewayIntentBits.Guilds | GatewayIntentBits.GuildMessages | GatewayIntentBits.MessageContent | GatewayIntentBits.DirectMessages;
 // Close codes after which reconnecting cannot help (bad token, bad intents, ...).
 const FATAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 
@@ -26,6 +27,7 @@ export interface DiscordRole { id: string; tags?: { bot_id?: string } }
 export interface DiscordRest extends DiscordPort, CommandsPort {
   guildRoles(guildId: string): Promise<DiscordRole[]>;
   me(): Promise<{ id: string; [k: string]: unknown }>;
+  openDm(userId: string): Promise<{ id: string; type?: number }>; // the bot's DM channel with a user (the same one every time)
   interactions: InteractionPort;
 }
 const EPHEMERAL = 64;
@@ -74,6 +76,7 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
     }),
     guildRoles: (guildId: string) => api.guilds.getRoles(guildId),
     me: () => api.users.getCurrent() as unknown as Promise<{ id: string; [k: string]: unknown }>,
+    openDm: (userId: string) => { if (!SNOWFLAKE.test(userId)) throw new Error("user id malformed"); return api.users.createDM(userId) as unknown as Promise<{ id: string; type?: number }>; },
     // nonce + enforce_nonce: Discord returns the already-created message for a repeated nonce (dedupe window of a
     // few minutes), so a post repeated after a crash does not appear twice within that window.
     createMessage: (channelId: string, payload: CreateMessagePayload): Promise<DiscordMessage> => {

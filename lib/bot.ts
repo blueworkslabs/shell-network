@@ -49,6 +49,8 @@ export interface BotOptions {
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
   allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
+  // the bot's DM with the user: every message of an allowlisted person is addressed to the bot (no mention needed)
+  dm?: boolean;
   // where the Discord tool stages the files of a tool post for this bridge to upload (lib/attachments.ts); none = tool posts with files are dropped
   attachmentsDir?: string;
 }
@@ -71,7 +73,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, dm = false }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -235,7 +237,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!fromBot && msg.id && isNewCommand(msg)) return acceptNew(msg as DiscordMessage & { id: string });
     // A crew bot's mention counts from its text too: whether Discord fills `mentions` for a bot-authored post is not
     // something the bridge relies on.
-    const mentioned = Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
+    const mentioned = (dm && !fromBot) || Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
     if (!mentioned) return { accepted: false, reason: "no mention" };
     // A person or talk-only member can resume with a bare mention; bridge-run bots cannot.
     const withoutUser = String(msg.content ?? "").replace(mentionRe(), "");

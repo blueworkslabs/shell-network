@@ -74,6 +74,25 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
   };
 }
 
+// Operator archive export is limited to the manifest's current thread, including text continuation.
+export function archiveReadRules(threadId: string): Rules {
+  return {
+    t3_thread_read: {
+      args: {
+        threadId: (v) => isStr(v) && v === threadId,
+        view: (v) => v === "messages",
+        limit: isInt(1, 100),
+        runLimit: isInt(1, 50),
+        maxCharsPerItem: isInt(1, 20_000),
+        afterPosition: isInt(-1, Number.MAX_SAFE_INTEGER),
+        itemId: isStr,
+        textOffset: isInt(1, Number.MAX_SAFE_INTEGER),
+      },
+      required: ["threadId", "view", "limit", "runLimit", "maxCharsPerItem"],
+    },
+  };
+}
+
 export function checkCall(rules: Rules, name: string, args: unknown): void {
   const rule = Object.hasOwn(rules, name) ? rules[name] : null;
   if (!rule) throw new ToolDenied(name, "tool not allowed");

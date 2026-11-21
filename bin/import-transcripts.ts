@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { archiveReadRules, checkCall } from "../lib/allowlist.ts";
 import { preflight } from "../lib/preflight.ts";
 import { readArchiveManifest, readArchivedTranscript, type ArchivedTranscript } from "../lib/t3-transcript.ts";
 import { McpClient, TOKEN_PATH } from "../lib/vendor/mcp.mjs";
@@ -24,7 +25,11 @@ try {
         const client = new McpClient({ log: { emit() {} }, clientName: "shell-network-archive-reader" });
         await client.connect();
         for (const [index, ref] of refs.entries()) {
-          const archive = await readArchivedTranscript(ref, (args) => client.call("t3_thread_read", args));
+          const rules = archiveReadRules(ref.threadId);
+          const archive = await readArchivedTranscript(ref, async (args) => {
+            checkCall(rules, "t3_thread_read", args);
+            return client.call("t3_thread_read", args);
+          });
           t3Archives.push(archive);
           const messages = archive.events.filter((event) => event.type === "message").length;
           console.error(`Archived t3 thread ${index + 1}/${refs.length}: ${messages} messages kept`);
@@ -32,6 +37,8 @@ try {
       } catch {
         throw new Error("Archived t3 read failed. Verify manifest IDs, project, archived state and read access.");
       }
+      const empty = t3Archives.findIndex((archive) => !archive.events.some((event) => event.type === "message"));
+      if (empty !== -1) throw new Error(`Archived t3 thread ${empty + 1}/${refs.length} kept no messages. No archive files written.`);
     }
     const result = importTranscripts({ database: values.database, jsonlDirectories: values["jsonl-dir"], output: values.output, t3Archives,
       onSkip: (name) => console.error(`Skipping legacy file ${JSON.stringify(name)}`) });

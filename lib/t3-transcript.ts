@@ -71,7 +71,7 @@ export async function readArchivedTranscript(ref: ArchiveRef, read: ReadArchive)
         }
         text += part.text;
       }
-      events.push({ type: "message", id: itemId, timestamp: str(item.updatedAt), message: { role, content: text } });
+      events.push({ type: "message", id: itemId, timestamp: str(item.createdAt) || str(item.updatedAt), message: { role, content: text } });
     }
     if (!page.hasMore) break;
     afterPosition = cursor(page.nextPosition, afterPosition);

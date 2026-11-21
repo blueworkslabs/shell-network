@@ -188,10 +188,13 @@ spot-check five sessions before enabling archive search.
 To include archived t3 conversations, supply `--t3-manifest /private/threads.json`. The file is a JSON array of
 objects with `threadId` and `projectId`. Build it from the bridge archive ledger or a verified operator inventory.
 Include only the agent's own archived top-level conversations. The exporter reads pages and text continuations
-using `t3_thread_read` under the existing t3 MCP configuration (`T1_TOKEN`, `T1_MCP_URL`). It does not use thread
-search or list for discovery. It verifies the archived state, project and thread type, and writes only local user
-and assistant messages. Keep the manifest private. Each t3 thread uses a namespaced session ID, so reruns keep
-the same archive file without colliding with OpenClaw sessions. A failed t3 read stops before writing any files.
+using `t3_thread_read`. Set `T1_TOKEN` explicitly to the operator's private t3 MCP token file with read access to
+the manifest threads. `T1_MCP_URL` selects the server and defaults to the local MCP endpoint. The CLI uses the MCP
+client directly, outside the running bridge's allowlist. Its only tool call is `t3_thread_read`.
+It verifies the archived state, project and thread type and keeps local user and assistant messages. Standard error
+reports the number of messages kept for each manifest entry, including zero, without printing IDs or contents.
+Keep the manifest private. Each t3 thread uses a namespaced session ID so reruns keep the same archive file without
+colliding with OpenClaw sessions. A failed t3 read stops before writing any files.
 
 ## Tests
 

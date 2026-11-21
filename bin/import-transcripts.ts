@@ -17,12 +17,18 @@ try {
     const t3Archives: ArchivedTranscript[] = [];
     if (values["t3-manifest"]) {
       const refs = readArchiveManifest(values["t3-manifest"]);
+      if (!process.env.T1_TOKEN) throw new Error("Set T1_TOKEN to the operator MCP token file for archived reads.");
       preflight({ secretFiles: [TOKEN_PATH] });
       // Tool requests and responses may contain private identifiers and text.
       try {
         const client = new McpClient({ log: { emit() {} }, clientName: "shell-network-archive-reader" });
         await client.connect();
-        for (const ref of refs) t3Archives.push(await readArchivedTranscript(ref, (args) => client.call("t3_thread_read", args)));
+        for (const [index, ref] of refs.entries()) {
+          const archive = await readArchivedTranscript(ref, (args) => client.call("t3_thread_read", args));
+          t3Archives.push(archive);
+          const messages = archive.events.filter((event) => event.type === "message").length;
+          console.error(`Archived t3 thread ${index + 1}/${refs.length}: ${messages} messages kept`);
+        }
       } catch {
         throw new Error("Archived t3 read failed. Verify manifest IDs, project, archived state and read access.");
       }

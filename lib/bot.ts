@@ -865,7 +865,5 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { phase: "sent", batchId: b.id };
   }
 
-  // tests: wait for a running export
-  const exportIdle = async () => { await exportState.running; };
-  return { accept, backfill, initWatermark, step, ensureThread, requestNew, status, exportIdle, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
+  return { accept, backfill, initWatermark, step, ensureThread, requestNew, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
 }

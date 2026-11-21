@@ -15,6 +15,15 @@ import { openTempBuffer, tempDir } from "./tmp.ts";
 const CH = "shell-network", BOT = "333333333333333333";
 const KEY = conversationKeyFor("gem", CH);
 
+// Waits until the export started by a step has logged its outcome, or until nothing more happens (no export ran). The fakes
+// answer from memory, so a few event-loop turns are enough; the bound keeps a broken test from hanging.
+async function exportSettled(log: { events: { event: string }[] }): Promise<void> {
+  const outcomes = () => log.events.filter((e) => e.event === "bridge.session_exported" || e.event === "bridge.session_export_failed").length;
+  const before = outcomes();
+  for (let i = 0; i < 50 && outcomes() === before; i++) await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r)); // the export's own finally (single-flight reset) runs after its last log line
+}
+
 function world({ notes = true }: { notes?: boolean } = {}) {
   const dir = tempDir("export-");
   const path = join(dir, "buffer.db"), notesRoot = join(dir, "notes");
@@ -36,7 +45,8 @@ function world({ notes = true }: { notes?: boolean } = {}) {
     },
     restart() { try { w.buffer.close(); } catch {} w.start(); w.bot.initWatermark(clock - 60_000); return w; },
     thread: () => w.buffer.kvGet(`${KEY}:threadId`) as string,
-    steps: async (n = 3) => { for (let i = 0; i < n; i++) { await w.bot.step(); await w.bot.exportIdle(); clock += 1000; } },
+    // the export runs beside the step loop: after each step, let it finish (or fail) before the next, as seen in its log
+    steps: async (n = 3) => { for (let i = 0; i < n; i++) { await w.bot.step(); await exportSettled(log); clock += 1000; } },
     tick: (ms: number) => { clock += ms; },
     finish: (t: string, text: string) => t3.complete(t, t3.threads.get(t)!.runs.at(-1)!.runId, text),
     files: () => (existsSync(join(notesRoot, "sessions")) ? readdirSync(join(notesRoot, "sessions")).filter((f) => f.endsWith(".md")) : []),

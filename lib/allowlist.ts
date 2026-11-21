@@ -7,7 +7,8 @@
 //   - launch: only in the configured project, on the configured provider instance, and only while no thread is bound;
 //   - list: only the configured project;
 //   - read / queue_list / send: only the bound thread (the bot's one thread); send only with mode "queue" and a
-//     clientRequestId.
+//     clientRequestId;
+//   - organize: only action "archive", only on the bound thread (/new; no unarchive, pin, settle or other action).
 // It constrains the bridge's code, not the token: the token's own authority is checked on the t3 host, and the token file
 // must stay out of reach of the provider processes (both outside this module).
 import type { Log } from "./types.ts";
@@ -60,6 +61,10 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
     },
     t3_queue: {
       args: { action: (v) => v === "list", threadId: ownThread, cursor: isInt(0, Number.MAX_SAFE_INTEGER), limit: isInt(1, 100) },
+      required: ["action", "threadId"],
+    },
+    t3_thread_organize: {
+      args: { action: (v) => v === "archive", threadId: ownThread },
       required: ["action", "threadId"],
     },
     t3_thread_send: {

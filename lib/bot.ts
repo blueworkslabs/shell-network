@@ -23,20 +23,24 @@
 import { reconcileBatch, messageIdMatchesRequest, settlement } from "./reconcile.ts";
 import { errText } from "./log.ts";
 import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./stuck.ts";
-import type { Buffer } from "./buffer.ts";
+import type { BatchLimit, Buffer } from "./buffer.ts";
 import type { BatchRow, DiscordMessage, DiscordPort, InboundRow, Log, ModelSelection, OutboxRow, Projection, QueueList, T3Port, ThreadRead, Verdict } from "./types.ts";
 
 // wake: not accepted, but the message left work for the step loop (an exchange-cap notice to post).
 export interface AcceptResult { accepted: boolean; inserted?: boolean; reason?: string; wake?: boolean }
 // What a person's bare mention (no text) stands for in the batch: an explicit bridge note, never invented user text.
 export const BARE_MENTION_TEXT = "[bridge: a mention without text, i.e. go on with the conversation above]";
+// What a `/new` becomes in the old thread: the wrap-up turn before the session is archived.
+export const NEW_WRAPUP_TEXT = "/new: this session is being archived and a fresh one starts after this turn. Write today's daily note for the project of this channel now (what was done, decided and left open), then reply with exactly NO_REPLY.";
+// First batch of a fresh session: nothing carries over except what the agent wrote down.
+export const FRESH_SESSION_TEXT = "[Fresh session: the previous one was archived by /new and you remember nothing of it. Read today's and yesterday's daily notes before you answer; they are your continuity.]";
 // Unread header: per-line cut, marked so the agent can tell the line is incomplete. Messages that mention the bot
 // (e.g. a handoff the exchange cap held back) get Discord's whole message length, so a resumed bot reads them in full.
 export const HEADER_LINE_MAX = 300;
 export const HEADER_ADDRESSED_LINE_MAX = 2000;
 const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars cut]` : s);
 // phase "open" carries the reconcile verdict of the oldest open batch.
-export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
+export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
 type Found = { status: "found"; message: DiscordMessage } | { status: "absent" } | { status: "unknown" };
 export interface BotOptions {
   name: string; conversationKey: string; channelId: string; channelName?: string; threadLabel?: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
@@ -104,6 +108,94 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     }
   }
 
+  // ---- /new: archive this bot's session and start a fresh one ----
+  // An allowlisted person's message that is exactly `/new` (this bot's mention optional, none needed) starts a reset,
+  // kept in kv `reset` = { id (the message), stage, oldThread?, oldTitle?, newTitle? }:
+  //   drain    messages before the /new go to the old thread as usual; later ones wait (buffer, limit)
+  //   wrapup   the /new itself is sent as one batch (NEW_WRAPUP_TEXT: write the daily note)
+  //   archive  once that batch is finished, its reply posted and the thread idle: archive the old thread, then in ONE
+  //            transaction record it (kv `archived`), set the replacement title, mark the session fresh and clear the
+  //            binding; the next ensureThread() launches the new thread by that title (crash-safe like any launch)
+  //   confirm  the fresh thread is bound: one confirmation (outbox `new:<id>`), reset done (kv `resetSeen`)
+  // A `/new` ignored while one is pending is recorded in kv `resetSeen` (the newest `/new` id handled or ignored).
+  // A crash between the t3 call and the transaction repeats the archive call; t3 refuses it, and a thread that reads as archived counts as done.
+  type Reset = { id: string; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string };
+  const maxId = (a: string | null, b: string): string => (a !== null && BigInt(a) > BigInt(b) ? a : b);
+  const resetState = (): Reset | null => { const v = buffer.kvGet(K("reset")); return v ? (JSON.parse(v) as Reset) : null; };
+  const saveReset = (r: Reset) => buffer.kvSet(K("reset"), JSON.stringify(r));
+  function isNewCommand(msg: DiscordMessage): boolean {
+    const noUser = String(msg.content ?? "").replace(mentionRe(), "");
+    return (botRoleId ? noUser.replace(roleRe(), "") : noUser).trim() === "/new";
+  }
+  function acceptNew(msg: DiscordMessage & { id: string }): AcceptResult {
+    const seen = buffer.kvGet(K("resetSeen"));
+    const cur = resetState();
+    if (cur?.id !== msg.id) {
+      if (seen && BigInt(msg.id) <= BigInt(seen)) return { accepted: false, reason: "new already handled" };
+      if (cur) { // ignored while one is pending, and remembered, so a replay after it finished does not start another
+        buffer.kvSet(K("resetSeen"), maxId(seen, msg.id));
+        return { accepted: false, reason: "new pending" };
+      }
+    }
+    // state and row together; a redelivery of the same message finds both (or completes whichever is missing)
+    const r = buffer.atomically(() => {
+      if (!cur) saveReset({ id: msg.id, stage: "drain" });
+      return buffer.accept({ source: "discord", sourceMessageId: msg.id, conversationKey, author: msg.author?.username ?? "user", text: NEW_WRAPUP_TEXT,
+        receivedAt: Date.parse(msg.timestamp as string) || now(), channelId });
+    });
+    log.emit("bridge.new_command", { bot: name, sourceMessageId: msg.id, inserted: r.inserted });
+    return { accepted: true, inserted: r.inserted };
+  }
+  const isBusy = (read: ThreadRead) => Boolean(read.thread?.activeRunId) || (read.recentRuns ?? []).some((r) => !TERMINAL.has(r.status));
+  // Advances the reset as far as it can in this step. Returns the limit for batching, or a result that ends the step.
+  async function resetStep(threadId: string, read: ThreadRead): Promise<{ limit?: BatchLimit; done?: StepResult }> {
+    let rs = resetState();
+    if (!rs) return {};
+    const quiet = () => gateOpen() && !isBusy(read) && !buffer.openBatches(conversationKey).length && !buffer.unpostedDelivered(conversationKey).length && !buffer.outboxHead(conversationKey);
+    if (rs.stage === "drain" && quiet() && !buffer.buffered(conversationKey, { id: rs.id, inclusive: false }).length) {
+      rs = { ...rs, stage: "wrapup" };
+      saveReset(rs);
+    }
+    if (rs.stage === "wrapup" && buffer.batchOfMessage(conversationKey, rs.id) && quiet()) {
+      rs = { ...rs, stage: "archive", oldThread: threadId, oldTitle: buffer.kvGet(K("threadTitle")), newTitle: newThreadTitle() };
+      saveReset(rs);
+    }
+    if (rs.stage === "archive") {
+      try { await t3.archive(rs.oldThread!); } catch (e) {
+        // t3 refuses a second archive of the same thread: after a crash between the call and the transaction below the
+        // error is fine if the thread itself reads as archived (its error text is not relied on). Otherwise, or if the
+        // read fails, the error stands: the binding stays and the next step retries.
+        const archived = await t3.read(rs.oldThread!).then((r) => r.thread?.archived === true, () => false);
+        if (!archived) throw e;
+        log.emit("bridge.archive_already", { bot: name, threadId: rs.oldThread });
+      }
+      const r = rs;
+      buffer.atomically(() => {
+        const list = JSON.parse(buffer.kvGet(K("archived")) ?? "[]") as { threadId: string; title: string | null; resetMessageId: string }[];
+        if (!list.some((a) => a.threadId === r.oldThread)) list.push({ threadId: r.oldThread!, title: r.oldTitle ?? null, resetMessageId: r.id });
+        buffer.kvSet(K("archived"), JSON.stringify(list));
+        buffer.kvSet(K("threadTitle"), r.newTitle!);
+        buffer.kvSet(K("fresh"), "1");
+        buffer.kvDelete(K("threadId"));
+        saveReset({ ...r, stage: "confirm" });
+      });
+      log.emit("bridge.session_archived", { bot: name, threadId: rs.oldThread, title: rs.oldTitle ?? null, resetMessageId: rs.id });
+      return { done: { phase: "new" } };
+    }
+    if (rs.stage === "confirm") {
+      if (threadId === rs.oldThread) return { done: { phase: "new" } }; // the fresh thread is not bound yet
+      const r = rs;
+      buffer.atomically(() => {
+        buffer.enqueue(conversationKey, { key: `new:${r.id}`, content: `🆕 New session started. The previous one is archived${r.oldTitle ? ` (t3 thread "${r.oldTitle}")` : ""}.`, nonce: `s${r.id}`, replyTo: r.id });
+        buffer.kvSet(K("resetSeen"), maxId(buffer.kvGet(K("resetSeen")), r.id));
+        buffer.kvDelete(K("reset"));
+      });
+      log.emit("bridge.session_new", { bot: name, threadId, resetMessageId: r.id });
+      return {};
+    }
+    return { limit: { id: rs.id, inclusive: rs.stage === "wrapup" } };
+  }
+
   // Accept one Discord MESSAGE_CREATE. Returns { accepted, inserted?, reason? }.
   async function accept(msg: DiscordMessage): Promise<AcceptResult> {
     if (msg?.channel_id !== channelId) return { accepted: false, reason: "other channel" };
@@ -120,6 +212,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
     if (!fromBot && !allowed.has(authorId)) { log.emit("bridge.dropped", { bot: name, sourceMessageId: msg.id ?? null, reason: "sender not allowed" }); return { accepted: false, reason: "sender not allowed" }; }
+    if (!fromBot && msg.id && isNewCommand(msg)) return acceptNew(msg as DiscordMessage & { id: string });
     // A crew bot's mention counts from its text too: whether Discord fills `mentions` for a bot-authored post is not
     // something the bridge relies on.
     const mentioned = Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
@@ -197,6 +290,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // crash the thread is found by that title instead of launching a second one. Fail closed: a lookup that cannot be
   // trusted (a listed item without a string title/threadId, or more than one exact match) and a launch answer without
   // a threadId escalate durably (kv `<key>:threadEscalated`) and nothing is launched or sent until a person clears it.
+  const newThreadTitle = () => `${threadLabel ?? name} (bridge ${now().toString(36)})`;
   async function ensureThread(): Promise<string> {
     const known = buffer.kvGet(K("threadId"));
     if (known) return known;
@@ -208,7 +302,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       return new Error(`thread escalated: ${why}`);
     };
     let title = buffer.kvGet(K("threadTitle"));
-    if (!title) { title = `${threadLabel ?? name} (bridge ${now().toString(36)})`; buffer.kvSet(K("threadTitle"), title); }
+    if (!title) { title = newThreadTitle(); buffer.kvSet(K("threadTitle"), title); }
     const listed = await t3.findThreads({ projectId, title });
     if (listed.some((t) => typeof t?.title !== "string" || typeof t?.threadId !== "string" || !t.threadId)) throw escalate("thread list item without a string title/threadId; lookup cannot rule out an earlier launch");
     const found = listed.filter((t) => t.title === title);
@@ -604,14 +698,16 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // `headerMaxChars` in total (the oldest line that does not mention this bot dropped first, then the oldest). Runs inside createBatch's transaction; advances the marker.
   // mentions of this bot and of the crew bots as @Name (other mentions stay as they are)
   const named = (text: string) => text.replace(/<@!?(\d+)>/g, (all, id: string) => (id === state.botUserId ? `@${name}` : bots.has(id) ? `@${bots.get(id)}` : all));
-  function unreadHeader(rows: InboundRow[]): string {
+  function unreadHeader(rows: InboundRow[], until?: BatchLimit): string {
     const since = buffer.kvGet(K("headerSince"));
     // Bounded read: at most `headerMaxMessages` lines can be shown, and lines are dropped oldest unaddressed first, then
     // oldest addressed (below), so only the newest `headerMaxMessages` of each kind can ever be shown; the rest is counted.
-    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId });
+    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId, until });
     const newest = [...(win.newestId ? [win.newestId] : []), ...rows.map((r) => r.source_message_id)].sort((a, b) => byId({ id: a }, { id: b })).at(-1);
     if (newest) buffer.kvSet(K("headerSince"), newest);
     // which channel this conversation is (the Discord tool needs it on every call), then how to address the crew
+    const fresh = buffer.kvGet(K("fresh")) ? `${FRESH_SESSION_TEXT}\n` : "";
+    if (fresh) buffer.kvDelete(K("fresh")); // inside createBatch's transaction: the first batch of the fresh thread carries it
     const hint = [`[Discord channel: #${channelName ?? channelId} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`,
       ...[...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`)];
     const toEntry = (addressed: boolean) => (m: { author_name: string; content: string }) =>
@@ -626,9 +722,9 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       entries.splice(i >= 0 ? i : 0, 1);
     }
     const lines = entries.map((e) => e.line);
-    if (!lines.length) return hint.join("\n") + "\n";
+    if (!lines.length) return fresh + hint.join("\n") + "\n";
     const left = total - lines.length;
-    return [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
+    return fresh + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
   }
 
   // One pass: catch up if needed, post finished replies, settle the oldest open batch, then (only if nothing is open,
@@ -648,6 +744,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const read = await t3.read(threadId);
     queuePending(threadId, read);
     await drain();
+    const reset = await resetStep(threadId, read);
+    if (reset.done) return reset.done;
 
     const open = buffer.openBatches(conversationKey);
     if (open.length) {
@@ -677,9 +775,9 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       return { phase: "open", ...v };
     }
     if (!gateOpen()) return { phase: "catching-up" };
-    const busy = Boolean(read.thread?.activeRunId) || (read.recentRuns ?? []).some((r) => !["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(r.status));
-    if (busy || !buffer.buffered(conversationKey).length) return { phase: busy ? "busy" : "idle" };
-    const b = buffer.createBatch(conversationKey, unreadHeader)!;
+    const busy = isBusy(read);
+    if (busy || !buffer.buffered(conversationKey, reset.limit).length) return { phase: busy ? "busy" : "idle" };
+    const b = buffer.createBatch(conversationKey, (rows) => unreadHeader(rows, reset.limit), reset.limit)!;
     await sendBatch(threadId, b);
     await typing();
     return { phase: "sent", batchId: b.id };

@@ -57,6 +57,28 @@ schema change before the trial verdict means a fresh DB.
 
 The **order guard** applies throughout: newer input never overtakes a batch that is held or unsettled.
 
+## `/new`: a fresh session
+
+A message that is exactly `/new` from an allowlisted person (this bot's mention optional, none needed, so every bot of
+the channel sees it) starts a reset of that bot's session in that channel. State is kv `reset` = { message id, stage }:
+
+1. **drain**: messages before the `/new` go to the old thread as usual; later ones stay buffered, and the unread
+   header of these batches stops at the `/new` too.
+2. **wrapup**: the `/new` itself is sent as one batch asking for the daily note (`NEW_WRAPUP_TEXT`).
+3. **archive**: once nothing is open, the thread is idle, replies are posted and the catch-up gate is open, the bridge
+   archives the old thread (`t3_thread_organize`, archive only). Then, in one transaction, it records the old thread
+   in kv `archived`, stores the replacement title, marks the session fresh and clears the thread binding.
+   `ensureThread()` launches the new thread by that title, so a crash around the launch is adopted, not repeated.
+   A crash between the t3 call and the transaction repeats the archive call, which t3 refuses ("already archived"). After
+   any archive error the bridge reads the thread (`thread.archived`): archived counts as done; if it is not, or the
+   read fails, the error stands, the binding stays and the next step retries.
+4. **confirm**: once the fresh thread is bound, one confirmation (outbox `new:<message id>`, a reply to the `/new`)
+   names the archived thread's title, and `resetSeen` keeps a replay of the same `/new` from starting another reset.
+
+The first batch of the fresh thread starts with a line telling the agent to read its daily notes. A second `/new`
+while one is pending is ignored. Nothing is force-cut: a turn that never ends keeps the reset waiting. Archived threads
+stay readable and searchable in t3; there is no `/resume` or unarchive yet.
+
 ## Output: one outbox per bot
 
 Every message a bot posts goes into the `outbox` table, and one worker posts the entries strictly head first. This

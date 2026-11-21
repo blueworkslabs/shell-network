@@ -27,6 +27,8 @@ an older t3 binary must not be pointed at a database migrated by a newer release
 - **One serialized outbox per bot.** Replies, relayed completions, stuck alerts, watchdog notices and the agent's own
   tool posts go out strictly in order. Each post is preceded by a durable marker and a channel boundary. After a crash,
   the head is looked up in the channel before anything else is posted.
+- **`/new`.** An allowlisted person's `/new` makes each bot write its daily note, archive its t3 thread and start a
+  fresh one; the old thread stays readable in t3. See ARCHITECTURE.md.
 - **Bot-to-bot with a cap.** Bots may hand work to each other by mention. After `BRIDGE_EXCHANGE_CAP` bot messages
   without a person in between, the bridge stops and posts one "waiting for the user" notice.
 - **Completion relay.** Runs that no batch started (background wakes, scheduled tasks) also reach the channel.

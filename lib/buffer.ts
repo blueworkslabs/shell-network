@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS outbox (               -- every message this bot post
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   conversation_key  TEXT NOT NULL,
   key               TEXT NOT NULL,              -- what it is: reply:<batch>:<part>, relay:<relay>:<part>, alert:<batch>:<episode>,
-                                                -- clear:<batch>:<episode>, talert:<seq>, tclear:<seq>, notice:<id>
+                                                -- clear:<batch>:<episode>, talert:<seq>, tclear:<seq>, notice:<id>, new:<message id>
   content           TEXT NOT NULL,
   nonce             TEXT NOT NULL,
   reply_to          TEXT,                       -- a channel message id, or "outbox:<id>" (that entry's message, resolved at POST)
@@ -199,6 +199,12 @@ export function coalesce(rows: Pick<InboundRow, "source" | "source_message_id" |
 
 // Status transitions setStatus() may make (forward only). resolved/cancelled are reachable only via resolve()/cancel().
 const ALLOWED: Partial<Record<BatchStatus, BatchStatus[]>> = { prepared: ["escalated"], sent: ["delivered", "held", "escalated"], "send-failed": ["sent", "escalated"], held: ["sent", "delivered", "escalated"] };
+
+// Snowflakes compare by length, then text.
+const idCmp = (a: string, b: string) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0);
+export type BatchLimit = { id: string; inclusive: boolean };
+const withinLimit = (rows: InboundRow[], limit?: BatchLimit): InboundRow[] =>
+  limit ? rows.filter((r) => (limit.inclusive ? idCmp(r.source_message_id, limit.id) <= 0 : idCmp(r.source_message_id, limit.id) < 0)) : rows;
 
 export type Buffer = ReturnType<typeof openBuffer>;
 
@@ -346,8 +352,11 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // is null) and the newest `limit` that do not, oldest first, plus how many such messages there are in all, and the
     // newest message id after `afterId` of any author. Only these can survive a header of at most `limit` lines, so the
     // read stays bounded however long the unread log is.
-    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit, channelId = "" }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number; channelId?: string }) {
-      const after = afterId === null ? "1" : "(length(id) > length(?1) OR (length(id) = length(?1) AND id > ?1))";
+    // until: only messages before (or through) a message id, so a batch cut at a `/new` shows nothing from after it.
+    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit, channelId = "", until }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number; channelId?: string; until?: BatchLimit }) {
+      if (until && !/^\d+$/.test(until.id)) throw new Error("channelWindow: until must be a Discord message id");
+      const upTo = until ? ` AND (length(id) < ${until.id.length} OR (length(id) = ${until.id.length} AND id ${until.inclusive ? "<=" : "<"} '${until.id}'))` : "";
+      const after = (afterId === null ? "1" : "(length(id) > length(?1) OR (length(id) = length(?1) AND id > ?1))") + upTo;
       const base = `${after} AND channel_id = ?4 AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))`;
       const mention = "(instr(content, '<@' || ?5 || '>') > 0 OR instr(content, '<@!' || ?5 || '>') > 0)";
       const params = [afterId ?? "", selfId, JSON.stringify(excludeIds), channelId, addressedId ?? ""] as SQLInputValue[];
@@ -360,18 +369,19 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       return { addressed, unaddressed, total, newestId: last?.id ?? null };
     },
 
-    buffered(conversationKey: string): InboundRow[] {
-      return all<InboundRow>(`SELECT * FROM inbound WHERE conversation_key = ? AND state = 'buffered' ORDER BY ${ARRIVAL}`, conversationKey);
+    // limit: only messages up to a Discord message id (before it, or through it); /new uses it to hold later messages back.
+    buffered(conversationKey: string, limit?: BatchLimit): InboundRow[] {
+      return withinLimit(all<InboundRow>(`SELECT * FROM inbound WHERE conversation_key = ? AND state = 'buffered' ORDER BY ${ARRIVAL}`, conversationKey), limit);
     },
 
     // Coalesce every buffered message of a conversation into one prepared batch (atomic). Refuses while the
     // conversation still has an unfinished batch, so batches reach t3 strictly in order. Returns null if empty.
     // header: optional text put before the coalesced messages (the unread-channel header).
-    createBatch(conversationKey: string, header: (rows: InboundRow[]) => string = () => ""): (BatchRow & { inboundIds: number[] }) | null {
+    createBatch(conversationKey: string, header: (rows: InboundRow[]) => string = () => "", limit?: BatchLimit): (BatchRow & { inboundIds: number[] }) | null {
       return tx(() => {
         const open = all<Pick<BatchRow, "id" | "status">>(`SELECT id, status FROM batch WHERE conversation_key = ? AND ${OPEN_SQL}`, conversationKey);
         if (open.length) throw new Error(`createBatch: batch ${open[0].id} (${open[0].status}) is still open for ${conversationKey}`);
-        const rows = all<InboundRow>(`SELECT * FROM inbound WHERE conversation_key = ? AND state = 'buffered' ORDER BY ${ARRIVAL}`, conversationKey);
+        const rows = withinLimit(all<InboundRow>(`SELECT * FROM inbound WHERE conversation_key = ? AND state = 'buffered' ORDER BY ${ARRIVAL}`, conversationKey), limit);
         if (!rows.length) return null;
         const prefix = requestPrefix(); // before the new batch exists, so it does not count as open
         const t = now();
@@ -586,6 +596,10 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       EXISTS (SELECT 1 FROM notice WHERE channel_message_id = ?1) OR EXISTS (SELECT 1 FROM alert WHERE channel_message_id = ?1 OR clear_message_id = ?1) AS n`, channelMessageId)!.n === 1,
     markRelayEmpty: (relayId: number): void => { db.prepare("UPDATE relay SET parts = 0, posted_at = ? WHERE id = ? AND posted_at IS NULL").run(now(), relayId); },
     batchRunIds: (conversationKey: string): string[] => all<{ t3_run_id: string }>("SELECT t3_run_id FROM batch WHERE conversation_key = ? AND t3_run_id IS NOT NULL", conversationKey).map((r) => r.t3_run_id),
+
+    // The batch a message went into (undefined while it is still buffered or unknown).
+    batchOfMessage: (conversationKey: string, sourceMessageId: string): BatchRow | undefined => one<BatchRow>(
+      "SELECT b.* FROM batch b JOIN inbound i ON i.batch_id = b.id WHERE i.conversation_key = ? AND i.source_message_id = ?", conversationKey, sourceMessageId),
 
     openBatches(conversationKey: string): BatchRow[] {
       return all<BatchRow>(`SELECT * FROM batch WHERE conversation_key = ? AND ${OPEN_SQL} ORDER BY id`, conversationKey);

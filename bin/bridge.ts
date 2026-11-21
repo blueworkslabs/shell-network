@@ -24,7 +24,7 @@ import { openBuffer } from "../lib/buffer.ts";
 import { acquireBotLock, LockHeldError, type BotLock } from "../lib/lock.ts";
 import { makeBot } from "../lib/bot.ts";
 import { discordRest, discordGateway } from "../lib/discord.ts";
-import { interactionDispatch, reconcileCommands } from "../lib/commands.ts";
+import { commandsHashKey, interactionDispatch, reconcileCommands } from "../lib/commands.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import type { LogFields } from "../lib/types.ts";
@@ -152,5 +152,5 @@ for (const w of watches) w.start();
 loop.start();
 // This application's slash commands, brought to our set in the background: a failure only logs (the text `/new` still
 // works) and is tried again at the next start, because the set's hash is stored only after a complete reconcile.
-void reconcileCommands({ port: discord, buffer, hashKey: `${cfg.key}:commandsHash`, log })
+void reconcileCommands({ port: discord, buffer, hashKey: commandsHashKey(cfg.key), log })
   .catch((e) => log.emit("bridge.commands_failed", { error: errText(e) }));

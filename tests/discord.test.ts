@@ -233,7 +233,7 @@ test("REST commands and interactions: the application id comes from Discord, onl
   const makeRequest = async (url: string, init: any) => {
     const path = new URL(url).pathname.replace("/api/v10", "");
     seen.push({ path, method: init.method, body: init.body ? JSON.parse(String(init.body)) : undefined });
-    if (path === "/applications/@me") return json({ id: "700000000000000001" }); // not the bot user's id
+    if (path === "/oauth2/applications/@me") return json({ id: "700000000000000001" }); // not the bot user's id
     if (path.endsWith("/commands") && init.method === "GET") return json([{ id: "5", name: "old" }]);
     if (path.includes("/callback")) return json({});
     return json({ id: "9" });
@@ -249,7 +249,7 @@ test("REST commands and interactions: the application id comes from Discord, onl
   await rest.interactions.reply("800000000000000002", "tok_en-2", "x".repeat(3000));
   await rest.interactions.edit("tok_en-1", "done");
   assert.deepEqual(seen.map((s) => `${s.method} ${s.path}`), [
-    "GET /applications/@me", // read once, then remembered
+    "GET /oauth2/applications/@me", // read once, then remembered
     "GET /applications/700000000000000001/commands",
     "POST /applications/700000000000000001/commands",
     "PATCH /applications/700000000000000001/commands/5",

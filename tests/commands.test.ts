@@ -7,17 +7,18 @@ import { makeBot, NEW_WRAPUP_TEXT } from "../lib/bot.ts";
 import { conversationKeyFor } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID, STRANGER_ID } from "./fakes.ts";
+import { type Buffer } from "../lib/buffer.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
 
 // ---- reconcile ----
 // what Discord returns for one of our commands: ours plus the fields it adds
 const registered = (c: CommandBody, id: string): ExistingCommand => ({ ...c, id, application_id: "700", version: "1", name_localizations: null, description_localizations: null, default_member_permissions: null });
-function fakeApp(initial: ExistingCommand[] = [], fail: { create?: string } = {}) {
+function fakeApp(initial: ExistingCommand[] = [], fail: { create?: string } = {}, appId = "700") {
   const cmds = new Map(initial.map((c) => [c.id, c]));
   const calls: string[] = [];
   let n = 100;
   const port: CommandsPort = {
-    async application() { calls.push("app"); return { id: "700" }; },
+    async application() { calls.push("app"); return { id: appId }; },
     async listCommands() { calls.push("list"); return [...cmds.values()]; },
     async createCommand(b) { calls.push(`create ${b.name}`); if (fail.create === b.name) { delete fail.create; throw new Error("boom"); } cmds.set(String(++n), registered(b, String(n))); return {}; },
     async editCommand(id, b) { calls.push(`edit ${b.name}`); cmds.set(id, registered(b, id)); return {}; },
@@ -70,19 +71,34 @@ test("RECONCILE: Discord's added fields do not count as a difference, and a chan
   assert.deepEqual(app.writes(), ["edit status"]);
 });
 
+test("RECONCILE hash is per application: one application's registration does not make another skip; the removal script's empty set is re-registered at the next start", async () => {
+  const store = kv(), log = memoryLog();
+  const a = fakeApp([], {}, "700"), b = fakeApp([], {}, "701");
+  assert.equal((await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log })).skipped, false);
+  assert.equal((await reconcileCommands({ port: b.port, buffer: store, hashKey: "h", log })).skipped, false, "the other application registers although the first one is done");
+  assert.equal((await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log })).skipped, true);
+  // rollback: bin/clear-commands.ts reconciles to the empty set under the same key; the next normal start registers again
+  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log, commands: [] }), { skipped: false, created: 0, edited: 0, deleted: 2 });
+  assert.deepEqual(names(a), []);
+  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 2, edited: 0, deleted: 0 });
+  assert.deepEqual(names(a), ["new", "status"]);
+  assert.deepEqual(names(b), ["new", "status"], "the other application was not touched by the removal");
+});
+
 test("RECONCILE failure: the rest is still done, the error surfaces, no hash is stored, and the next start finishes the job", async () => {
   const app = fakeApp([{ id: "3", name: "ping", description: "foreign", type: 1 }], { create: "new" }), store = kv();
   await assert.rejects(reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log: memoryLog() }), /create new: boom/);
   assert.deepEqual(names(app), ["status"], "status created and ping deleted although new failed");
-  assert.equal(store.kvGet("h"), null);
+  assert.equal(store.kvGet("h:700"), null);
   assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log: memoryLog() }), { skipped: false, created: 1, edited: 0, deleted: 0 });
   assert.deepEqual(names(app), ["new", "status"]);
-  assert.notEqual(store.kvGet("h"), null);
+  assert.notEqual(store.kvGet("h:700"), null);
 });
 
 // ---- interactions ----
 const CH = "100000000000000001", OTHER_CH = "100000000000000002", BOT = "333333333333333333";
 const KEY = conversationKeyFor("gem", CH);
+type IxOpts = { channel?: string; user?: string; type?: number };
 function world() {
   const path = join(tempDir("slash-"), "buffer.db");
   let clock = 1_792_500_000_000;
@@ -90,33 +106,41 @@ function world() {
   const t3 = fakeT3();
   const discord = fakeDiscord({ channelId: CH, botUserId: BOT, now });
   const log = memoryLog();
-  const buffer = openTempBuffer(path, { now });
-  const bot = makeBot({ name: "Gem", conversationKey: KEY, channelId: CH, channelName: "shell-network", botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem",
-    modelSelection: { instanceId: "crewGemClaude", model: "m" }, buffer, t3, discord, log, now, session: () => "s1", exchangeCap: 12 });
-  bot.initWatermark(clock - 60_000);
   const calls: string[] = [];
   const fail: { defer?: unknown; edit?: unknown } = {};
+  const acked = new Set<string>();
   const port: InteractionPort = {
     async reply(id, token, content) { calls.push(`reply:${content}`); },
-    async defer(id, token) { calls.push("defer"); if (fail.defer) throw fail.defer; },
+    async defer(id, token) { calls.push("defer"); if (fail.defer) throw fail.defer; if (acked.has(id)) throw Object.assign(new Error(`Interaction has already been acknowledged (${token})`), { code: 40060 }); acked.add(id); },
     async edit(token, content) { calls.push(`edit:${content}`); if (fail.edit) throw fail.edit; },
   };
-  let nudges = 0;
-  const dispatch = interactionDispatch({ port, bots: new Map([[CH, bot]]), allowedAuthors: [HUMAN_ID], nudge: () => { nudges++; }, log, now });
-  let n = 0;
+  let nudges = 0, n = 0;
   // an interaction id is a snowflake made when the command is used
   const snow = () => String(((BigInt(clock) - 1420070400000n) << 22n) + BigInt(++n));
   const w = {
-    t3, discord, log, buffer, bot, calls, fail, nudges: () => nudges, port,
-    thread: () => buffer.kvGet(`${KEY}:threadId`) as string,
-    steps: async (k = 3) => { for (let i = 0; i < k; i++) { await bot.step(); clock += 1000; } },
-    run: async (name: string, { channel = CH, user = HUMAN_ID, type = 2 }: { channel?: string; user?: string; type?: number } = {}) => {
-      const id = snow();
-      await dispatch("INTERACTION_CREATE", { id, token: `tok${id}`, type, channel_id: channel, data: { name }, member: { user: { id: user, username: "user1" } } });
-      return id;
+    path, t3, discord, log, buffer: null as unknown as Buffer, bot: null as unknown as ReturnType<typeof makeBot>,
+    dispatch: null as unknown as ReturnType<typeof interactionDispatch>,
+    calls, fail, nudges: () => nudges, port,
+    start() {
+      w.buffer = openTempBuffer(path, { now });
+      t3.crash.buffer = w.buffer;
+      w.bot = makeBot({ name: "Gem", conversationKey: KEY, channelId: CH, channelName: "shell-network", botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem",
+        modelSelection: { instanceId: "crewGemClaude", model: "m" }, buffer: w.buffer, t3, discord, log, now, session: () => "s1", exchangeCap: 12 });
+      w.dispatch = interactionDispatch({ port, bots: new Map([[CH, w.bot]]), allowedAuthors: [HUMAN_ID], nudge: () => { nudges++; }, log, now });
+      return w;
     },
+    restart() { try { w.buffer.close(); } catch {} return w.start(); },
+    thread: () => w.buffer.kvGet(`${KEY}:threadId`) as string,
+    steps: async (k = 3) => { for (let i = 0; i < k; i++) { await w.bot.step(); clock += 1000; } },
+    interaction: (name: string, { channel = CH, user = HUMAN_ID, type = 2 }: IxOpts = {}) => {
+      const id = snow();
+      return { id, token: `tok${id}-secret`, type, channel_id: channel, data: { name }, member: { user: { id: user, username: "user1" } } };
+    },
+    run: async (name: string, o: IxOpts = {}) => { const i = w.interaction(name, o); await w.dispatch("INTERACTION_CREATE", i); return i.id; },
     finish: (t: string, text: string | null) => t3.complete(t, t3.threads.get(t)!.runs.at(-1)!.runId, text),
   };
+  w.start();
+  w.bot.initWatermark(clock - 60_000);
   return w;
 }
 
@@ -211,4 +235,64 @@ test("INTERACTION /status: this bot and channel, the thread's state, the open ba
   await w.run("status");
   assert.match(w.calls.at(-1)!, /\/new: pending \(wrapup\)/);
   assert.doesNotMatch(w.calls.at(-1)!, /thread-\d|\/home|[0-9]{10}/, "no ids or paths");
+});
+
+test("INTERACTION duplicate delivery: the same interaction twice starts one reset and one archive; a second answer attempt is told it was acknowledged", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("work"));
+  await w.steps(1);
+  const t1 = w.thread();
+  const i = w.interaction("new");
+  await w.dispatch("INTERACTION_CREATE", i);
+  await w.dispatch("INTERACTION_CREATE", i); // a gateway replay: Discord refuses the second defer (40060)
+  assert.deepEqual(w.calls.filter((c) => c === "defer").length, 2);
+  assert.equal(w.calls.filter((c) => c.startsWith("edit:")).length, 1, "only the first delivery acts and answers");
+  assert.ok(w.log.events.some((e) => e.event === "bridge.interaction_duplicate"));
+  w.finish(t1, "done");
+  await w.steps(3);
+  w.finish(t1, "NO_REPLY");
+  await w.steps(5);
+  assert.equal(w.t3.calls.filter((c) => c.tool === "archive").length, 1);
+  assert.equal(w.t3.threads.size, 2);
+  assert.equal(w.discord.botPosts().filter((m) => m.content.startsWith("🆕")).length, 1);
+});
+
+test("INTERACTION /new survives a restart and an expired token: the reset and its channel confirmation do not depend on the interaction", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("work"));
+  await w.steps(1);
+  const t1 = w.thread();
+  w.fail.edit = Object.assign(new Error("Unknown interaction"), { code: 10062 }); // the reply never arrives
+  await w.run("new");
+  w.restart();
+  w.bot.initWatermark(1_792_500_000_000);
+  w.finish(t1, "done");
+  await w.steps(3);
+  w.restart();
+  w.finish(t1, "NO_REPLY");
+  await w.steps(6);
+  assert.deepEqual(w.t3.calls.filter((c) => c.tool === "archive").map((c) => c.threadId), [t1]);
+  assert.notEqual(w.thread(), t1);
+  assert.equal(w.discord.botPosts().filter((m) => m.content.startsWith("🆕")).length, 1);
+  assert.equal(w.buffer.kvGet(`${KEY}:reset`), null);
+});
+
+test("INTERACTION tokens never reach the log or the database, not even through an error that quotes them", async () => {
+  const w = world();
+  const i = w.interaction("new");
+  w.fail.edit = new Error(`PATCH https://discord.com/api/v10/webhooks/700000000000000001/${i.token}/messages/@original failed (${i.token})`);
+  await w.dispatch("INTERACTION_CREATE", i);
+  w.fail.edit = undefined; // the failure was about i's token only
+  const j = w.interaction("status");
+  w.bot.status = async () => { throw new Error(`boom ${j.token}`); };
+  await w.dispatch("INTERACTION_CREATE", j);
+  const k = w.interaction("new");
+  w.fail.defer = new Error(`/interactions/${k.id}/${k.token}/callback timed out`);
+  await w.dispatch("INTERACTION_CREATE", k);
+  await w.steps(2);
+  const dump = JSON.stringify(w.log.events) + JSON.stringify([
+    ...w.buffer.db.prepare("SELECT value FROM kv").all(), ...w.buffer.db.prepare("SELECT text, author FROM inbound").all(),
+    ...w.buffer.db.prepare("SELECT text FROM batch").all(), ...w.buffer.db.prepare("SELECT content FROM outbox").all()]);
+  for (const t of [i.token, j.token, k.token]) { const at = dump.indexOf(t); assert.ok(at < 0, `a token is stored or logged: ...${dump.slice(Math.max(0, at - 120), at + 60)}`); }
+  assert.ok(w.log.events.some((e) => e.event === "bridge.interaction_error" && String(e.error).includes("[token]")), "control: the errors were logged, redacted");
 });

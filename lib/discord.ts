@@ -48,12 +48,12 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
   const rest = makeRest({ token, makeRequest, api: apiBase, timeoutMs });
   rest.on("rateLimited", (info) => log?.emit("discord.rate_limited", { method: info.method, route: info.route, waitMs: info.retryAfter, global: info.global }));
   const api = new API(rest);
-  // This application's id (not assumed to be the bot user's), read once; a failed read is tried again next time.
+  // This application's id (from Discord's application data, not assumed to be the bot user's), read once; a failed read is tried again next time.
   let appId: string | null = null;
   const application = async (): Promise<{ id: string }> => {
     if (appId === null) {
-      const a = await api.applications.getCurrent();
-      if (typeof a?.id !== "string" || !SNOWFLAKE.test(a.id)) throw new Error("applications/@me: no application id");
+      const a = await api.oauth2.getCurrentBotApplicationInformation(); // GET /oauth2/applications/@me
+      if (typeof a?.id !== "string" || !SNOWFLAKE.test(a.id)) throw new Error("oauth2/applications/@me: no application id");
       appId = a.id;
     }
     return { id: appId };

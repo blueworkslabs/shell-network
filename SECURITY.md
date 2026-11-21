@@ -26,7 +26,8 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
     with action `archive` on the bot's own bound thread (`/new`); no other action, no other thread.
   - Slash commands: the Discord client can manage only its own application's global commands (the id is read from
     Discord) and answer an interaction by its id and token (checked for format); an interaction is answered only if it
-    comes from an allowlisted person in one of the bot's channels, otherwise with an ephemeral refusal.
+    comes from an allowlisted person in one of the bot's channels, otherwise with an ephemeral refusal. Interaction
+    tokens are never stored or logged.
 - **Secret handling.** Secrets are passed as file paths, never as values. At startup, each secret file must be a
   regular file (not a symlink) owned by the process user with no group/other permission bits, in a directory with the
   same properties. Otherwise the process does not start (`lib/preflight.ts`). Stuck alerts and notices never include

@@ -2,7 +2,7 @@
 // and the handler for INTERACTION_CREATE.
 //
 // Registration (per application, in the background after startup; a failure only logs and is retried at the next
-// start): the set's hash is kept in kv, and while it is unchanged no request is made. Otherwise the application's global
+// start): the set's hash is kept in kv per application, and while it is unchanged no request is made. Otherwise the application's global
 // commands are read and brought to exactly this set: a missing one is created, a different one edited, every other
 // one (foreign commands, other types, stale names) deleted. The hash is stored only when all of that succeeded.
 //
@@ -16,6 +16,7 @@ import { errText } from "./log.ts";
 import type { Buffer } from "./buffer.ts";
 import type { Log } from "./types.ts";
 
+export const commandsHashKey = (botKey: string) => `${botKey}:commandsHash`;
 export interface CommandBody {
   name: string; description: string; type: 1; contexts: number[]; integration_types: number[]; options: never[];
   default_member_permissions: null; nsfw: false;
@@ -55,7 +56,8 @@ export async function reconcileCommands({ port, buffer, hashKey, log, commands =
   { port: CommandsPort; buffer: Pick<Buffer, "kvGet" | "kvSet">; hashKey: string; log: Log; commands?: readonly CommandBody[] }): Promise<Reconciled> {
   const app = await port.application();
   const hash = createHash("sha256").update(JSON.stringify([app.id, commands])).digest("hex");
-  if (buffer.kvGet(hashKey) === hash) return { skipped: true };
+  const key = `${hashKey}:${app.id}`; // per application: one application's registration never makes another skip
+  if (buffer.kvGet(key) === hash) return { skipped: true };
   const have = await port.listCommands();
   const wanted = new Map(commands.map((c) => [c.name, c]));
   const kept = new Set<string>();
@@ -74,7 +76,7 @@ export async function reconcileCommands({ port, buffer, hashKey, log, commands =
   }
   log.emit("bridge.commands_reconciled", { created, edited, deleted, failed: failures.length });
   if (failures.length) throw new Error(`commands not fully reconciled (${failures.length}): ${failures.join("; ")}`);
-  buffer.kvSet(hashKey, hash);
+  buffer.kvSet(key, hash);
   return { skipped: false, created, edited, deleted };
 }
 
@@ -94,16 +96,18 @@ interface Interaction {
   member?: { user?: { id?: unknown; username?: unknown } }; user?: { id?: unknown; username?: unknown };
 }
 const FAILED = "That didn't work; try again in a moment.";
-// 10062: the interaction expired or was already answered (Discord HTTP 404)
-const expired = (e: unknown) => (e as { code?: number } | null)?.code === 10062;
+// 10062: the interaction expired (Discord HTTP 404); 40060: it was already acknowledged, i.e. delivered twice
+const kind = (e: unknown) => { const c = (e as { code?: number } | null)?.code; return c === 10062 ? "expired" : c === 40060 ? "duplicate" : "error"; };
+// An interaction token is a credential for its 15 minutes: it never reaches the log or the database, errors included.
+const redact = (s: string, token: string) => s.split(token).join("[token]").replace(/(\/(?:interactions|webhooks)\/\d+\/)[\w.-]+/g, "$1[token]");
 
 export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, now = () => Date.now() }: {
   port: InteractionPort; bots: Map<string, CommandBot>; allowedAuthors: string[]; nudge: () => void; log: Log; now?: () => number;
 }): (type: string, d: unknown) => Promise<void> | undefined {
   const allowed = new Set(allowedAuthors);
-  const safe = async (what: string, fn: () => Promise<unknown>) => {
+  const safe = async (token: string, what: string, fn: () => Promise<unknown>) => {
     try { await fn(); return true; } catch (e) {
-      log.emit(expired(e) ? "bridge.interaction_expired" : "bridge.interaction_error", { what, error: errText(e) });
+      log.emit(`bridge.interaction_${kind(e)}`, { what, error: redact(errText(e), token) });
       return false;
     }
   };
@@ -111,11 +115,11 @@ export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, no
     const id = String(i.id), token = String(i.token), name = String(i.data?.name);
     const user = i.member?.user ?? i.user;
     const bot = typeof i.channel_id === "string" ? bots.get(i.channel_id) : undefined;
-    if (name !== "new" && name !== "status") { await safe("reply", () => port.reply(id, token, "Unknown command.")); log.emit("bridge.interaction_refused", { why: "unknown command" }); return; }
+    if (name !== "new" && name !== "status") { await safe(token, "reply", () => port.reply(id, token, "Unknown command.")); log.emit("bridge.interaction_refused", { why: "unknown command" }); return; }
     // anything but our own commands, from our user, in our channels: refused, ephemeral, nothing else done
-    if (!bot) { await safe("reply", () => port.reply(id, token, "This bot is not active in this channel.")); log.emit("bridge.interaction_refused", { command: name, why: "channel" }); return; }
-    if (typeof user?.id !== "string" || !allowed.has(user.id)) { await safe("reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: name, why: "user" }); return; }
-    if (!(await safe("defer", () => port.defer(id, token)))) return; // expired before we answered: nothing to do, nothing was started
+    if (!bot) { await safe(token, "reply", () => port.reply(id, token, "This bot is not active in this channel.")); log.emit("bridge.interaction_refused", { command: name, why: "channel" }); return; }
+    if (typeof user?.id !== "string" || !allowed.has(user.id)) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: name, why: "user" }); return; }
+    if (!(await safe(token, "defer", () => port.defer(id, token)))) return; // expired before we answered: nothing to do, nothing was started
     let text = FAILED;
     try {
       if (name === "new") {
@@ -124,13 +128,13 @@ export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, no
           : r.reason === "new pending" ? "A /new is already pending for this bot in this channel." : "That /new was already handled.";
         if (r.accepted) nudge();
       } else text = await bot.status();
-    } catch (e) { log.emit("bridge.interaction_error", { what: name, error: errText(e) }); }
-    await safe("edit", () => port.edit(token, text));
+    } catch (e) { log.emit("bridge.interaction_error", { what: name, error: redact(errText(e), token) }); }
+    await safe(token, "edit", () => port.edit(token, text));
   }
   return (type, d) => {
     const i = d as Interaction;
     // type 2 = application command; only well-formed ones reach the handler
     if (type !== "INTERACTION_CREATE" || i?.type !== 2 || typeof i.id !== "string" || typeof i.token !== "string" || typeof i.data?.name !== "string") return undefined;
-    return handle(i).catch((e) => log.emit("bridge.interaction_error", { what: "handle", error: errText(e) }));
+    return handle(i).catch((e) => log.emit("bridge.interaction_error", { what: "handle", error: redact(errText(e), String(i.token)) }));
   };
 }

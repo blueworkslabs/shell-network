@@ -41,7 +41,7 @@ export function bridgeConfig(env: Record<string, string | undefined>) {
   if (!/^\d{1,4}$/.test(cap)) throw new Error("BRIDGE_EXCHANGE_CAP: an integer >= 0 (0 = off)");
   return {
     bot: self as BotConfig,
-    allowedBots: members.filter((m) => m.key !== key).map(({ id, name }) => ({ id, name })),
+    allowedBots: members.filter((m) => m.key !== key).map(({ id, name, instanceId }) => ({ id, name, ...(!instanceId ? { talkOnly: true } : {}) })),
     exchangeCap: Number(cap),
   };
 }

@@ -340,21 +340,29 @@ test("CAP NOTICE per episode: the next capped episode gets its own 'waiting for 
 });
 
 
-test("TALK-ONLY: mentions are accepted, unread messages appear in the header, unknown bots stay dropped and the cap applies", async () => {
+test("TALK-ONLY: messages reset the cap without consuming it, bare mentions resume, active bots remain capped", async () => {
   const w = crew({ cap: 1, talkOnly: true });
-  const say = async (text: string, id = "666666666666666666") => {
-    const m = w.discord.userSays(text, { mention: false, bot: true, authorId: id, author: "Advisor" });
-    return w.gem.bot.accept(m);
+  const say = async (text: string, id = "666666666666666666", channel = CH) => {
+    const m = w.discord.userSays(text, { mention: false, bot: true, authorId: id, author: "Advisor", channel });
+    w.tick(1000);
+    return (await w.both(m))[0];
   };
+  await w.person("start", HERMES);
+  await w.turn(w.hermes, `<@${GEM}> one`);
+  assert.equal((await say(`<@${GEM}> capped`, HERMES)).reason, "exchange cap");
   assert.equal((await say("background from advisor")).reason, "no mention");
-  assert.deepEqual(await say(`<@${GEM}> first`), { accepted: true, inserted: true });
-  const turn = await w.turn(w.gem, "received");
-  assert.ok(turn.sent.includes("Advisor: background from advisor"), turn.sent);
-  assert.ok(turn.sent.includes("Advisor: first"), turn.sent);
-  assert.equal((await say(`<@${GEM}> second`)).reason, "exchange cap");
+  assert.equal((await say(`<@${GEM}> two`, HERMES)).accepted, true, "unaddressed talk-only message reset the cap");
+  const received = await w.turn(w.gem, "received");
+  assert.ok(received.sent.includes("Advisor: background from advisor"), received.sent);
+  assert.equal((await say(`<@${GEM}> still capped`, HERMES)).reason, "exchange cap");
   assert.equal((await say(`<@${GEM}> unknown`, CODEX)).reason, "bot author");
-  await w.person("resume", GEM);
-  const resumed = await w.turn(w.gem, "ok");
-  assert.ok(resumed.sent.includes("Advisor: @Gem second"), resumed.sent);
-  assert.ok(!resumed.sent.includes("unknown"), resumed.sent);
+  assert.equal((await say("wrong channel", "666666666666666666", "other")).reason, "other channel");
+  assert.equal((await say(`<@${GEM}> still capped again`, HERMES)).reason, "exchange cap", "unknown/other channel cannot reset");
+  assert.deepEqual(await say(`<@${GEM}>`), { accepted: true, inserted: true });
+  const resumed = await w.turn(w.gem, "resumed");
+  assert.ok(resumed.sent.includes(BARE_MENTION_TEXT), resumed.sent);
+  assert.equal((await say(`<@${GEM}> three`, HERMES)).accepted, true, "talk-only resume did not consume budget");
+  assert.equal((await say(`<@${GEM}> four`, HERMES)).reason, "exchange cap");
+  assert.equal((await say(`<@${GEM}> first`)).accepted, true);
+  assert.equal((await say(`<@${GEM}> second`)).accepted, true, "talk-only messages are never capped");
 });

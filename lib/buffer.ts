@@ -271,7 +271,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
   const transition = (id: number, status: BatchStatus, t: number, extra = "", args: SQLInputValue[] = []) =>
     db.prepare(`UPDATE batch SET status=?, episode=episode+1, status_since=?, updated_at=?${extra} WHERE id=?`).run(status, t, t, ...args, id);
 
-  // Bot-to-bot episodes: the messages of allowlisted people (accepted input or human_message, with or without a
+  // Bot-to-bot episodes: messages of allowlisted people and talk-only crew (accepted input or human_message, with or without a
   // mention) cut the channel into episodes, in Discord id order. A bot message belongs to the episode its id falls in,
   // whenever it arrives (late or replayed messages are counted where they were posted, not where they
   // arrive). Snowflakes compare by length, then text.
@@ -332,10 +332,11 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     },
 
     // Channel log for the unread header: only what the bridge was allowed to read (allowlisted authors, bots).
-    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number; channelId?: string }): void {
+    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number; channelId?: string; resetsCap?: boolean }): void {
       tx(() => {
         db.prepare("INSERT OR IGNORE INTO channel_message (id, author_id, author_name, author_kind, content, at, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?)").run(m.id, m.authorId, m.authorName, m.authorKind, m.content, m.at, m.channelId ?? "");
-        if (m.authorKind === "human") db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(m.id, m.channelId ?? "");
+        // Talk-only members reset episodes without losing their bot identity in the channel log.
+        if (m.authorKind === "human" || m.resetsCap) db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(m.id, m.channelId ?? "");
         db.prepare("DELETE FROM channel_message WHERE at < ?").run(now() - CHANNEL_LOG_KEEP_MS); // the header needs recent turns only
       });
     },
@@ -554,7 +555,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     outboxApplied: (id: number): void => { db.prepare("UPDATE outbox SET state = 'posted', posted_at = ? WHERE id = ? AND state IN ('pending','posting')").run(now(), id); },
 
     // ---- the bot's Discord tool ----
-    setToolConfig(conversationKey: string, c: { channelId: string; botUserId: string; crew: { id: string; name: string }[]; exchangeCap: number }): void {
+    setToolConfig(conversationKey: string, c: { channelId: string; botUserId: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap: number }): void {
       db.prepare(`INSERT INTO tool_config (conversation_key, channel_id, bot_user_id, crew, exchange_cap, updated_at) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT (conversation_key) DO UPDATE SET channel_id = excluded.channel_id, bot_user_id = excluded.bot_user_id, crew = excluded.crew,
         exchange_cap = excluded.exchange_cap, updated_at = excluded.updated_at`).run(conversationKey, c.channelId, c.botUserId, JSON.stringify(c.crew), c.exchangeCap, now());

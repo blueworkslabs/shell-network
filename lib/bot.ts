@@ -43,7 +43,7 @@ export interface BotOptions {
   buffer: Buffer; t3: T3Port; discord: DiscordPort; log: Log; now?: () => number;
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
-  allowedBots?: { id: string; name: string }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
+  allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
 }
 
 const PART = 1900;
@@ -111,10 +111,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const fromBot = Boolean(msg.author?.bot);
     const self = fromBot && authorId === state.botUserId;
     const crewBot = fromBot && bots.has(authorId as string);
+    const talkOnly = crewBot && allowedBots.some((b) => b.id === authorId && b.talkOnly);
     // Channel log for the unread header: the allowlisted people, the allowed crew bots and this bot itself only.
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content: String(msg.content ?? ""), at: Date.parse(msg.timestamp as string) || now(), channelId });
+        content: String(msg.content ?? ""), at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
@@ -123,14 +124,14 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     // something the bridge relies on.
     const mentioned = Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
     if (!mentioned) return { accepted: false, reason: "no mention" };
-    // A person's bare mention means "go on" (e.g. after the exchange-cap pause); a bot's bare mention stays dropped.
+    // A person or talk-only member can resume with a bare mention; bridge-run bots cannot.
     const withoutUser = String(msg.content ?? "").replace(mentionRe(), "");
     const stripped = (botRoleId ? withoutUser.replace(roleRe(), "") : withoutUser).trim();
-    if (!stripped && fromBot) return { accepted: false, reason: "empty after mention" };
+    if (!stripped && fromBot && !talkOnly) return { accepted: false, reason: "empty after mention" };
     const text = stripped || BARE_MENTION_TEXT;
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
-    if (crewBot) {
+    if (crewBot && !talkOnly) {
       const b = buffer.acceptFromBot(input, exchangeCap);
       if ("capped" in b) {
         // the cap is reached: not delivered; one notice per episode (key = last human message), whichever bot sees it first

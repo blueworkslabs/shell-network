@@ -148,7 +148,7 @@ they do not substitute for the provider's live tool configuration and recall che
 With `DISCORD_TOOL_MEMORY_INDEX` (a SQLite path outside the notes) `memory_search` uses an index instead of the file walk
 (`lib/memindex.ts`): Markdown chunks of about 300 words cut at headings, FTS5 full text, and embeddings from an
 OpenAI-compatible endpoint (`DISCORD_TOOL_EMBED_URL`, `DISCORD_TOOL_EMBED_MODEL`, `DISCORD_TOOL_EMBED_KEY` as a key file,
-optional `DISCORD_TOOL_EMBED_DIMENSIONS`; a change of model or dimensions re-embeds everything; the similarity floor is
+optional `DISCORD_TOOL_EMBED_DIMENSIONS`; a change of model or dimensions re-embeds everything (so does another endpoint); the similarity floor is
 `DISCORD_TOOL_EMBED_MIN_SIMILARITY`, default 0.3), merged by reciprocal rank fusion. The endpoint receives the text of notes and transcripts (in chunks) and every
 query. Each match says how it matched (`text`,
 `semantic` or `both`) and whether it is a `note` or a `session` (a transcript under `sessions/`, where short turns

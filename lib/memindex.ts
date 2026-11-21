@@ -49,9 +49,23 @@ export function chunkMarkdown(text: string, { groupTurns = false }: { groupTurns
     out.push({ start: from + 1, end: to + 1, text: withHeading });
   };
   let sectionStart = 0;
+  // one line longer than a chunk: cut into word windows that all point at that line
+  const longLine = (i: number) => {
+    const ws = lines[i].split(/\s+/).filter(Boolean);
+    for (let k = 0; k < ws.length; k += CHUNK_WORDS - OVERLAP_WORDS) {
+      out.push({ start: i + 1, end: i + 1, text: `${heading && !lines[i].startsWith("#") ? `${heading}\n` : ""}${ws.slice(k, k + CHUNK_WORDS).join(" ")}` });
+      if (k + CHUNK_WORDS >= ws.length) break;
+    }
+  };
   const section = (from: number, to: number) => {
     let s = from, count = 0;
     for (let i = from; i <= to; i++) {
+      if (words(lines[i]) > CHUNK_WORDS) {
+        if (i > s) emit(s, i - 1);
+        longLine(i);
+        s = i + 1; count = 0;
+        continue;
+      }
       count += words(lines[i]);
       if (count >= CHUNK_WORDS && i < to) {
         emit(s, i);
@@ -97,8 +111,9 @@ export function httpEmbedder({ baseUrl, model, key, dimensions, fetchImpl = fetc
 }): Embedder {
   const url = `${baseUrl.replace(/\/+$/, "")}/embeddings`;
   const clean = (s: string) => (key ? s.split(key).join("[key]") : s);
+  // the vector space: model, dimensions and endpoint (the same model name elsewhere may be another model)
   return {
-    model: dimensions ? `${model}@${dimensions}` : model,
+    model: `${model}@${dimensions ?? "default"}@${new URL(url).host}`,
     async embed(texts) {
       for (let attempt = 0; ; attempt++) {
         let res: Response | null = null, failure = "";
@@ -108,7 +123,9 @@ export function httpEmbedder({ baseUrl, model, key, dimensions, fetchImpl = fetc
             body: JSON.stringify({ model, input: texts, ...(dimensions ? { dimensions } : {}) }) });
         } catch (e) { failure = clean(errText(e)).slice(0, 200); }
         if (res?.ok) {
-          const body = await res.json() as { data?: { index?: number; embedding?: number[] }[] };
+          // a parser error could quote the answer: a fixed message instead
+          let body: { data?: { index?: number; embedding?: number[] }[] };
+          try { body = await res.json() as typeof body; } catch { throw new Error("embeddings: invalid JSON in the answer"); }
           const data = Array.isArray(body?.data) ? [...body.data].sort((x, y) => (x.index ?? 0) - (y.index ?? 0)) : [];
           if (data.length !== texts.length || data.some((d) => !Array.isArray(d.embedding) || !d.embedding.length)) throw new Error("embeddings: malformed answer");
           return data.map((d) => Float32Array.from(d.embedding!));

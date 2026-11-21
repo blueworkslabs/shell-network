@@ -222,8 +222,8 @@ test("MODEL CHANGE: vectors of another model or dimensions are dropped and re-em
   const again = openMemIndex({ root: w.notes, indexPath: join(w.dir, "index.db"), embedder: other });
   assert.deepEqual(await again.embedPending(), { embedded: 1 }, "the new space is embedded from scratch");
   assert.deepEqual((again.db.prepare("SELECT DISTINCT model FROM vector").all() as { model: string }[]).map((r) => r.model), ["fake-4@2"], "the old space is gone");
-  assert.equal(httpEmbedder({ baseUrl: "https://x", model: "m", key: "k", dimensions: 512 }).model, "m@512");
-  assert.equal(httpEmbedder({ baseUrl: "https://x", model: "m", key: "k" }).model, "m");
+  assert.equal(httpEmbedder({ baseUrl: "https://x.example/v1", model: "m", key: "k", dimensions: 512 }).model, "m@512@x.example");
+  assert.equal(httpEmbedder({ baseUrl: "https://y.example/v1", model: "m", key: "k" }).model, "m@default@y.example", "another endpoint is another space");
   assert.equal(minSimilarityFromEnv({}), MIN_SIMILARITY);
   assert.equal(minSimilarityFromEnv({ DISCORD_TOOL_EMBED_MIN_SIMILARITY: "0.2" }), 0.2);
   assert.throws(() => minSimilarityFromEnv({ DISCORD_TOOL_EMBED_MIN_SIMILARITY: "high" }), /-1 to 1/);
@@ -231,4 +231,21 @@ test("MODEL CHANGE: vectors of another model or dimensions are dropped and re-em
   const loose = openMemIndex({ root: w.notes, indexPath: join(w.dir, "index.db"), embedder: other, minSimilarity: -1 });
   const r = (await loose.tool.call({ query: "zzz unrelated" })).structuredContent as MemResult;
   assert.equal(r.matches[0]?.match, "semantic", "with floor -1 even an unrelated chunk counts");
+});
+
+test("LONG LINES and private answers: a 12,000-word line becomes chunks of at most CHUNK_WORDS on that line; a malformed answer body is not quoted", async () => {
+  const text = `# H\nshort\n${Array.from({ length: 12_000 }, (_, i) => `w${i}`).join(" ")}\nafter`;
+  const cs = chunkMarkdown(text);
+  const onLine3 = cs.filter((c) => c.start === 3 && c.end === 3);
+  assert.ok(onLine3.length >= 40, "the long line is cut into many chunks");
+  assert.ok(cs.every((c) => c.text.split(/\s+/).length <= CHUNK_WORDS + 10));
+  assert.ok(onLine3[1].text.includes(`w${CHUNK_WORDS - 40}`), "windows overlap");
+  assert.deepEqual(cs.at(-1)!.start, 4);
+  const w = world();
+  w.write("long.md", text);
+  const r = await w.search("w11999");
+  assert.deepEqual([r.matches[0].file, r.matches[0].line], ["long.md", 3]);
+  const e = httpEmbedder({ baseUrl: "https://api.example/v1", model: "m", key: "k", sleep: async () => {},
+    fetchImpl: (async () => new Response("{ private transcript excerpt", { status: 200 })) as unknown as typeof fetch });
+  await assert.rejects(e.embed(["a"]), (err: Error) => err.message === "embeddings: invalid JSON in the answer");
 });

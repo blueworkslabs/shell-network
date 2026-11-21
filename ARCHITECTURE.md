@@ -150,6 +150,33 @@ with the batch replies. Such runs come from background wakes (`notification` inp
 had already finished when the relay first saw the thread count as history. `lib/shellwatch.ts` wakes the step loop on
 t3 `thread.updated` events, and the idle tick stays as a fallback.
 
+### Scheduled work (heartbeat replacement)
+
+From the bot's current channel-bound t3 thread, use `schedule_task` with
+`bindToCurrentThread:true`, an explicit schedule and a unique `clientRequestId`.
+Use `{type:"once",runAt:"<ISO timestamp with timezone>"}` for a one-shot check.
+Store the returned task ID and next run time in private notes. For recurring work,
+use an explicitly authorized interval/fixed-time schedule and keep the task ID so
+it can be updated/paused (`scheduledTaskId`, `enabled:false`), not recreated on every turn.
+The scheduled prompt should describe the check and ask for ordinary final text;
+the bridge completion relay delivers it. Do not also send the same text through
+`discord_send`. Exact `NO_REPLY` suppresses a no-change result.
+
+Binding matters: an unbound task may create a different t3 thread that the bridge
+is not watching. A Discord `/new` archives/replaces the bound thread; automatic
+schedule rebinding is not implemented or verified. Pause/recreate the schedule in
+the replacement thread before relying on recurring delivery. `freshSession:false`
+was tested; fresh-session schedules and server/provider restarts were not.
+
+Live check on 2026-11-21, t3 0.1.11 and bridge `e54b8f0`: Hermes invoked the native
+schedule tool, binding a one-shot task to his second channel. Only his bridge was
+restarted at 18:47:13 UTC; provider/server and thread bindings stayed intact. Due
+18:50:21.100 UTC, the scheduled run started 18:50:24.535 (+3.435 seconds), completed
+18:50:26.912, and its marker appeared once in the intended channel at 18:50:28.943.
+The buffer recorded one posted relay entry and no matching entry for the other
+channel. This is a live one-shot/restart receipt, not an exactly-once guarantee or
+a timing SLA. No bridge code change was required.
+
 ## Stuck alerts and the watchdog
 
 - **Stuck alerts** (`lib/stuck.ts`): a batch that stays open past its limit gets one "⚠️ Stuck" post per status
@@ -181,3 +208,8 @@ t3 `thread.updated` events, and the idle tick stays as a fallback.
 - `lib/`: the bridge core (`bot.ts`), buffer (`buffer.ts`), reconcile, stuck, watchdog, the t3 and Discord adapters, allowlist and preflight, the writer lock, and the tool.
 - `lib/vendor/`: the MCP and WS clients shared with the project's t3 test harness. Their types are in `*.d.mts`.
 - `tests/`: offline tests over fakes. `tests/fixtures/` holds reduced evidence captured from a real t3 0.1.0.
+
+## Operations
+
+See [install and rollback](OPERATIONS.md) for release preparation, backups, health checks,
+provider tool version pins and slash-command cleanup.

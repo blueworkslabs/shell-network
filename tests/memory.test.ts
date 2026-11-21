@@ -69,3 +69,20 @@ test("MEMORY stdio: a fresh tool process retrieves a fact stored only in an old 
   assert.ok(list.result.tools.some((t: { name: string }) => t.name === "memory_search"));
   assert.deepEqual(result.result.structuredContent.matches, [{ file: "2025-01-01.md", line: 1, text: "The old prototype's switch was amber." }]);
 });
+
+test("MEMORY recent notes: newest date names survive the result limit", async () => {
+  const root = tempDir("notes-");
+  for (const date of ["2025-01-01", "2025-01-02", "2025-01-03"]) writeFileSync(join(root, `${date}.md`), "release decision");
+  const out = await search(root, "release", 2);
+  assert.deepEqual(out.matches.map((m) => m.file), ["2025-01-03.md", "2025-01-02.md"]);
+  assert.equal(out.incomplete, true);
+});
+
+test("MEMORY Unicode excerpts: offsets refer to the original line and query metacharacters remain literal", async () => {
+  const root = tempDir("notes-");
+  writeFileSync(join(root, "note.md"), "İ".repeat(150) + "Needle.*[x]" + "z".repeat(500));
+  const out = await search(root, "needle.*[x]");
+  assert.equal(out.matches.length, 1);
+  assert.ok(out.matches[0].text.includes("Needle.*[x]"), out.matches[0].text);
+  assert.ok(out.matches[0].text.length <= 402);
+});

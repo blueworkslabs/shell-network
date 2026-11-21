@@ -122,7 +122,8 @@ The `T1_` prefix on the t3 connection variables is historical.
 
 `memory_search({"query":"old project decision","max_results":10})` searches the notes directory configured by
 `DISCORD_TOOL_NOTES`. Queries are case-insensitive literal text, with up to 20 matching lines returned as relative
-file names, 1-based line numbers and excerpts. The tool reads current files on each call: new and edited notes need no
+file names, 1-based line numbers and excerpts. Entries are visited in descending filename order, so date-named daily
+notes prioritize recent entries when results are limited. The tool reads current files on each call: new and edited notes need no
 index rebuild. Only non-hidden `.md` and `.txt` files are included; symlinks, hardlinks and binary files are skipped.
 It never searches another bot's notes or archived channel history.
 
@@ -134,7 +135,8 @@ An empty result with `incomplete: true` does not establish that the fact is abse
 Installation: the external operator sets `DISCORD_TOOL_NOTES=/path/to/bot/notes` in each bot's existing MCP launch
 environment and reloads that tool process. Select only the bot's own notes directory, not a shared parent. Bridge
 restarts, database migrations and credentials are not needed. Without this optional setting the existing tool list is
-unchanged. Roll back by removing the setting and reloading the tool, or by restoring the previous release.
+unchanged. An invalid notes directory prevents the MCP tool from starting; validate this setting during activation.
+Roll back by removing the setting and reloading the tool, or by restoring the previous release.
 
 Live check: after a fresh session, ask about a fact kept only in an old note. Verify that the bot calls `memory_search`
 and answers with the matching file and line. Automated tests cover that search through a fresh stdio tool process;

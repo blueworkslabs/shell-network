@@ -20,7 +20,8 @@ export async function memoryTool(directory: string): Promise<Tool> {
     if (typeof args.query !== "string" || !args.query.trim() || args.query.length > 200) throw new Error("query must contain 1–200 characters");
     const limit = args.max_results ?? 10;
     if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > 20) throw new Error("max_results must be an integer from 1 to 20");
-    const query = args.query.trim().toLowerCase();
+    // Escape metacharacters: a literal query, with case folding that preserves original-string offsets.
+    const query = new RegExp(args.query.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu");
     const result: MemorySearch = { matches: [], incomplete: false };
     let bytes = 0, files = 0, entries = 0, stop = false;
     async function walk(dir: string, depth: number): Promise<void> {
@@ -28,7 +29,8 @@ export async function memoryTool(directory: string): Promise<Tool> {
       // Recheck on every call: replacing a directory with a symlink must not broaden the configured scope.
       const st = await lstat(dir);
       if (st.isSymbolicLink() || !st.isDirectory() || !inside(await realpath(dir))) { result.incomplete = true; return; }
-      const children = (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      // Daily notes use YYYY-MM-DD names: retain recent notes first when a search reaches its limit.
+      const children = (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name < b.name ? 1 : a.name > b.name ? -1 : 0);
       for (const child of children) {
         if (stop) break;
         if (++entries > MAX_ENTRIES) { result.incomplete = true; stop = true; break; }
@@ -59,8 +61,9 @@ export async function memoryTool(directory: string): Promise<Tool> {
               if (text.includes("\0")) continue;
               const lines = text.split(/\r?\n/);
               for (let i = 0; i < lines.length; i++) {
-                const at = lines[i].toLowerCase().indexOf(query);
-                if (at < 0) continue;
+                const hit = query.exec(lines[i]);
+                if (!hit) continue;
+                const at = hit.index;
                 if (result.matches.length === limit) { result.incomplete = true; stop = true; break; }
                 const from = Math.max(0, at - 100), end = Math.min(lines[i].length, from + 400);
                 result.matches.push({ file: relative(root, path).split(sep).join("/"), line: i + 1,

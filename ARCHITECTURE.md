@@ -103,7 +103,7 @@ archived conversations under `sessions/` in the agent's notes root for hybrid in
 from the bridge's per-conversation `archived` ledger (thread id, title, reset message id), or an explicit operator
 manifest for older archives; neither native search nor list is a complete archive inventory. Export using the read
 API with both pagination levels, stable thread/item ids, and idempotent reruns. Do not launch old conversations or
-write directly into t3's database. This source is required work, not implemented by this documentation.
+write directly into t3's database. The importer accepts an explicit operator manifest via `--t3-manifest`; see README.md for the command and scope.
 
 ## Direct messages
 

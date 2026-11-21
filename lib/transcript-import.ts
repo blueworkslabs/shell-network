@@ -3,11 +3,12 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { zstdDecompressSync } from "node:zlib";
+import type { ArchivedTranscript } from "./t3-transcript.ts";
 
 type RecordData = Record<string, unknown>;
 type Event = RecordData & { type: string };
 type Session = { id: string; key?: string; label?: string; events: Event[]; seen: Set<string> };
-type ImportOptions = { database?: string; jsonlDirectories?: string[]; output: string; onSkip?: (filename: string) => void };
+type ImportOptions = { database?: string; jsonlDirectories?: string[]; output: string; onSkip?: (filename: string) => void; t3Archives?: ArchivedTranscript[] };
 type ImportResult = { sessions: number; written: number; unchanged: number; corruptLines: number };
 
 const LEGACY = /\.jsonl(?:\.(?:reset\..+|bak\..+|deleted\..+\.zst|imported-\d+))?$/;
@@ -97,8 +98,8 @@ function markdown(session: Session): { date: string; content: string } | undefin
   return { date: first.slice(0, 10) || "unknown-date", content: [heading, ...sections].join("\n\n") + "\n" };
 }
 
-export function importTranscripts({ database, jsonlDirectories = [], output, onSkip = () => {} }: ImportOptions): ImportResult {
-  if (!database && !jsonlDirectories.length) throw new Error("at least one copied input is required");
+export function importTranscripts({ database, jsonlDirectories = [], output, onSkip = () => {}, t3Archives = [] }: ImportOptions): ImportResult {
+  if (!database && !jsonlDirectories.length && !t3Archives.length) throw new Error("at least one copied input is required");
   const sessions = new Map<string, Session>();
   const channels = new Map<string, string>();
   const storeKeys = new Map<string, string>();
@@ -178,6 +179,13 @@ export function importTranscripts({ database, jsonlDirectories = [], output, onS
       if (match && !session.key) session.key = `agent:${match[1]}:discord:${match[2]}:${match[3]}`;
       addLines(session, lines);
     }
+  }
+
+  for (const archive of t3Archives) {
+    const session = get(archive.id);
+    session.key = archive.key;
+    session.label = archive.label;
+    for (const event of archive.events) add(session, event);
   }
 
   for (const session of sessions.values()) {

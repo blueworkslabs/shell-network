@@ -325,7 +325,11 @@ export function openMemIndex({ root: dir, indexPath, embedder = null, now = () =
     const fused = new Map<number, { score: number; match: MemMatch["match"] }>();
     for (const [id, r] of textRanks) fused.set(id, { score: 1 / (RRF_K + r + 1), match: "text" });
     for (const [id, r] of semRanks) { const f = fused.get(id); fused.set(id, f ? { score: f.score + 1 / (RRF_K + r + 1), match: "both" } : { score: 1 / (RRF_K + r + 1), match: "semantic" }); }
-    const ranked = [...fused].sort((a, b) => b[1].score - a[1].score || a[0] - b[0]);
+    // A query of one token (a commit hash, an id, a path) asks for that exact string: its text hits come first, meaning-only
+    // hits after them (embeddings place such strings next to unrelated text).
+    const exact = !/\s/.test(query.trim());
+    const tier = (m: MemMatch["match"]) => (exact && m === "semantic" ? 1 : 0);
+    const ranked = [...fused].sort((a, b) => tier(a[1].match) - tier(b[1].match) || b[1].score - a[1].score || a[0] - b[0]);
     const matches: MemMatch[] = [];
     const seen = new Set<string>();
     for (const [id, f] of ranked) {

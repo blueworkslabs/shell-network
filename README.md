@@ -151,7 +151,7 @@ OpenAI-compatible endpoint (`DISCORD_TOOL_EMBED_URL`, `DISCORD_TOOL_EMBED_MODEL`
 optional `DISCORD_TOOL_EMBED_DIMENSIONS`; a change of model or dimensions re-embeds everything (so does another endpoint); the similarity floor is
 `DISCORD_TOOL_EMBED_MIN_SIMILARITY`, default 0.3), merged by reciprocal rank fusion. The endpoint receives the text of notes and transcripts (in chunks) and every
 query. Each match says how it matched (`text`,
-`semantic` or `both`) and whether it is a `note` or a `session` (a transcript under `sessions/`, where short turns
+`semantic` or `both`; for a query of one token, such as a commit hash, id or path, text hits come first) and whether it is a `note` or a `session` (a transcript under `sessions/`, where short turns
 share a chunk); `semantic: false` with a `reason` means text only (no endpoint, or it failed). A note is found by
 text right after it is written; embeddings follow in the background (at tool start and every
 `DISCORD_TOOL_INDEX_EVERY_MS`, default 10 minutes; `unembedded` counts what is still waiting). Only new or changed

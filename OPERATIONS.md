@@ -31,6 +31,7 @@ idle makes install verification unambiguous.
 Run in bash; replace the revision with the exact approved commit:
 
 ```bash
+(
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 cd "$HOME/work/shell-network"
@@ -41,6 +42,7 @@ test ! -e "$RELEASE_DIR"
 mkdir -p "$RELEASE_DIR"
 git archive "$RELEASE_COMMIT" | tar -x -C "$RELEASE_DIR"
 (cd "$RELEASE_DIR" && npm ci --omit=dev)
+)
 ```
 
 If that exact release already exists, inspect it; do not overwrite a running release.
@@ -51,6 +53,9 @@ These commands change only the two bridge unit overrides. Watchdog and provider
 MCP code have separate version pins; see below when the release changes them.
 
 ```bash
+# Step 1 ran in a subshell. Use the same approved commit here.
+export RELEASE_COMMIT="$(git -C "$HOME/work/shell-network" rev-parse 'APPROVED_COMMIT^{commit}')"
+export RELEASE_DIR="$HOME/.local/lib/t3-bridge/$RELEASE_COMMIT"
 export RELEASE_BACKUP="$HOME/backups/shell-network-$(date -u +%Y%m%dT%H%M%SZ)"
 python3 - <<'PY'
 import json, os, pathlib, shutil, sqlite3, subprocess
@@ -115,7 +120,8 @@ provider/model: the current `/status` does not report the executed model.
 
 ## 4. Roll back code, retaining live state
 
-Set `RELEASE_BACKUP` to the saved absolute backup path. Use the same quiet-window
+Set `RELEASE_BACKUP` to the saved absolute backup path, including in a new SSH
+session (`export RELEASE_BACKUP="/absolute/path/to/saved/backup"`). Use the same quiet-window
 and idle checks above. Restore only the two overrides, never the whole config or DB:
 
 ```bash
@@ -164,6 +170,9 @@ other operators' changes; revert only this release's fields if any were changed.
 Changing code does not remove registered commands. Before rolling back to code
 without slash handlers, run the **slash-capable** release's helper for both apps.
 The helper removes all global commands of the selected app, not just these two.
+In a new SSH session, set `RELEASE_DIR` again to the installed **slash-capable**
+release (`export RELEASE_DIR="$HOME/.local/lib/t3-bridge/<commit>"`), not the
+pre-slash rollback target. Set `RELEASE_BACKUP` again too if continuing into rollback.
 Keep the bridges stopped while clearing; use the owning bot's env, whose token is a
 file path. These installed env files are trusted shell assignments:
 

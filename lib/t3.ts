@@ -22,8 +22,10 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
       return await mcp.call(name, args, { thread: (args.threadId as string | undefined) ?? null, label });
     } catch (e) {
       if (isTransportError(e)) {
-        log.emit("bridge.mcp_reconnect", { tool: name, error: errText(e) });
-        await mcp.reconnect(sid).catch((r) => log.emit("mcp.reconnect_failed", { tool: name, error: errText(r) }));
+        // an archive read's error may quote the conversation (an HTTP answer body): a fixed text for those
+        const quiet = label === "bridge-archive-read";
+        log.emit("bridge.mcp_reconnect", { tool: name, error: quiet ? "[archive read failed]" : errText(e) });
+        await mcp.reconnect(sid).catch((r) => log.emit("mcp.reconnect_failed", { tool: name, error: quiet ? "[reconnect failed]" : errText(r) }));
       }
       throw e;
     }

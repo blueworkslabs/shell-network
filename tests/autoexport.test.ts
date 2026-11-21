@@ -183,3 +183,17 @@ test("MCP LOG: archive reads are logged by size only, a failure with a fixed tex
   assert.equal(events[1].d.error, "[archive read failed]");
   assert.deepEqual(events[3].d.result, { runId: "r" }, "kept tools stay in full");
 });
+
+test("RECONNECT LOG: a transport error of an archive read is logged with a fixed text, also when the reconnect fails; other calls keep their error", async () => {
+  const { t3Adapter } = await import("../lib/t3.ts");
+  const { memoryLog } = await import("../lib/log.ts");
+  const log = memoryLog();
+  const raw = { sessionId: "s", call: async () => { throw new Error("HTTP 503 Service Unavailable: amber secret from the thread"); }, reconnect: async () => { throw new Error("reconnect refused: amber secret"); } };
+  const a = t3Adapter({ mcp: raw, policy: { projectId: "p", instanceId: "i", boundThread: () => "bound", archivedThreads: () => ["old"] }, log });
+  await assert.rejects(a.readArchived({ threadId: "old", view: "messages", limit: 100, runLimit: 1, maxCharsPerItem: 20_000 }));
+  const events = log.events.filter((e) => e.event === "bridge.mcp_reconnect" || e.event === "mcp.reconnect_failed");
+  assert.equal(events.length, 2, "both events were written");
+  assert.ok(!JSON.stringify(log.events).includes("amber"), JSON.stringify(log.events));
+  await assert.rejects(a.read("bound"));
+  assert.match(String(log.events.filter((e) => e.event === "bridge.mcp_reconnect").at(-1)!.error), /HTTP 503/, "other reads keep the error for diagnosis");
+});

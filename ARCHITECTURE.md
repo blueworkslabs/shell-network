@@ -79,6 +79,13 @@ The first batch of the fresh thread starts with a line telling the agent to read
 while one is pending is ignored. Nothing is force-cut: a turn that never ends keeps the reset waiting. Archived threads
 stay readable by id in t3, but are excluded from its native search; there is no `/resume` or unarchive yet.
 
+**Export after `/new`** (#50): with `BRIDGE_NOTES_DIR` (the bot's notes root, the same as the tool's `DISCORD_TOOL_NOTES`)
+every thread of the conversation's `archived` ledger is exported into `sessions/` once no reset is pending: read from t3
+in the messages view (both pagination levels; the allowlist admits the ledger's threads for that view only) and written by
+the transcript importer, which finds an existing file by its session id. A marker in kv (`exported:<thread>`) is set after
+the write, so a crash in between repeats an unchanged write: one file per thread. It runs beside the step loop and never
+holds up the fresh session; a failure is retried with backoff and shows in `/status`. The memory index picks the file up.
+
 ## Conversation history (t3 0.1.11, checked 2026-11-21)
 
 `t3_thread_search` searches non-archived threads by title/branch/PR/project and message text, not only titles.

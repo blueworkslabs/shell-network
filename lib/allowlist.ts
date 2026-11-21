@@ -7,7 +7,8 @@
 //   - launch: only in the configured project, on the configured provider instance, and only while no thread is bound;
 //   - list: only the configured project;
 //   - read / queue_list / send: only the bound thread (the bot's one thread); send only with mode "queue" and a
-//     clientRequestId;
+//     clientRequestId; read also a thread of the conversation's own `archived` ledger, but then only the "messages" view
+//     with its text continuation (the export of an archived session into sessions/, #50);
 //   - organize: only action "archive", only on the bound thread (/new; no unarchive, pin, settle or other action).
 // It constrains the bridge's code, not the token: the token's own authority is checked on the t3 host, and the token file
 // must stay out of reach of the provider processes (both outside this module).
@@ -22,9 +23,10 @@ export class ToolDenied extends Error {
 }
 
 type Check = (v: unknown) => boolean;
-interface Rule { args: Record<string, Check>; required: string[]; when?: () => string | null }
+interface Rule { args: Record<string, Check>; required: string[]; when?: (args: Record<string, unknown>) => string | null }
 export type Rules = Record<string, Rule>;
-export interface AllowlistPolicy { projectId: string; instanceId: string; boundThread: () => string | null }
+// archivedThreads: the conversation's own archived threads (its `archived` ledger), readable for the export after /new
+export interface AllowlistPolicy { projectId: string; instanceId: string; boundThread: () => string | null; archivedThreads?: () => string[] }
 // The part of the MCP client the allowlist wraps.
 export interface McpLike {
   sessionId: string | null;
@@ -40,6 +42,7 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
   const { projectId, instanceId, boundThread } = policy ?? ({} as Partial<AllowlistPolicy>);
   if (!isStr(projectId) || !isStr(instanceId) || typeof boundThread !== "function") throw new Error("allowlist: projectId, instanceId and boundThread required");
   const ownThread: Check = (v) => isStr(v) && v === boundThread();
+  const archived = (v: unknown) => isStr(v) && v !== boundThread() && (policy.archivedThreads?.() ?? []).includes(v);
   return {
     t3_thread_launch: {
       args: {
@@ -56,8 +59,13 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
       required: ["projectId", "titleContains"],
     },
     t3_thread_read: {
-      args: { threadId: ownThread, view: (v) => v === "activity", limit: isInt(1, 100), runLimit: isInt(1, 50), maxCharsPerItem: isInt(1, 50_000), afterPosition: isInt(-1, Number.MAX_SAFE_INTEGER) },
+      args: { threadId: (v) => ownThread(v) || archived(v), view: (v) => v === "activity" || v === "messages", limit: isInt(1, 100), runLimit: isInt(1, 50),
+        maxCharsPerItem: isInt(1, 50_000), afterPosition: isInt(-1, Number.MAX_SAFE_INTEGER), itemId: isStr, textOffset: isInt(1, Number.MAX_SAFE_INTEGER) },
       required: ["threadId"],
+      // the bound thread: the activity view only, as before; an archived thread: the messages view (with continuation) only
+      when: (a) => ownThread(a.threadId)
+        ? (a.view === "activity" || a.view === undefined) && a.itemId === undefined && a.textOffset === undefined ? null : "the bound thread is read in the activity view only"
+        : a.view === "messages" ? null : "an archived thread is read in the messages view only",
     },
     t3_queue: {
       args: { action: (v) => v === "list", threadId: ownThread, cursor: isInt(0, Number.MAX_SAFE_INTEGER), limit: isInt(1, 100) },
@@ -103,7 +111,7 @@ export function checkCall(rules: Rules, name: string, args: unknown): void {
     if (!rule.args[k](a[k])) throw new ToolDenied(name, `argument ${k} outside the allowed values`);
   }
   for (const k of rule.required) if (!Object.hasOwn(a, k)) throw new ToolDenied(name, `argument ${k} required`);
-  const why = rule.when?.();
+  const why = rule.when?.(a);
   if (why) throw new ToolDenied(name, why);
 }
 

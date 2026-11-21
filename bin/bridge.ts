@@ -15,12 +15,14 @@
 //   BRIDGE_ALLOWED_AUTHORS   comma-separated Discord user ids whose mentions are accepted (the user only);
 //                            everyone else is dropped before the buffer
 //   BRIDGE_EXCHANGE_CAP      optional, bot-to-bot messages without a human message between (default 2, 0 = off)
+//   BRIDGE_NOTES_DIR         optional, absolute path of the bot's notes root (the Discord tool's DISCORD_TOOL_NOTES):
+//                            threads archived by /new are exported into its sessions/ (#50)
 //   BRIDGE_DM_USERS          optional, comma-separated user ids (each also in BRIDGE_ALLOWED_AUTHORS) whose DMs this bot
 //                            serves, each DM as its own conversation; other people's DMs are ignored and logged
 // Secret files must be the bridge user's own, without group/other bits, in such a directory (lib/preflight.ts).
 // Writer lock: `<directory of BRIDGE_DB>/<bot>.lock.db`, held for the life of the process (lib/lock.ts); a second
 // bridge for the same bot exits with status 4 ("lease held"). Ops starts the successor once the holder has exited.
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { openBuffer } from "../lib/buffer.ts";
 import { acquireBotLock, LockHeldError, type BotLock } from "../lib/lock.ts";
@@ -95,6 +97,8 @@ const mcpLog = { emit: (e: string, d: LogFields = {}) => log.emit(e, e === "call
 const mcp = new McpClient({ log: mcpLog, token: loadToken(), clientName: "t3-crew-bridge" });
 await mcp.connect();
 const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
+const notesRoot = process.env.BRIDGE_NOTES_DIR || undefined;
+if (notesRoot !== undefined && (!notesRoot.startsWith("/") || !(() => { try { return lstatSync(notesRoot).isDirectory(); } catch { return false; } })())) { console.error("BRIDGE_NOTES_DIR: an absolute path of an existing directory (not a symlink)"); process.exit(2); }
 let dmUserIds: string[];
 try { dmUserIds = dmUsers(process.env.BRIDGE_DM_USERS, allowedAuthors); } catch (e) { console.error((e as Error).message); process.exit(2); }
 // writes: the bot's channels, its DM channels (opened below), and threads its tool created in a channel
@@ -122,10 +126,12 @@ for (const [i, channelId] of conversations.entries()) {
   const botRoleId = dm ? null : await managedRole({ discord, channelId, botUserId: cfg.id, log });
   const channelName = dm ? "dm" : await discord.getChannel(channelId).then((c) => c.name ?? channelId, () => channelId);
   // MCP allowlist: this project, this instance, this conversation's one thread (kv, set once launched/adopted)
-  const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`) };
+  const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`),
+    // the conversation's own archived threads (its /new ledger), readable for the export only
+    archivedThreads: () => (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) };
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, dm,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, dm, notesRoot,
     buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
 }

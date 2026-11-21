@@ -75,5 +75,6 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
       return call("t3_thread_send", { threadId, message, mode, clientRequestId }, "bridge-send");
     },
     archive: (threadId: string) => call("t3_thread_organize", { action: "archive", threadId }, "bridge-archive"),
+    readArchived: (args) => call("t3_thread_read", args, "bridge-archive-read"),
   };
 }

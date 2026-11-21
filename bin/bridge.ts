@@ -136,7 +136,8 @@ const loop = stepLoop({ step: stepAll(bots, log, conversations), tickMs, log });
 const nudge = loop.nudge;
 
 // Slash commands (`/new`, `/status`): answered per interaction, by the bot of the interaction's channel (lib/commands.ts).
-const interact = interactionDispatch({ port: discord.interactions, bots: new Map(bots.map((b, i) => [conversations[i], b])), allowedAuthors, nudge, log });
+// guild channels only: the slash commands are guild-only, and a DM conversation is never a command target
+const interact = interactionDispatch({ port: discord.interactions, bots: new Map(bots.map((b, i) => [conversations[i], b] as const).filter(([ch]) => !dmChannels.has(ch))), allowedAuthors, nudge, log });
 const dmIgnored = dmIgnoredDispatch({ known: new Set(conversations), log });
 // Catch-up runs inside the step loop (single flight); every new live session (READY/RESUMED) closes the dispatch
 // gate until a catch-up has completed within it.

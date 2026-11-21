@@ -26,6 +26,12 @@ test("OPEN: the DM channel comes from Discord; a user whose DM cannot be opened 
   const discord = { async openDm(userId: string) { if (userId === "2") throw new Error("Cannot send messages to this user"); if (userId === "3") return { id: "55", type: 0 }; return { id: DM_CH, type: 1 }; } };
   assert.deepEqual(await openDms({ discord, users: [HUMAN_ID, "2", "3"], log }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
   assert.equal(log.events.filter((e) => e.event === "bridge.dm_open_failed").length, 2, "a failed open and a channel that is not a DM");
+  // a lookup that never answers is given up after the bound; the next user is still opened
+  const slow = { async openDm(userId: string) { return userId === "4" ? new Promise<never>(() => {}) : { id: DM_CH, type: 1 }; } };
+  const t0 = Date.now();
+  assert.deepEqual(await openDms({ discord: slow, users: ["4", HUMAN_ID], log, timeoutMs: 50 }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
+  assert.ok(Date.now() - t0 < 2000);
+  assert.match(String(log.events.at(-1)!.error), /timed out/);
 });
 
 test("REST: openDm posts to /users/@me/channels; a DM channel is writable only once the bridge admits it", async () => {
@@ -96,6 +102,8 @@ test("DM from anyone else: ignored and logged without its text; a stranger insid
   const ev = w.log.events.find((e) => e.event === "bridge.dm_ignored")!;
   assert.deepEqual([ev.channelId, ev.authorId], [OTHER_DM, STRANGER_ID]);
   assert.ok(!JSON.stringify(w.log.events).includes("let me in"), "the text is not logged");
+  for (let i = 0; i < 5; i++) await w.deliver(w.discord.userSays(`spam ${i}`, { channel: OTHER_DM, mention: false, author: "stranger", authorId: STRANGER_ID }));
+  assert.equal(w.log.events.filter((e) => e.event === "bridge.dm_ignored").length, 1, "once per sender");
   assert.equal((await w.dm.accept(w.discord.userSays("hi", { channel: DM_CH, mention: false, author: "stranger", authorId: STRANGER_ID }))).reason, "sender not allowed");
   // guild messages and bot messages are not DMs to report
   await w.deliver({ ...w.discord.userSays("x", { channel: "100000000000000099", mention: false }), guild_id: "1" });

@@ -67,22 +67,28 @@ export function dmUsers(value: string | undefined, allowedAuthors: string[]): st
 }
 // The DM channel per user, from Discord (POST /users/@me/channels answers with the same channel every time). A user whose
 // DM cannot be opened is logged and left out; the guild channels go on without it.
-export async function openDms({ discord, users, log }: { discord: Pick<DiscordRest, "openDm">; users: string[]; log: Log }): Promise<{ userId: string; channelId: string }[]> {
+// Each lookup is bounded (timeoutMs), so a slow Discord cannot hold up the guild channels' start.
+export async function openDms({ discord, users, log, timeoutMs = 10_000 }: { discord: Pick<DiscordRest, "openDm">; users: string[]; log: Log; timeoutMs?: number }): Promise<{ userId: string; channelId: string }[]> {
   const out: { userId: string; channelId: string }[] = [];
   for (const userId of users) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const ch = await discord.openDm(userId);
+      const ch = await Promise.race([discord.openDm(userId), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), timeoutMs); })]);
       if (typeof ch?.id !== "string" || !/^\d{1,25}$/.test(ch.id) || (ch.type !== undefined && ch.type !== 1)) throw new Error("not a DM channel");
       out.push({ userId, channelId: ch.id });
-    } catch (e) { log.emit("bridge.dm_open_failed", { error: errText(e) }); }
+    } catch (e) { log.emit("bridge.dm_open_failed", { error: errText(e) }); } finally { clearTimeout(timer); }
   }
   return out;
 }
 // A DM that no conversation owns (someone else writing to the bot) is dropped like any other channel's message; this
-// logs it, without its text.
+// logs it, without its text, once per sender and process, so a stranger cannot flood the log.
 export function dmIgnoredDispatch({ known, log }: { known: Set<string>; log: Log }): (type: string, d: any) => void {
+  const seen = new Set<string>();
   return (type, d) => {
     if (type !== "MESSAGE_CREATE" || d?.guild_id || typeof d?.channel_id !== "string" || known.has(d.channel_id) || d?.author?.bot) return;
+    const sender = typeof d?.author?.id === "string" ? d.author.id : d.channel_id;
+    if (seen.has(sender)) return;
+    seen.add(sender);
     log.emit("bridge.dm_ignored", { channelId: d.channel_id, authorId: typeof d?.author?.id === "string" ? d.author.id : null });
   };
 }

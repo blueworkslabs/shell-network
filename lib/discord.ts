@@ -11,6 +11,7 @@ import { API, GatewayIntentBits, type RESTPostAPIChannelMessageJSONBody } from "
 import { REST, type RESTOptions } from "@discordjs/rest";
 import { WebSocketManager, WebSocketShardEvents } from "@discordjs/ws";
 import { errText } from "./log.ts";
+import type { CommandBody, CommandsPort, ExistingCommand, InteractionPort } from "./commands.ts";
 import type { CreateMessagePayload, DiscordMessage, DiscordPort, Log } from "./types.ts";
 
 export const INTENTS = GatewayIntentBits.Guilds | GatewayIntentBits.GuildMessages | GatewayIntentBits.MessageContent;
@@ -20,10 +21,16 @@ const FATAL_CLOSE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 // The only Discord surface handed to bridge code: the guarded port. No raw request client is reachable through it;
 // the gateway builds its own REST for /gateway/bot.
 export interface DiscordRole { id: string; tags?: { bot_id?: string } }
-export interface DiscordRest extends DiscordPort {
+// commands: this application's own global slash commands only (its id is read from Discord, never passed in);
+// interactions: answers to an interaction by its id and token (ephemeral, never a channel post).
+export interface DiscordRest extends DiscordPort, CommandsPort {
   guildRoles(guildId: string): Promise<DiscordRole[]>;
   me(): Promise<{ id: string; [k: string]: unknown }>;
+  interactions: InteractionPort;
 }
+const EPHEMERAL = 64;
+const SNOWFLAKE = /^\d{1,25}$/, INTERACTION_TOKEN = /^[A-Za-z0-9._-]{1,1000}$/;
+const clip = (s: string) => (s.length > 1900 ? `${s.slice(0, 1900)}…` : s);
 const makeRest = ({ token, makeRequest, api, timeoutMs = 15_000 }: { token: string; makeRequest?: RESTOptions["makeRequest"]; api?: string; timeoutMs?: number }) =>
   // retries: 0 — no hidden repeats of a timed-out POST; the bridge's own recovery decides (reply lookup, nonce).
   new REST({ version: "10", timeout: timeoutMs, retries: 0, ...(makeRequest ? { makeRequest } : {}), ...(api ? { api } : {}) }).setToken(token);
@@ -41,7 +48,30 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
   const rest = makeRest({ token, makeRequest, api: apiBase, timeoutMs });
   rest.on("rateLimited", (info) => log?.emit("discord.rate_limited", { method: info.method, route: info.route, waitMs: info.retryAfter, global: info.global }));
   const api = new API(rest);
+  // This application's id (not assumed to be the bot user's), read once; a failed read is tried again next time.
+  let appId: string | null = null;
+  const application = async (): Promise<{ id: string }> => {
+    if (appId === null) {
+      const a = await api.applications.getCurrent();
+      if (typeof a?.id !== "string" || !SNOWFLAKE.test(a.id)) throw new Error("applications/@me: no application id");
+      appId = a.id;
+    }
+    return { id: appId };
+  };
+  const callback = (interactionId: string, token: string) => {
+    if (!SNOWFLAKE.test(interactionId) || !INTERACTION_TOKEN.test(token)) throw new Error("interaction id or token malformed");
+  };
   return Object.freeze({
+    application,
+    listCommands: async () => api.applicationCommands.getGlobalCommands((await application()).id) as unknown as Promise<ExistingCommand[]>,
+    createCommand: async (body: CommandBody) => api.applicationCommands.createGlobalCommand((await application()).id, body as never),
+    editCommand: async (id: string, body: CommandBody) => { if (!SNOWFLAKE.test(id)) throw new Error("command id malformed"); return api.applicationCommands.editGlobalCommand((await application()).id, id, body as never); },
+    deleteCommand: async (id: string) => { if (!SNOWFLAKE.test(id)) throw new Error("command id malformed"); return api.applicationCommands.deleteGlobalCommand((await application()).id, id); },
+    interactions: Object.freeze({
+      reply: (interactionId: string, token: string, content: string) => { callback(interactionId, token); return api.interactions.reply(interactionId, token, { content: clip(content), flags: EPHEMERAL, allowed_mentions: { parse: [] } }); },
+      defer: (interactionId: string, token: string) => { callback(interactionId, token); return api.interactions.defer(interactionId, token, { flags: EPHEMERAL }); },
+      edit: async (token: string, content: string) => { callback("0", token); return api.interactions.editReply((await application()).id, token, { content: clip(content), allowed_mentions: { parse: [] } }); },
+    }),
     guildRoles: (guildId: string) => api.guilds.getRoles(guildId),
     me: () => api.users.getCurrent() as unknown as Promise<{ id: string; [k: string]: unknown }>,
     // nonce + enforce_nonce: Discord returns the already-created message for a repeated nonce (dedupe window of a

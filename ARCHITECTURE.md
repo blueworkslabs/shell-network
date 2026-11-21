@@ -179,7 +179,8 @@ t3 `thread.updated` events, and the idle tick stays as a fallback.
   CDN hosts, at most 10 are listed. A mention with only files is not a bare mention. The unread header names files of
   unaddressed messages. The bridge downloads nothing. *Outbound:* `discord_send` takes `files` (at most 4 paths, 8 MiB in
   all). The tool, which has no Discord credential, resolves each path (symlinks included): it must be inside
-  `DISCORD_TOOL_WORKSPACE` and a regular file. It copies the files into `attachments/` next to the buffer DB (0700) and
+  `DISCORD_TOOL_WORKSPACE` and a regular file (the type is checked before anything is opened, so a FIFO cannot block
+  the tool while it holds the DB writer lock; names are kept at their last 80 characters). It copies the files into `attachments/` next to the buffer DB (0700) and
   the outbox entry names the copies in `meta.files`. Right before the POST the bridge validates every entry with a
   `files` key again (strict staged name, inside the staging directory, plain file, same limits), uploads the bytes with
   `createMessage` and removes the copies once the post is recorded; a failing check drops the entry. The text may be

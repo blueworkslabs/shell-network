@@ -3,6 +3,7 @@
 // them again and uploads them exactly once; paths stay inside the workspace.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { type Buffer } from "../lib/buffer.ts";
@@ -155,6 +156,34 @@ test("OUTBOUND limits: another directory, a symlink out, a directory, a missing 
   refused(noWs, ["ok.txt"], /not enabled/);
   assert.equal(safeName("../../etc/pass wd"), "__.._etc_pass_wd", "names cannot move a path");
   assert.equal(safeName(""), "file");
+});
+
+test("OUTBOUND FIFO: a named pipe in the workspace is refused at once, without opening it (it would block while the tool holds the DB writer lock)", { timeout: 10_000 }, async () => {
+  const w = world();
+  execFileSync("mkfifo", [join(w.ws, "pipe.txt")]);
+  refused(w, ["pipe.txt"], /not a regular file/);
+  // the tool is still usable: the writer lock was not held up
+  writeFileSync(join(w.ws, "ok.txt"), "ok");
+  send(w, ["ok.txt"], "after the pipe");
+  await w.steps(2);
+  assert.equal(w.discord.botPosts().length, 1);
+});
+
+test("OUTBOUND long names: a 94-character file name is cut the same way when staged, uploaded and found again after a crash", async () => {
+  const w = world({ nonceWindow: false });
+  const long = `${"n".repeat(90)}.txt`;
+  assert.equal(long.length, 94);
+  writeFileSync(join(w.ws, long), "long name");
+  send(w, [long], "");
+  w.discord.crash.post = "after";
+  await assert.rejects(w.steps(2), /CRASH/);
+  w.restart();
+  w.bot.initWatermark(1_792_500_000_000 - 60_000);
+  await w.steps(4);
+  const posts = w.discord.botPosts();
+  assert.equal(posts.length, 1, "found again, not posted twice");
+  assert.equal(posts[0].attachments![0].filename, long.slice(-80), "the tail is kept, so the extension stays");
+  assert.deepEqual(w.staged(), []);
 });
 
 test("OUTBOUND replay: the same idempotency key stages nothing twice and returns the first result", async () => {

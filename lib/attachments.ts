@@ -31,7 +31,7 @@ type Att = NonNullable<DiscordMessage["attachments"]>[number];
 export function attachmentLines(atts: DiscordMessage["attachments"]): string[] {
   if (!Array.isArray(atts) || !atts.length) return [];
   const lines = atts.slice(0, ATTACH_LIST_MAX).map((a: Att) => {
-    const name = flat(typeof a?.filename === "string" && a.filename ? a.filename : "file", 80);
+    const name = flat(typeof a?.filename === "string" && a.filename ? a.filename : "file", NAME_MAX);
     const type = typeof a?.content_type === "string" && MIME.test(a.content_type) ? a.content_type : "unknown type";
     const url = typeof a?.url === "string" && CDN.test(a.url) ? ` ${a.url}` : "";
     return `[attachment: ${name} (${type}, ${sizeText(a?.size)})${url}]`;
@@ -41,12 +41,14 @@ export function attachmentLines(atts: DiscordMessage["attachments"]): string[] {
 }
 // Names only, for the unread header and the post search: "a.png, b.pdf".
 export const attachmentNames = (atts: DiscordMessage["attachments"]): string[] =>
-  (Array.isArray(atts) ? atts : []).slice(0, ATTACH_LIST_MAX).map((a) => (typeof a?.filename === "string" ? flat(a.filename, 80) : "file"));
+  (Array.isArray(atts) ? atts : []).slice(0, ATTACH_LIST_MAX).map((a) => (typeof a?.filename === "string" ? flat(a.filename, NAME_MAX) : "file"));
 
 // ---- outbound ----
 // A file name that survives Discord unchanged (it turns spaces into underscores) and cannot move a path.
-export const safeName = (n: string): string => flat(n, 400).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(-100) || "file";
-const STAGED = /^[0-9a-f]{24}\/\d-[A-Za-z0-9._-]{1,100}$/, STAGED_NAME = /^[A-Za-z0-9._-]{1,100}$/, STAGED_DIR = /^[0-9a-f]{24}$/;
+// At most NAME_MAX characters (the tail, so the extension stays): the same length the post search compares by.
+export const NAME_MAX = 80;
+export const safeName = (n: string): string => flat(n, 400).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(-NAME_MAX) || "file";
+const STAGED = new RegExp(`^[0-9a-f]{24}/\\d-[A-Za-z0-9._-]{1,${NAME_MAX}}$`), STAGED_NAME = new RegExp(`^[A-Za-z0-9._-]{1,${NAME_MAX}}$`), STAGED_DIR = /^[0-9a-f]{24}$/;
 export interface StagedFile { staged: string; name: string; size: number }
 const inside = (root: string, p: string) => p.startsWith(root.endsWith(sep) ? root : root + sep);
 
@@ -61,9 +63,12 @@ export function stageFiles({ paths, workspace, stagingDir }: { paths: string[]; 
     let real: string;
     try { real = realpathSync(resolve(root, p)); } catch { throw new Error(`files[${i}]: no such file`); }
     if (!inside(root, real)) throw new Error(`files[${i}]: not inside the workspace`);
+    // The type is checked before anything is opened: opening a FIFO would block while the caller holds the DB's writer lock.
+    // O_NONBLOCK keeps even a file swapped for a FIFO in between from blocking; O_NOFOLLOW refuses a symlink swapped in.
+    try { if (!statSync(real).isFile()) throw new Error(`files[${i}]: not a regular file`); } catch (e) { throw e instanceof Error && e.message.startsWith("files[") ? e : new Error(`files[${i}]: cannot be read`); }
     let fd: number | null = null;
     try {
-      fd = openSync(real, constants.O_RDONLY | constants.O_NOFOLLOW); // the path has no symlink left; this refuses one swapped in since
+      fd = openSync(real, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const st = fstatSync(fd);
       if (!st.isFile()) throw new Error(`files[${i}]: not a regular file`);
       if (st.size > ATTACH_MAX_BYTES) throw new Error(`files[${i}]: ${st.size} bytes; at most ${ATTACH_MAX_BYTES} in all`);

@@ -91,10 +91,11 @@ No bot-to-bot cap applies (no crew bot is in a DM). Text `/new` works there; the
 gateway asks for the `DIRECT_MESSAGES` intent, which is not privileged. All DM lookups together get 10 seconds at
 startup; a request still running at the deadline is aborted and its user left out until the next start.
 
-Privacy limit: the bot's Discord tool is one process per agent, shared by all its conversations, so a turn in a guild
-channel can still read or post to the DM channel when it names its id explicitly. The DM's text never enters a guild
-thread by itself (separate thread and header), but nothing stops the agent from looking; DMs are private from other
-people, not from the bot's other conversations.
+By design, a DM is one more conversation of the same agent, not a separate agent. Its Discord tool, notes and memory
+are shared with the agent's other conversations, so a guild turn can read the DM channel by naming its id, and what
+the agent learns in a DM can reach its notes. The DM's text never enters a guild thread by itself (separate thread and
+header). DMs are private from other people, not from the agent; keeping them out of public channels is a persona
+rule. Do not enable DMs for an agent that serves untrusted channels.
 
 ## Slash commands (`lib/commands.ts`)
 

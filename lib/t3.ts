@@ -22,8 +22,10 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
       return await mcp.call(name, args, { thread: (args.threadId as string | undefined) ?? null, label });
     } catch (e) {
       if (isTransportError(e)) {
-        log.emit("bridge.mcp_reconnect", { tool: name, error: errText(e) });
-        await mcp.reconnect(sid).catch((r) => log.emit("mcp.reconnect_failed", { tool: name, error: errText(r) }));
+        // an archive read's error may quote the conversation (an HTTP answer body): a fixed text for those
+        const quiet = label === "bridge-archive-read";
+        log.emit("bridge.mcp_reconnect", { tool: name, error: quiet ? "[archive read failed]" : errText(e) });
+        await mcp.reconnect(sid).catch((r) => log.emit("mcp.reconnect_failed", { tool: name, error: quiet ? "[reconnect failed]" : errText(r) }));
       }
       throw e;
     }
@@ -75,5 +77,17 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
       return call("t3_thread_send", { threadId, message, mode, clientRequestId }, "bridge-send");
     },
     archive: (threadId: string) => call("t3_thread_organize", { action: "archive", threadId }, "bridge-archive"),
+    readArchived: (args) => call("t3_thread_read", args, "bridge-archive-read"),
   };
+}
+
+// The MCP client logs every call. Read-type results are reduced to their size (the bridge reads the whole thread every
+// tick); `keep` names tools whose results stay in full as evidence (sends, launches). Archive reads (the export after
+// /new) carry conversation text in results and failures alike: sizes only, and a fixed text for a failure.
+export function mcpCallLog(log: Log, keep: Set<string>): Log {
+  const size = (v: unknown) => `[${JSON.stringify(v ?? null).length} bytes]`;
+  return { emit: (e, d = {}) => {
+    if (d.label === "bridge-archive-read" && (e === "call.end" || e === "call.error")) return log.emit(e, { ...d, result: size(d.result), ...(d.error !== undefined ? { error: "[archive read failed]" } : {}) });
+    return log.emit(e, e === "call.end" && !keep.has(d.tool as string) ? { ...d, result: size(d.result) } : d);
+  } };
 }

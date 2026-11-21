@@ -226,4 +226,6 @@ export interface T3Port {
   send(args: { threadId: string; message: string; mode: "queue"; clientRequestId: string }): Promise<{ messageId?: string; runId?: string; delivery?: string }>;
   // /new: archive the bot's own (bound) thread; archived threads stay readable by id (native search excludes them)
   archive(threadId: string): Promise<unknown>;
+  // the export after /new: one page of an archived thread in the messages view (lib/t3-transcript.ts)
+  readArchived(args: { threadId: string; view: "messages"; limit: number; runLimit: number; maxCharsPerItem: number; afterPosition?: number; itemId?: string; textOffset?: number }): Promise<unknown>;
 }

@@ -21,6 +21,8 @@
 //     (marker set before the post; the search resumes across steps and only a search that reached the end of the
 //     channel counts as "absent"), and never repeated after it was recorded. Replies post in batch order.
 import { reconcileBatch, messageIdMatchesRequest, settlement } from "./reconcile.ts";
+import { readArchivedTranscript } from "./t3-transcript.ts";
+import { importTranscripts } from "./transcript-import.ts";
 import { attachmentLines, attachmentNames, readStaged, removeStaged, type StagedFile } from "./attachments.ts";
 import { errText } from "./log.ts";
 import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./stuck.ts";
@@ -51,6 +53,8 @@ export interface BotOptions {
   allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
   // the bot's DM with the user: every message of an allowlisted person is addressed to the bot (no mention needed)
   dm?: boolean;
+  // the bot's notes root (the tool's DISCORD_TOOL_NOTES): archived sessions are exported into its sessions/ (#50); none = no export
+  notesRoot?: string;
   // where the Discord tool stages the files of a tool post for this bridge to upload (lib/attachments.ts); none = tool posts with files are dropped
   attachmentsDir?: string;
 }
@@ -73,7 +77,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, dm = false }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, dm = false, notesRoot }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -166,7 +170,47 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})` : "none pending"}`,
+      ...(notesRoot ? [`Archive export: ${pendingExports().length} pending${exportState.lastError ? `; last error: ${exportState.lastError}` : ""}`] : []),
       `Bot-to-bot messages since the last message from a person or talk-only member: ${exchangeCap > 0 ? `${n} of ${exchangeCap}` : `${n} (no cap)`}`].join("\n");
+  }
+  // ---- export of archived sessions into sessions/ (#50) ----
+  // Every thread of the conversation's `archived` ledger without an export marker (kv `exported:<thread>`, set after the
+  // file is written) is read from t3 (messages view, both pagination levels) and written by the transcript importer, which
+  // finds an existing file by its session id: a crash between the write and the marker repeats an unchanged write, still
+  // one file. A thread that yields no messages is a failure, not an empty export. Runs beside the step loop, single flight, only while no reset is pending; a failure waits (backoff) and is
+  // retried, and shows in /status. The log carries counts and thread ids, never text.
+  class ExportError extends Error {}
+  const exportState: { running: Promise<void> | null; failures: number; nextAt: number; lastError: string | null } = { running: null, failures: 0, nextAt: 0, lastError: null };
+  const pendingExports = (): string[] => (notesRoot ? (JSON.parse(buffer.kvGet(K("archived")) ?? "[]") as { threadId: string }[]).map((a) => a.threadId).filter((id) => !buffer.kvGet(K(`exported:${id}`))) : []);
+  function exportArchived(): void {
+    if (!notesRoot || exportState.running || resetState() || now() < exportState.nextAt) return;
+    const todo = pendingExports();
+    if (!todo.length) return;
+    exportState.running = (async () => {
+      for (const threadId of todo) {
+        let archive;
+        try { archive = await readArchivedTranscript({ threadId, projectId }, (args) => t3.readArchived(args)); }
+        catch (e) { throw new ExportError(/archived top-level|Invalid archive|continuation|cursor|item ID/.test(errText(e)) ? "unexpected t3 answer" : "t3 read failed"); }
+        const messages = archive.events.filter((e) => e.type === "message").length;
+        // an archived thread always holds at least the /new wrap-up turn: zero means every item was filtered out (an
+        // answer shape we do not know), so it stays pending and shows instead of being marked done
+        if (!messages) throw new ExportError("no messages kept (unexpected t3 answer)");
+        let written;
+        try { written = importTranscripts({ output: notesRoot, t3Archives: [archive] }); } catch { throw new ExportError("writing sessions/ failed"); }
+        // the importer leaves out a session that renders no turn: then nothing was exported, so no marker either
+        if (written.written + written.unchanged < 1) throw new ExportError("nothing to write (no rendered turns)");
+        buffer.kvSet(K(`exported:${threadId}`), String(messages));
+        log.emit("bridge.session_exported", { bot: name, threadId, messages });
+      }
+      exportState.failures = 0;
+      exportState.lastError = null;
+    })().catch((e) => {
+      exportState.failures++;
+      exportState.nextAt = now() + Math.min(3_600_000, 30_000 * 2 ** (exportState.failures - 1));
+      // fixed categories only: an error from t3 or the filesystem could carry text of the conversation
+      exportState.lastError = e instanceof ExportError ? e.message : "export failed";
+      log.emit("bridge.session_export_failed", { bot: name, error: exportState.lastError, failures: exportState.failures });
+    }).finally(() => { exportState.running = null; });
   }
   const isBusy = (read: ThreadRead) => Boolean(read.thread?.activeRunId) || (read.recentRuns ?? []).some((r) => !TERMINAL.has(r.status));
   // Advances the reset as far as it can in this step. Returns the limit for batching, or a result that ends the step.
@@ -783,6 +827,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     await drain();
     const reset = await resetStep(threadId, read);
     if (reset.done) return reset.done;
+    exportArchived(); // in the background: never holds up the fresh session
 
     const open = buffer.openBatches(conversationKey);
     if (open.length) {

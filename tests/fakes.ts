@@ -21,6 +21,9 @@ export interface FakeT3 {
   send(args: SendArgs): Promise<{ messageId: string; runId?: string; delivery?: string; status?: string }>;
   archiveError: string | null; // test control: archive fails with this message (once)
   archive(threadId: string): Promise<{ archived: true }>; // like t3: a second archive of a thread is an error
+  // the messages view of a thread (as live t3 answers it for an archived conversation), paged by `limit`
+  readArchived(args: { threadId: string; view: "messages"; limit: number; afterPosition?: number; itemId?: string; textOffset?: number }): Promise<unknown>;
+  archiveReadError: string | null; // test control: every readArchived fails with this message until cleared
   complete(threadId: string, runId: string, text: string | null): void;
   fail(threadId: string, runId: string, opts?: { holdQueue?: boolean }): void;
   resume(threadId: string): void; // t3's queue.resume: clears queueHeld on every queued run, then starts the next
@@ -94,6 +97,22 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       return { messageId, runId: run.runId, delivery, status: run.status };
     },
     archiveError: null,
+    archiveReadError: null,
+    async readArchived({ threadId, view, limit, afterPosition = -1 }) {
+      calls.push({ tool: "readArchived", threadId });
+      if (api.archiveReadError) throw new Error(api.archiveReadError);
+      if (view !== "messages") throw new Error("fake t3: readArchived wants the messages view");
+      const t = th(threadId);
+      const msgs = t.items.map((it, i) => ({ ...it, pos: i })).filter((it) => it.type === "user_message" || it.type === "assistant_message");
+      const page = msgs.filter((m) => m.pos > afterPosition).slice(0, limit);
+      const last = page.at(-1)?.pos ?? afterPosition;
+      return {
+        thread: { threadId, projectId: t.projectId, archived: t.archived === true, title: t.title, createdAt: "2026-11-21T10:00:00.000Z" },
+        items: page.map((m) => ({ itemId: `${threadId}#${m.pos}`, type: m.type, text: m.text, textTruncated: false, sourceThreadId: threadId, visibility: "local",
+          createdAt: new Date(Date.UTC(2026, 10, 21, 10, 0, m.pos)).toISOString() })),
+        hasMore: msgs.some((m) => m.pos > last), nextPosition: last,
+      };
+    },
     async archive(threadId) {
       calls.push({ tool: "archive", threadId });
       if (api.archiveError) { const m = api.archiveError; api.archiveError = null; throw new Error(m); }

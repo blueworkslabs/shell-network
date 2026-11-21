@@ -28,6 +28,11 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
     Discord) and answer an interaction by its id and token (checked for format); an interaction is answered only if it
     comes from an allowlisted person in one of the bot's channels, otherwise with an ephemeral refusal. Interaction
     tokens are never stored or logged.
+- **Memory search.** Optional `DISCORD_TOOL_NOTES` scopes read-only search to one bot's notes directory. The tool
+  accepts text queries, never caller-supplied paths; it skips symlinks, hardlinks, hidden and non-note files, checks
+  canonical paths and bounds reads/results. This is filesystem hygiene under the trusted-VM model, not isolation
+  against a process that can concurrently replace directory ancestors or change the provider environment. It adds no
+  credentials or network access.
 - **Secret handling.** Secrets are passed as file paths, never as values. At startup, each secret file must be a
   regular file (not a symlink) owned by the process user with no group/other permission bits, in a directory with the
   same properties. Otherwise the process does not start (`lib/preflight.ts`). Stuck alerts and notices never include

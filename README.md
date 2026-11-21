@@ -113,9 +113,32 @@ The full list of settings is in the header of each entrypoint:
 - `bin/bridge.ts`: one bot. A second bridge for the same bot exits with status 4, "lease held".
 - `bin/watchdog.ts`: settings `WATCHDOG_DB`, `WATCHDOG_LOG` and `WATCHDOG_OPERATE_TOKEN`.
 - `bin/discord-tool.ts`: configured in the t3 provider instance with `DISCORD_TOOL_BOT` and `DISCORD_TOOL_DB`. It
-  refuses to start if any of the bridge's secret variables are in its environment.
+  refuses to start if any of the bridge's secret variables are in its environment. Optionally set `DISCORD_TOOL_NOTES`
+  to an absolute directory containing only that bot's notes to enable the read-only `memory_search` tool.
 
 The `T1_` prefix on the t3 connection variables is historical.
+
+## Searching saved notes
+
+`memory_search({"query":"old project decision","max_results":10})` searches the notes directory configured by
+`DISCORD_TOOL_NOTES`. Queries are case-insensitive literal text, with up to 20 matching lines returned as relative
+file names, 1-based line numbers and excerpts. The tool reads current files on each call: new and edited notes need no
+index rebuild. Only non-hidden `.md` and `.txt` files are included; symlinks, hardlinks and binary files are skipped.
+It never searches another bot's notes or archived channel history.
+
+Search is bounded to 1,000 note files, 5,000 directory entries, eight directory levels, 256 KiB per file and 8 MiB per
+call. Excerpts are at most 402 characters including truncation marks. `incomplete: true` means a result limit, skipped
+unreadable/oversized file or search budget prevented a complete search; narrow the query or inspect the notes directly.
+An empty result with `incomplete: true` does not establish that the fact is absent.
+
+Installation: the external operator sets `DISCORD_TOOL_NOTES=/path/to/bot/notes` in each bot's existing MCP launch
+environment and reloads that tool process. Select only the bot's own notes directory, not a shared parent. Bridge
+restarts, database migrations and credentials are not needed. Without this optional setting the existing tool list is
+unchanged. Roll back by removing the setting and reloading the tool, or by restoring the previous release.
+
+Live check: after a fresh session, ask about a fact kept only in an old note. Verify that the bot calls `memory_search`
+and answers with the matching file and line. Automated tests cover that search through a fresh stdio tool process;
+they do not substitute for the provider's live tool configuration and recall check.
 
 ## Tests
 

@@ -69,20 +69,26 @@ export function dmUsers(value: string | undefined, allowedAuthors: string[]): st
 // DM cannot be opened is logged and left out; the guild channels go on without it.
 // All lookups together are bounded (timeoutMs, rate-limit waits included), so a slow Discord cannot hold up the guild
 // channels' start; a request still running at the deadline is aborted, and its user is left out until the next start.
-export async function openDms({ discord, users, log, timeoutMs = 10_000, now = () => Date.now() }: { discord: Pick<DiscordRest, "openDm">; users: string[]; log: Log; timeoutMs?: number; now?: () => number }): Promise<{ userId: string; channelId: string }[]> {
+export async function openDms({ discord, users, log, timeoutMs = 10_000, setTimer = setTimeout, clearTimer = clearTimeout }: {
+  discord: Pick<DiscordRest, "openDm">; users: string[]; log: Log; timeoutMs?: number;
+  setTimer?: (fn: () => void, ms: number) => unknown; clearTimer?: (t: any) => void;
+}): Promise<{ userId: string; channelId: string }[]> {
   const out: { userId: string; channelId: string }[] = [];
-  const deadline = now() + timeoutMs;
-  for (const userId of users) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const abort = new AbortController();
-    try {
-      const left = deadline - now();
-      if (left <= 0) throw new Error("timed out (startup budget used up)");
-      const ch = await Promise.race([discord.openDm(userId, abort.signal), new Promise<never>((_, reject) => { timer = setTimeout(() => { abort.abort(); reject(new Error("timed out")); }, left); })]);
-      if (typeof ch?.id !== "string" || !/^\d{1,25}$/.test(ch.id) || (ch.type !== undefined && ch.type !== 1)) throw new Error("not a DM channel");
-      out.push({ userId, channelId: ch.id });
-    } catch (e) { log.emit("bridge.dm_open_failed", { error: errText(e) }); } finally { clearTimeout(timer); }
-  }
+  // One timer for the whole discovery: when it fires, the request in flight is aborted and no later one starts. (Budgets
+  // recomputed from the wall clock per request let a request start with a millisecond left, only to be aborted.)
+  let expired = false, current: AbortController | null = null, fail: (() => void) | null = null;
+  const timer = setTimer(() => { expired = true; current?.abort(); fail?.(); }, timeoutMs);
+  try {
+    for (const userId of users) {
+      if (expired) { log.emit("bridge.dm_open_failed", { error: "timed out (startup budget used up)" }); continue; }
+      const abort = (current = new AbortController());
+      try {
+        const ch = await Promise.race([discord.openDm(userId, abort.signal), new Promise<never>((_, reject) => { fail = () => reject(new Error("timed out")); })]);
+        if (typeof ch?.id !== "string" || !/^\d{1,25}$/.test(ch.id) || (ch.type !== undefined && ch.type !== 1)) throw new Error("not a DM channel");
+        out.push({ userId, channelId: ch.id });
+      } catch (e) { log.emit("bridge.dm_open_failed", { error: errText(e) }); } finally { current = null; fail = null; }
+    }
+  } finally { clearTimer(timer); }
   return out;
 }
 // A DM that no conversation owns (someone else writing to the bot) is dropped like any other channel's message; this

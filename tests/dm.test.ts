@@ -26,17 +26,29 @@ test("OPEN: the DM channel comes from Discord; a user whose DM cannot be opened 
   const discord = { async openDm(userId: string) { if (userId === "2") throw new Error("Cannot send messages to this user"); if (userId === "3") return { id: "55", type: 0 }; return { id: DM_CH, type: 1 }; } };
   assert.deepEqual(await openDms({ discord, users: [HUMAN_ID, "2", "3"], log }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
   assert.equal(log.events.filter((e) => e.event === "bridge.dm_open_failed").length, 2, "a failed open and a channel that is not a DM");
-  // the whole startup lookup is bounded: lookups that never answer (e.g. rate-limit waits) end at the budget, in all
-  const aborted: string[] = [];
-  const slow = { async openDm(userId: string, signal?: AbortSignal) { signal?.addEventListener("abort", () => aborted.push(userId)); return new Promise<never>(() => {}); } };
-  const t0 = Date.now();
-  assert.deepEqual(await openDms({ discord: slow, users: ["4", "5", "6"], log, timeoutMs: 100 }), []);
-  assert.ok(Date.now() - t0 < 1000, "three hung lookups share one budget, not 3 x the budget");
-  assert.deepEqual(aborted, ["4"], "the request running at the deadline is aborted; the others never start");
-  assert.match(String(log.events.at(-1)!.error), /timed out/);
-  // a fast user before a hung one is opened
-  const mixed = { async openDm(userId: string) { return userId === "4" ? new Promise<never>(() => {}) : { id: DM_CH, type: 1 }; } };
-  assert.deepEqual(await openDms({ discord: mixed, users: [HUMAN_ID, "4"], log, timeoutMs: 50 }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
+  // the whole startup lookup is bounded by one timer (a fake one here: no wall clock in the test)
+  const fakeTimer = () => { let fire: (() => void) | null = null; let cleared = false;
+    return { setTimer: (fn: () => void) => { fire = fn; return 1; }, clearTimer: () => { cleared = true; }, fire: () => fire?.(), cleared: () => cleared }; };
+  const aborted: string[] = [], started: string[] = [];
+  const t = fakeTimer();
+  const slow = { async openDm(userId: string, signal?: AbortSignal) { started.push(userId); signal?.addEventListener("abort", () => aborted.push(userId)); return new Promise<never>(() => {}); } };
+  const run = openDms({ discord: slow, users: ["4", "5", "6"], log, setTimer: t.setTimer, clearTimer: t.clearTimer });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(started, ["4"]);
+  t.fire(); // the deadline
+  assert.deepEqual(await run, []);
+  assert.deepEqual([started, aborted], [["4"], ["4"]], "the request in flight is aborted; no later one starts, however late the clock reads");
+  assert.ok(t.cleared(), "the timer is cleared at the end");
+  assert.equal(log.events.filter((e) => /budget used up/.test(String(e.error))).length, 2, "the skipped users are logged");
+  // a fast user before a hung one is opened; the deadline between two lookups stops the next one from starting
+  const t2 = fakeTimer();
+  const order: string[] = [];
+  const mixed = { async openDm(userId: string) { order.push(userId); if (userId === HUMAN_ID) { t2.fire(); return { id: DM_CH, type: 1 }; } return new Promise<never>(() => {}); } };
+  assert.deepEqual(await openDms({ discord: mixed, users: [HUMAN_ID, "4"], log, setTimer: t2.setTimer, clearTimer: t2.clearTimer }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
+  assert.deepEqual(order, [HUMAN_ID], "the deadline passed during the first lookup: the second never starts");
+  // the real timer still works end to end
+  const real = await openDms({ discord: slow, users: ["7"], log, timeoutMs: 20 });
+  assert.deepEqual(real, []);
 });
 
 test("REST: openDm posts to /users/@me/channels; a DM channel is writable only once the bridge admits it", async () => {

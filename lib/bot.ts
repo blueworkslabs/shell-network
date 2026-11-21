@@ -21,6 +21,7 @@
 //     (marker set before the post; the search resumes across steps and only a search that reached the end of the
 //     channel counts as "absent"), and never repeated after it was recorded. Replies post in batch order.
 import { reconcileBatch, messageIdMatchesRequest, settlement } from "./reconcile.ts";
+import { attachmentLines, attachmentNames, readStaged, removeStaged, type StagedFile } from "./attachments.ts";
 import { errText } from "./log.ts";
 import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./stuck.ts";
 import type { BatchLimit, Buffer } from "./buffer.ts";
@@ -48,6 +49,8 @@ export interface BotOptions {
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
   allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
+  // where the Discord tool stages the files of a tool post for this bridge to upload (lib/attachments.ts); none = tool posts with files are dropped
+  attachmentsDir?: string;
 }
 
 const PART = 1900;
@@ -68,7 +71,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000 }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -224,7 +227,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     // Channel log for the unread header: the allowlisted people, the allowed crew bots and this bot itself only.
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content: String(msg.content ?? ""), at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+        content: String(msg.content ?? "") + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : ""), at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
@@ -237,8 +240,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     // A person or talk-only member can resume with a bare mention; bridge-run bots cannot.
     const withoutUser = String(msg.content ?? "").replace(mentionRe(), "");
     const stripped = (botRoleId ? withoutUser.replace(roleRe(), "") : withoutUser).trim();
-    if (!stripped && fromBot && !talkOnly) return { accepted: false, reason: "empty after mention" };
-    const text = stripped || BARE_MENTION_TEXT;
+    // files under the text, one line each (a mention with only files is not a bare mention)
+    const files = attachmentLines(msg.attachments);
+    if (!stripped && !files.length && fromBot && !talkOnly) return { accepted: false, reason: "empty after mention" };
+    const text = [stripped || (files.length ? "" : BARE_MENTION_TEXT), ...files].filter(Boolean).join("\n");
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
     if (crewBot && !talkOnly) {
@@ -392,7 +397,12 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   };
   // Tool entries are checked again right before they go out: the channel they were made for must be this
   // bridge's channel and their target a message of the channel log; otherwise they are dropped, never posted.
-  const toolMeta = (h: OutboxRow) => JSON.parse(h.meta) as { channel?: string; thread?: number };
+  const toolMeta = (h: OutboxRow) => JSON.parse(h.meta) as { channel?: string; thread?: number; files?: StagedFile[] };
+  // an entry with a `files` key is a post with files, whatever that key holds: a malformed one is dropped, never posted as plain text
+  const hasFilesKey = (h: OutboxRow) => h.key.startsWith("tool:") && Object.hasOwn(toolMeta(h), "files");
+  const toolFiles = (h: OutboxRow): StagedFile[] => { const f = h.key.startsWith("tool:") ? toolMeta(h).files : undefined; return Array.isArray(f) ? f : []; };
+  // the staged copies of an entry that is posted or dropped are not needed any more
+  const unstage = (h: OutboxRow) => { const f = toolFiles(h); if (f.length) { try { removeStaged({ files: f, stagingDir: attachmentsDir }); } catch (e) { log.emit("bridge.unstage_failed", { bot: name, key: h.key, error: errText(e) }); } } };
   // where an entry goes: the channel, or a thread this bot's tool created there (tool sends only)
   const targetOf = (h: OutboxRow): string => { const m = toolMeta(h); return h.key.startsWith("tool:") && m.thread === 1 && m.channel ? m.channel : channelId; };
   function toolRejected(h: OutboxRow): string | null {
@@ -401,7 +411,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (inThread ? !meta.channel || !buffer.isToolThread(conversationKey, meta.channel) : meta.channel !== channelId) return "channel not allowed";
     if (inThread && h.reply_to !== null) return "no reply targets in a thread";
     if (h.reply_to !== null && buffer.channelMessage(h.reply_to)?.channel_id !== channelId) return "target is not a message of the channel";
-    if (h.key.startsWith("tool:") && (!h.content.trim() || h.content.length > PART)) return "content empty or too long";
+    if (h.key.startsWith("tool:") && ((!h.content.trim() && !hasFilesKey(h)) || h.content.length > PART)) return "content empty or too long";
     return null;
   }
   // Checks gate only the first attempt (R2): a tool entry is checked and possibly dropped
@@ -411,6 +421,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const cur = buffer.outboxById(h.id);
     if (cur?.state !== "pending") throw new Error(`rejectTool: ${h.key} is ${cur?.state ?? "missing"}, not pending; an attempted entry is settled by recovery, never dropped`);
     buffer.outboxDrop(h.id);
+    unstage(h);
     log.emit("bridge.tool_rejected", { bot: name, key: h.key, why });
   }
   const errStatus = (e: unknown) => e as { status?: number; code?: number } | null;
@@ -482,10 +493,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const replyTo = resolveReplyTo(h);
       const target = targetOf(h);
       if (h.state === "posting") {
-        const r = await searchOwnPost(K(`outboxSearch:${h.id}`), h.boundary!, h.content, replyTo, target);
+        const r = await searchOwnPost(K(`outboxSearch:${h.id}`), h.boundary!, h.content, replyTo, target, toolFiles(h).map((f) => f.name));
         if (r.status === "unknown") { log.emit("bridge.outbox_search_incomplete", { bot: name, key: h.key }); return false; }
         if (r.status === "found") {
           buffer.outboxPosted(h.id, r.message.id, () => onPosted(h, r.message.id));
+          unstage(h);
           log.emit(postedEvent(h, true), { bot: name, key: h.key, channelMessageId: r.message.id, recovered: true });
           continue;
         }
@@ -502,13 +514,17 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (staleAlert(h)) continue;
       const tool = h.key.startsWith("tool:");
       if (tool) { const why = toolRejected(h); if (why) { rejectTool(h, why); continue; } }
+      // the files of a tool post, validated again against the staging directory right before they go out
+      let upload: { name: string; data: Uint8Array }[] = [];
+      if (hasFilesKey(h)) { try { upload = readStaged({ files: toolMeta(h).files, stagingDir: attachmentsDir }); } catch (e) { rejectTool(h, `attachment: ${errText(e)}`); continue; } }
       buffer.outboxPosting(h.id, boundary);
       // a tool post may ping only the crew bots it names that are still allowed now
       const users = (JSON.parse(h.users) as string[]).filter((u) => !tool || mentionsIn(h.content).includes(u));
       const m = await discord.createMessage(target, { content: h.content, nonce: h.nonce, enforce_nonce: true,
         allowed_mentions: { parse: [] as string[], ...(users.length ? { users } : {}), ...(tool ? { replied_user: false } : {}) },
-        ...(replyTo ? { message_reference: { message_id: replyTo, channel_id: target, fail_if_not_exists: false } } : {}) });
+        ...(replyTo ? { message_reference: { message_id: replyTo, channel_id: target, fail_if_not_exists: false } } : {}), ...(upload.length ? { files: upload } : {}) });
       buffer.outboxPosted(h.id, m.id, () => onPosted(h, m.id));
+      unstage(h);
       log.emit(postedEvent(h, false), { bot: name, key: h.key, channelMessageId: m.id });
     }
   }
@@ -530,16 +546,17 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return null;
   }
 
+  const sameNames = (a: string[], b: string[]) => a.length === b.length && [...a].sort().join("\0") === [...b].sort().join("\0");
   // This bot's post with exactly `text` (and, if given, replying to `replyTo`) after `startAfter`, not recorded as
   // another post; resumable across steps (progress in kv); a full page budget without an answer is "unknown".
-  async function searchOwnPost(progressKey: string, startAfter: string, text: string, replyTo: string | null, ch = channelId): Promise<Found> {
+  async function searchOwnPost(progressKey: string, startAfter: string, text: string, replyTo: string | null, ch = channelId, fileNames: string[] = []): Promise<Found> {
     let after = buffer.kvGet(progressKey) ?? startAfter;
     for (let page = 0; page < searchPagesPerStep; page++) {
       const msgs = await discord.messagesAfter(ch, after);
       if (!Array.isArray(msgs)) throw new Error("messagesAfter: not an array");
       const ordered = [...msgs].sort(byId);
       const hit = ordered.find((m) => m.author?.id === state.botUserId && String(m.content ?? "").trim() === text.trim() &&
-        (replyTo === null || m.message_reference?.message_id === replyTo) && !buffer.isRecordedPost(m.id));
+        (replyTo === null || m.message_reference?.message_id === replyTo) && (!fileNames.length || sameNames(attachmentNames(m.attachments), fileNames)) && !buffer.isRecordedPost(m.id));
       if (hit) return { status: "found", message: hit };
       if (ordered.length < PAGE) return { status: "absent" };
       after = ordered.at(-1)!.id;

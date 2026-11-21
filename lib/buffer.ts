@@ -601,6 +601,8 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     batchOfMessage: (conversationKey: string, sourceMessageId: string): BatchRow | undefined => one<BatchRow>(
       "SELECT b.* FROM batch b JOIN inbound i ON i.batch_id = b.id WHERE i.conversation_key = ? AND i.source_message_id = ?", conversationKey, sourceMessageId),
 
+    // Is a staged attachment directory named by an outbox entry that is not settled (pending or posting)?
+    stagedInUse: (dirId: string): boolean => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE state IN ('pending','posting') AND instr(meta, ?) > 0", dirId)!.n > 0,
     // A person's action that is not a channel message (a slash command) cuts the channel's episode like a message does:
     // the receiving side (inbound) and the Discord tool's budget (human_message) both read this boundary.
     recordResetBoundary: (id: string, channelId: string): void => { db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(id, channelId); },

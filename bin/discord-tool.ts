@@ -6,7 +6,11 @@
 // discord_react, discord_thread and discord_read; every call names one of the bot's channels.
 //   DISCORD_TOOL_BOT   bot key (lowercase letters, lib/bots.ts)
 //   DISCORD_TOOL_DB    the bridge's buffer DB (must exist: the bridge creates it)
+//   DISCORD_TOOL_WORKSPACE  optional, absolute path of the agent's workspace: the only place discord_send may attach files
+//                           from (staged copies go to `attachments/` next to the DB, for the bridge to upload)
 // stdout carries protocol messages only; diagnostics go to stderr.
+import { statSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { openToolDb } from "../lib/tooldb.ts";
 import { handle, parseLine } from "../lib/mcpserver.ts";
@@ -20,7 +24,9 @@ if (!/^[a-z]{1,20}$/.test(key)) fatal("DISCORD_TOOL_BOT: lowercase letters only"
 const dbPath = process.env.DISCORD_TOOL_DB ?? fatal("missing DISCORD_TOOL_DB");
 const db = (() => { try { return openToolDb(dbPath); } catch (e) { return fatal((e as Error).message); } })();
 
-const { tools } = makeTools(db, key);
+const workspace = process.env.DISCORD_TOOL_WORKSPACE;
+if (workspace !== undefined && (!isAbsolute(workspace) || !(() => { try { return statSync(workspace).isDirectory(); } catch { return false; } })())) fatal("DISCORD_TOOL_WORKSPACE: an absolute path of an existing directory");
+const { tools } = makeTools(db, key, { workspace, stagingDir: join(dirname(dbPath), "attachments") });
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let pending = Promise.resolve(); // replies in request order

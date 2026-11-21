@@ -13,6 +13,7 @@
 //     another crew bot since the last message of a person, plus every bot's tool sends to a bot not in the log yet; the check
 //     and the insert are one transaction, so two concurrent calls cannot both pass. Reactions do not use the cap.
 import { randomBytes } from "node:crypto";
+import { ATTACH_MAX_FILES, removeStaged, stageFiles, type StagedFile } from "./attachments.ts";
 import { conversationKeyFor } from "./bots.ts";
 import type { ToolDb } from "./tooldb.ts";
 import type { Tool, ToolResult } from "./mcpserver.ts";
@@ -34,7 +35,9 @@ interface Config { channel_id: string; bot_user_id: string; crew: { id: string; 
 const after = (col: string) => `(length(${col}) > length(?) OR (length(${col}) = length(?) AND ${col} > ?))`;
 const names = (content: string, id: string) => content.includes(`<@${id}>`) || content.includes(`<@!${id}>`);
 
-export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: { now?: () => number } = {}) {
+// workspace / stagingDir: where discord_send may take files from (the agent's workspace) and where it stages copies for the
+// bridge to upload (lib/attachments.ts); without them `files` is refused.
+export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), workspace, stagingDir }: { now?: () => number; workspace?: string; stagingDir?: string } = {}) {
   const db = tdb._db;
   const one = <T>(sql: string, ...a: (string | number | null)[]) => db.prepare(sql).get(...a) as T | undefined;
   const mine = "substr(conversation_key, 1, length(?1) + 1) = ?1 || '.'"; // this bot's conversations
@@ -85,10 +88,11 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
   };
 
   // One request: replay check, validation (`check` may throw ToolError), insert; all in one IMMEDIATE transaction.
-  function request(op: Op, idem: unknown, args: Record<string, string | null>, check: (r: ReturnType<typeof resolve>) => { content: string; replyTo: string | null; users: string[]; meta: Record<string, unknown> }, { threadOk = false } = {}): ToolResult {
+  function request(op: Op, idem: unknown, args: Record<string, string | string[] | null>, check: (r: ReturnType<typeof resolve>) => { content: string; replyTo: string | null; users: string[]; meta: Record<string, unknown> }, { threadOk = false } = {}): ToolResult {
     if (typeof idem !== "string" || !IDEM.test(idem)) throw new ToolError("idempotency_key: required, 1-100 characters of A-Z a-z 0-9 . _ : -");
     const canonical = JSON.stringify(args);
     db.exec("BEGIN IMMEDIATE");
+    let staged: unknown;
     try {
       const target = resolve(args.channel as string, { threadOk });
       const key = target.key;
@@ -100,6 +104,7 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
         return result(op, r, true);
       }
       const v = check(target);
+      staged = v.meta.files;
       const hex = randomBytes(12).toString("hex");
       const okey = `${PREFIX[op]}:${hex}`;
       const ins = db.prepare(`INSERT INTO outbox (conversation_key, key, content, nonce, reply_to, users, meta, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
@@ -109,6 +114,7 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
       return result(op, { key: okey, state: "pending", channel_message_id: null, reply_to: v.replyTo }, false);
     } catch (e) {
       try { db.exec("ROLLBACK"); } catch {}
+      try { removeStaged({ files: staged, stagingDir }); } catch {} // copies of an entry that was not inserted
       throw e;
     }
   }
@@ -118,9 +124,12 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
   function send(a: Record<string, unknown>): ToolResult {
     const channel = str(a.channel, "channel"), content = str(a.content, "content").trim();
     const replyTo = a.reply_to === undefined || a.reply_to === null ? null : str(a.reply_to, "reply_to");
-    return request("send", a.idempotency_key, { channel, content, reply_to: replyTo }, ({ c, thread }) => {
+    const files = a.files === undefined || a.files === null ? [] : Array.isArray(a.files) && a.files.every((f) => typeof f === "string") ? (a.files as string[]) : (() => { throw new ToolError("files: a list of paths"); })();
+    if (files.length > ATTACH_MAX_FILES) throw new ToolError(`files: at most ${ATTACH_MAX_FILES}`);
+    // `files` joins the canonical arguments only when given, so replays of requests made before it existed still match
+    return request("send", a.idempotency_key, { channel, content, reply_to: replyTo, ...(files.length ? { files } : {}) }, ({ c, thread }) => {
       if (thread && replyTo !== null) throw new ToolError("reply_to is not supported in a thread");
-      if (!content) throw new ToolError("content is empty");
+      if (!content && !files.length) throw new ToolError("content is empty");
       if (content.length > MAX_CONTENT) throw new ToolError(`content is ${content.length} characters; at most ${MAX_CONTENT}`);
       if (replyTo !== null && (!SNOWFLAKE.test(replyTo) || !inLog(replyTo, c.channel_id))) throw new ToolError(`reply_to ${replyTo} is not a message of the channel`);
       const users = c.crew.filter((b) => names(content, b.id)).map((b) => b.id);
@@ -129,7 +138,10 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
         const n = exchanges(c);
         if (n >= c.exchange_cap) throw new ToolError(`exchange cap reached: ${n} bot-to-bot messages since the user's last message (cap ${c.exchange_cap}); wait for the user`);
       }
-      return { content, replyTo, users, meta: { channel, ...(thread ? { thread: 1 } : {}), ...(addressesBot ? { addressesBot: 1 } : {}) } };
+      // last, after every check: the copies are the only side effect outside the transaction
+      let staged: StagedFile[] = [];
+      if (files.length) { try { staged = stageFiles({ paths: files, workspace, stagingDir }); } catch (e) { throw new ToolError((e as Error).message); } }
+      return { content, replyTo, users, meta: { channel, ...(thread ? { thread: 1 } : {}), ...(addressesBot ? { addressesBot: 1 } : {}), ...(staged.length ? { files: staged } : {}) } };
     }, { threadOk: true });
   }
 
@@ -171,7 +183,8 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: 
   const tools: Tool[] = [
     { name: "discord_send", description: "Post a message to one of the bot's Discord channels (usually the one the conversation came from). The bridge posts it in order after anything already queued. Mention a crew bot with <@id> only to hand it work; that counts toward the bot-to-bot exchange cap. After posting with this tool, end your turn with exactly NO_REPLY so your final text is not posted as well.",
       inputSchema: { type: "object", additionalProperties: false, required: ["channel", "content", "idempotency_key"],
-        properties: { channel: { type: "string", description: "Channel id: one of the bot's channels, or a thread this bot created in one." }, content: { type: "string", maxLength: MAX_CONTENT }, reply_to: { type: "string", description: "Optional: id of a message in the channel to reply to." }, idempotency_key: idemProp } },
+        properties: { channel: { type: "string", description: "Channel id: one of the bot's channels, or a thread this bot created in one." }, content: { type: "string", maxLength: MAX_CONTENT, description: "May be empty when files are given." }, reply_to: { type: "string", description: "Optional: id of a message in the channel to reply to." },
+          files: { type: "array", maxItems: ATTACH_MAX_FILES, items: { type: "string" }, description: "Optional: paths of files in your workspace to attach (absolute, or relative to the workspace; at most 8 MiB in all)." }, idempotency_key: idemProp } },
       call: send },
     { name: "discord_react", description: "Add a reaction (one Unicode emoji) to a message in one of the bot's Discord channels.",
       inputSchema: { type: "object", additionalProperties: false, required: ["channel", "message_id", "emoji", "idempotency_key"],

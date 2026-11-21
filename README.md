@@ -37,7 +37,8 @@ an older t3 binary must not be pointed at a database migrated by a newer release
 - **Watchdog.** A separate process holds t3's `operate` grant. It resumes held queues (see [LESSONS.md](LESSONS.md)).
 - **Discord tool for the agent.** `bin/discord-tool.ts` is a stdio MCP server the provider spawns. It offers
   `discord_send`, `discord_react`, `discord_thread` and `discord_read`. It holds no token: it writes into the bridge's
-  outbox through a confined DB connection, and the bridge does the posting.
+  outbox through a confined DB connection, and the bridge does the posting. `discord_send` can attach files from the agent's workspace (`DISCORD_TOOL_WORKSPACE`); files attached to a
+  message reach the agent as a line with name, type, size and URL.
 
 The design is described in [ARCHITECTURE.md](ARCHITECTURE.md).
 

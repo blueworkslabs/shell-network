@@ -67,13 +67,17 @@ export function dmUsers(value: string | undefined, allowedAuthors: string[]): st
 }
 // The DM channel per user, from Discord (POST /users/@me/channels answers with the same channel every time). A user whose
 // DM cannot be opened is logged and left out; the guild channels go on without it.
-// Each lookup is bounded (timeoutMs), so a slow Discord cannot hold up the guild channels' start.
-export async function openDms({ discord, users, log, timeoutMs = 10_000 }: { discord: Pick<DiscordRest, "openDm">; users: string[]; log: Log; timeoutMs?: number }): Promise<{ userId: string; channelId: string }[]> {
+// All lookups together are bounded (timeoutMs, rate-limit waits included), so a slow Discord cannot hold up the guild
+// channels' start; a user whose lookup did not answer in time is left out until the next start.
+export async function openDms({ discord, users, log, timeoutMs = 10_000, now = () => Date.now() }: { discord: Pick<DiscordRest, "openDm">; users: string[]; log: Log; timeoutMs?: number; now?: () => number }): Promise<{ userId: string; channelId: string }[]> {
   const out: { userId: string; channelId: string }[] = [];
+  const deadline = now() + timeoutMs;
   for (const userId of users) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const ch = await Promise.race([discord.openDm(userId), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), timeoutMs); })]);
+      const left = deadline - now();
+      if (left <= 0) throw new Error("timed out (startup budget used up)");
+      const ch = await Promise.race([discord.openDm(userId), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("timed out")), left); })]);
       if (typeof ch?.id !== "string" || !/^\d{1,25}$/.test(ch.id) || (ch.type !== undefined && ch.type !== 1)) throw new Error("not a DM channel");
       out.push({ userId, channelId: ch.id });
     } catch (e) { log.emit("bridge.dm_open_failed", { error: errText(e) }); } finally { clearTimeout(timer); }

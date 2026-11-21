@@ -88,7 +88,13 @@ that user is addressed to the bot (no mention needed); the REST write guard admi
 opened. A DM nobody's conversation owns (someone else writing to the bot) is dropped at the channel check and logged as
 `bridge.dm_ignored`, without its text. A DM that cannot be opened is logged and left out; the guild channels go on.
 No bot-to-bot cap applies (no crew bot is in a DM). Text `/new` works there; the slash commands stay guild-only. The
-gateway asks for the `DIRECT_MESSAGES` intent, which is not privileged.
+gateway asks for the `DIRECT_MESSAGES` intent, which is not privileged. All DM lookups together get 10 seconds at
+startup; one that does not answer in time is left out until the next start.
+
+Privacy limit: the bot's Discord tool is one process per agent, shared by all its conversations, so a turn in a guild
+channel can still read or post to the DM channel when it names its id explicitly. The DM's text never enters a guild
+thread by itself (separate thread and header), but nothing stops the agent from looking; DMs are private from other
+people, not from the bot's other conversations.
 
 ## Slash commands (`lib/commands.ts`)
 

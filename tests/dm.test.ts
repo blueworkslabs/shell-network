@@ -26,12 +26,15 @@ test("OPEN: the DM channel comes from Discord; a user whose DM cannot be opened 
   const discord = { async openDm(userId: string) { if (userId === "2") throw new Error("Cannot send messages to this user"); if (userId === "3") return { id: "55", type: 0 }; return { id: DM_CH, type: 1 }; } };
   assert.deepEqual(await openDms({ discord, users: [HUMAN_ID, "2", "3"], log }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
   assert.equal(log.events.filter((e) => e.event === "bridge.dm_open_failed").length, 2, "a failed open and a channel that is not a DM");
-  // a lookup that never answers is given up after the bound; the next user is still opened
-  const slow = { async openDm(userId: string) { return userId === "4" ? new Promise<never>(() => {}) : { id: DM_CH, type: 1 }; } };
+  // the whole startup lookup is bounded: lookups that never answer (e.g. rate-limit waits) end at the budget, in all
+  const slow = { async openDm() { return new Promise<never>(() => {}); } };
   const t0 = Date.now();
-  assert.deepEqual(await openDms({ discord: slow, users: ["4", HUMAN_ID], log, timeoutMs: 50 }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
-  assert.ok(Date.now() - t0 < 2000);
+  assert.deepEqual(await openDms({ discord: slow, users: ["4", "5", "6"], log, timeoutMs: 100 }), []);
+  assert.ok(Date.now() - t0 < 1000, "three hung lookups share one budget, not 3 x the budget");
   assert.match(String(log.events.at(-1)!.error), /timed out/);
+  // a fast user before a hung one is opened
+  const mixed = { async openDm(userId: string) { return userId === "4" ? new Promise<never>(() => {}) : { id: DM_CH, type: 1 }; } };
+  assert.deepEqual(await openDms({ discord: mixed, users: [HUMAN_ID, "4"], log, timeoutMs: 50 }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
 });
 
 test("REST: openDm posts to /users/@me/channels; a DM channel is writable only once the bridge admits it", async () => {

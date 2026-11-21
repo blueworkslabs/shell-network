@@ -66,7 +66,7 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
     async read(threadId) {
       const t = th(threadId);
       const active = t.runs.find((r) => !TERMINAL.has(r.status) && r.status !== "queued");
-      return { thread: { threadId, activeRunId: active?.runId ?? null }, recentRuns: t.runs.map((r) => ({ runId: r.runId, ordinal: r.ordinal, status: r.status })), items: t.items.map((i) => ({ ...i })) };
+      return { thread: { threadId, activeRunId: active?.runId ?? null, ...(t.archived ? { archived: true } : {}) }, recentRuns: t.runs.map((r) => ({ runId: r.runId, ordinal: r.ordinal, status: r.status })), items: t.items.map((i) => ({ ...i })) };
     },
     async projection(threadId) {
       return { runs: th(threadId).runs.map((r) => ({ id: r.runId, ordinal: r.ordinal, status: r.status, queueHeld: r.queueHeld ?? false, userMessageId: r.userMessageId })) };

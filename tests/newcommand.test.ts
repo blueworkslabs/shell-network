@@ -163,7 +163,8 @@ for (const point of ["archive", "launch"] as const) {
     const { t1 } = await toWrapup(w);
     w.finish(t1, "NO_REPLY");
     w.t3.crash[point] = "after";
-    await assert.rejects(w.steps(6), /CRASH/);
+    // the "crash" closes the buffer; after the archive call the bridge finds the thread archived and then hits the closed DB
+    await assert.rejects(w.steps(6), /CRASH|database is not open/);
     w.restart();
     w.bot.initWatermark(1_792_500_000_000);
     await w.steps(8);
@@ -177,7 +178,7 @@ for (const point of ["archive", "launch"] as const) {
     assert.equal(w.sentTo(t2).filter((s) => s.includes(FRESH_SESSION_TEXT)).length, 1);
     assert.match(w.sentTo(t2)[0], /after the cut/);
     if (point === "archive") {
-      assert.deepEqual(w.archives(), [t1, t1], "the repeated call got t3's real 'already archived' answer, taken as done");
+      assert.deepEqual(w.archives(), [t1, t1], "the repeated call got t3's real 'already archived' error; the thread reads as archived, so it counts as done");
       assert.ok(w.log.events.some((e) => e.event === "bridge.archive_already"));
     }
   });
@@ -196,6 +197,29 @@ test("NEW ARCHIVE FAILS: any other archive error leaves the binding and the rese
   await w.steps(6);
   assert.deepEqual(w.archives(), [t1, t1]);
   assert.equal(w.t3.threads.size, 2);
+  assert.equal(w.confirmations().length, 1);
+});
+
+test("NEW ARCHIVE ERROR is believed only when the thread reads as archived, not from its wording, and not when the read fails", async () => {
+  const w = world();
+  const { t1 } = await toWrapup(w);
+  w.finish(t1, "NO_REPLY");
+  // the words of the real error, but the thread is not archived
+  w.t3.archiveError = "orchestration_error: Thread is already archived.";
+  await assert.rejects(w.steps(4), /already archived/);
+  assert.equal(w.thread(), t1);
+  assert.equal(w.t3.threads.size, 1);
+  // archived for real (as after a crash), but the read fails: the error stands, the binding stays
+  await w.t3.archive(t1);
+  const read = w.t3.read;
+  w.t3.read = async () => { throw new Error("t3 unreachable"); };
+  await assert.rejects(w.bot.step(), /t3 unreachable|already archived/);
+  assert.equal(w.thread(), t1);
+  assert.equal(w.confirmations().length, 0);
+  w.t3.read = read;
+  await w.steps(6); // the read works again: archived, so recovery continues
+  assert.equal(w.t3.threads.size, 2);
+  assert.notEqual(w.thread(), t1);
   assert.equal(w.confirmations().length, 1);
 });
 

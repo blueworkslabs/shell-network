@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { openToolDb } from "../lib/tooldb.ts";
 import { makeTools, ToolError, MAX_CONTENT } from "../lib/tools.ts";
+import { conversationKeyFor } from "../lib/bots.ts";
 import { openTempBuffer, tempDir, track } from "./tmp.ts";
 
 const CH = "100000000000000001", ME = "200000000000000001", HERMES = "300000000000000001", HUMAN = "400000000000000001";
@@ -17,8 +18,8 @@ const sf = () => sfAt(tick());
 function setup({ cap = 2 }: { cap?: number } = {}) {
   const path = join(tempDir("bridge-tools-"), "buffer.db");
   const b = openTempBuffer(path);
-  b.setToolConfig("gem", { channelId: CH, botUserId: ME, crew: [{ id: HERMES, name: "Hermes" }], exchangeCap: cap });
-  const say = (authorId: string, kind: "human" | "bot", content: string) => { const t = tick(); const id = sfAt(t); b.recordChannelMessage({ id, authorId, authorName: "x", authorKind: kind, content, at: t }); return id; };
+  b.setToolConfig(conversationKeyFor("gem", CH), { channelId: CH, botUserId: ME, crew: [{ id: HERMES, name: "Hermes" }], exchangeCap: cap });
+  const say = (authorId: string, kind: "human" | "bot", content: string) => { const t = tick(); const id = sfAt(t); b.recordChannelMessage({ id, authorId, authorName: "x", authorKind: kind, content, at: t, channelId: CH }); return id; };
   const t = makeTools(track(openToolDb(path)), "gem", { now: tick });
   const out = (r: { structuredContent?: unknown }) => r.structuredContent as { status: string; ref: string; replay?: boolean; messageId?: string };
   return { path, b, t, say, out };
@@ -78,10 +79,10 @@ test("TOOL CAP: cap 0 is off", () => {
 test("TOOL REACT: queues a reaction on a message of the channel log; foreign targets, custom or non-emoji are refused; keys are per operation", () => {
   const { t, say, out } = setup();
   const m = say(HUMAN, "human", "nice");
-  out(t.react({ message_id: m, emoji: "👍", idempotency_key: "k1" }));
-  for (const emoji of ["👩‍💻", "1️⃣", "🇩🇪", "❤️"]) assert.equal(out(t.react({ message_id: m, emoji, idempotency_key: `e${emoji.codePointAt(0)}` })).status, "queued", emoji);
-  for (const emoji of ["abc", "1", "<:x:123>", "", "👍 👍", "👍".repeat(20)]) assert.throws(() => t.react({ message_id: m, emoji, idempotency_key: "bad" }), /emoji/, emoji);
-  assert.throws(() => t.react({ message_id: "123456789012345678", emoji: "👍", idempotency_key: "k2" }), /not a message of the channel/);
+  out(t.react({ channel: CH, message_id: m, emoji: "👍", idempotency_key: "k1" }));
+  for (const emoji of ["👩‍💻", "1️⃣", "🇩🇪", "❤️"]) assert.equal(out(t.react({ channel: CH, message_id: m, emoji, idempotency_key: `e${emoji.codePointAt(0)}` })).status, "queued", emoji);
+  for (const emoji of ["abc", "1", "<:x:123>", "", "👍 👍", "👍".repeat(20)]) assert.throws(() => t.react({ channel: CH, message_id: m, emoji, idempotency_key: "bad" }), /emoji/, emoji);
+  assert.throws(() => t.react({ channel: CH, message_id: "123456789012345678", emoji: "👍", idempotency_key: "k2" }), /not a message of the channel/);
   assert.equal(out(t.send({ channel: CH, content: "same key, other operation", idempotency_key: "k1" })).status, "queued");
 });
 
@@ -93,36 +94,36 @@ test("TOOL READ: the channel log, newest `limit` (max 50) before `before`, oldes
   assert.deepEqual(all.messages.map((m) => m.kind), ["human", "bot", "bot"]);
   const page = t.read({ channel: CH, limit: 1, before: ids[2] }).structuredContent as { messages: { id: string }[] };
   assert.deepEqual(page.messages.map((m) => m.id), [ids[1]]);
-  assert.throws(() => t.read({ channel: "999" }), /cannot be read/);
+  assert.throws(() => t.read({ channel: "999" }), /not allowed/);
   for (const limit of [0, 51, 2.5, "3"]) assert.throws(() => t.read({ channel: CH, limit }), /limit/, String(limit));
 });
 
 test("TOOL THREAD: queues a thread from a message of the channel log; sends into it are allowed only once the bridge has created it, and never with a reply target", () => {
   const { b, t, say, out } = setup();
   const m = say(HUMAN, "human", "topic starter");
-  const r = out(t.thread({ message_id: m, name: "  deep dive  ", idempotency_key: "t1" }));
-  const e = b.outboxEntry("gem", r.ref)!;
+  const r = out(t.thread({ channel: CH, message_id: m, name: "  deep dive  ", idempotency_key: "t1" }));
+  const e = b.outboxEntry(conversationKeyFor("gem", CH), r.ref)!;
   assert.throws(() => t.send({ channel: m, content: "in the thread", idempotency_key: "s1" }), /not allowed/, "not created yet");
   b.outboxApplied(e.id); // the bridge created it
-  assert.equal(out(t.thread({ message_id: m, name: "  deep dive  ", idempotency_key: "t1" })).status, "done");
-  assert.equal((t.thread({ message_id: m, name: "  deep dive  ", idempotency_key: "t1" }).structuredContent as { threadId: string }).threadId, m);
+  assert.equal(out(t.thread({ channel: CH, message_id: m, name: "  deep dive  ", idempotency_key: "t1" })).status, "done");
+  assert.equal((t.thread({ channel: CH, message_id: m, name: "  deep dive  ", idempotency_key: "t1" }).structuredContent as { threadId: string }).threadId, m);
   out(t.send({ channel: m, content: "in the thread", idempotency_key: "s1" }));
   assert.throws(() => t.send({ channel: m, content: "x", reply_to: m, idempotency_key: "s2" }), /not supported in a thread/);
-  assert.throws(() => t.thread({ message_id: "123456789012345678", name: "x", idempotency_key: "t2" }), /not a message of the channel/);
-  for (const name of ["", "a\nb", "n".repeat(101)]) assert.throws(() => t.thread({ message_id: m, name, idempotency_key: "t3" }), /name/);
+  assert.throws(() => t.thread({ channel: CH, message_id: "123456789012345678", name: "x", idempotency_key: "t2" }), /not a message of the channel/);
+  for (const name of ["", "a\nb", "n".repeat(101)]) assert.throws(() => t.thread({ channel: CH, message_id: m, name, idempotency_key: "t3" }), /name/);
 });
 
 test("TOOL THREAD ONLY: a posted entry that merely replies to a message does not make that message a tool thread", () => {
   const { b, t, say } = setup();
   const m = say(HUMAN, "human", "question");
-  const reply = b.enqueue("gem", { key: "reply:1:0", content: "answer", nonce: "b1p0", replyTo: m });
+  const reply = b.enqueue(conversationKeyFor("gem", CH), { key: "reply:1:0", content: "answer", nonce: "b1p0", replyTo: m });
   b.outboxPosted(reply.id, sf());
   assert.throws(() => t.send({ channel: m, content: "into a non-thread", idempotency_key: "nt" }), /not allowed/);
 });
 
 test("R1 SHARED CAP: Gem's and Hermes's queued tool sends to each other share one conversation budget", () => {
   const { path, b, t: gem, say, out } = setup({ cap: 2 });
-  b.setToolConfig("hermes", { channelId: CH, botUserId: HERMES, crew: [{ id: ME, name: "Gem" }], exchangeCap: 2 });
+  b.setToolConfig(conversationKeyFor("hermes", CH), { channelId: CH, botUserId: HERMES, crew: [{ id: ME, name: "Gem" }], exchangeCap: 2 });
   const hermes = makeTools(track(openToolDb(path)), "hermes", { now: tick });
   say(HUMAN, "human", "you two, sort it out");
   out(gem.send({ channel: CH, content: `<@${HERMES}> one`, idempotency_key: "g1" }));

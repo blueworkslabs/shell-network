@@ -99,6 +99,7 @@ export interface RelayRow {
 
 export interface AcceptInput {
   authorKind?: "human" | "bot";
+  channelId?: string;   // Discord channel of the message ('' in single-channel tests)
   source: string;
   sourceMessageId: string;
   conversationKey: string;
@@ -201,7 +202,7 @@ export interface DiscordPort {
   react(channelId: string, messageId: string, emoji: string): Promise<unknown>;
   messagesAfter(channelId: string, afterId: string, limit?: number): Promise<DiscordMessage[]>;
   startThread(channelId: string, messageId: string, name: string): Promise<{ id: string }>;
-  getChannel(channelId: string): Promise<{ id: string; parent_id?: string | null; guild_id?: string }>;
+  getChannel(channelId: string): Promise<{ id: string; name?: string; parent_id?: string | null; guild_id?: string }>;
 }
 
 // ---- t3 port used by the bot core (lib/t3.ts implements it) ----

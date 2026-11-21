@@ -43,3 +43,15 @@ export async function managedRole({ discord, channelId, botUserId, log }: {
     return null;
   }
 }
+
+// One bridge process serves one bot in several channels: one bot core per channel, stepped in turn by the single
+// step loop. A failing channel is logged and does not stop the others; the loop counts as idle only if all are idle.
+export function stepAll(bots: { step(): Promise<{ phase: string }> }[], log: Log, labels: string[] = []): () => Promise<{ phase: string }> {
+  return async () => {
+    let idle = true;
+    for (const [i, b] of bots.entries()) {
+      try { if ((await b.step()).phase !== "idle") idle = false; } catch (e) { idle = false; log.emit("bridge.step_error", { channel: labels[i] ?? null, error: errText(e) }); }
+    }
+    return { phase: idle ? "idle" : "open" };
+  };
+}

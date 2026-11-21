@@ -5,13 +5,15 @@
 // and checks channel, target and mentions again right before the POST. Rules:
 //   - an idempotency key is required; per bot and operation, a replay with the same arguments returns the first
 //     result, the same key with other arguments is refused;
-//   - the one channel the bridge posts to, or a thread this bot's tool created there (sends only: a tool
-//     thread under the allowed channel inherits it); reply/reaction/thread targets must be messages of the channel log;
+//   - every call names its channel: one of the bot's channels (a tool_config row per bot and channel, written by the
+//     bridge), or for sends a thread this bot's tool created in one of them (the thread inherits its channel);
+//     reply/reaction/thread targets must be messages of that channel's log;
 //   - mentions only of the configured crew bots (allowed_mentions users), never roles, everyone or the replied user;
 //   - a send that names another crew bot uses the bot-to-bot exchange budget of the conversation: bot messages naming
 //     another crew bot since the last message of a person, plus every bot's tool sends to a bot not in the log yet; the check
 //     and the insert are one transaction, so two concurrent calls cannot both pass. Reactions do not use the cap.
 import { randomBytes } from "node:crypto";
+import { conversationKeyFor } from "./bots.ts";
 import type { ToolDb } from "./tooldb.ts";
 import type { Tool, ToolResult } from "./mcpserver.ts";
 
@@ -32,25 +34,35 @@ interface Config { channel_id: string; bot_user_id: string; crew: { id: string; 
 const after = (col: string) => `(length(${col}) > length(?) OR (length(${col}) = length(?) AND ${col} > ?))`;
 const names = (content: string, id: string) => content.includes(`<@${id}>`) || content.includes(`<@!${id}>`);
 
-export function makeTools(tdb: ToolDb, key: string, { now = () => Date.now() }: { now?: () => number } = {}) {
+export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now() }: { now?: () => number } = {}) {
   const db = tdb._db;
   const one = <T>(sql: string, ...a: (string | number | null)[]) => db.prepare(sql).get(...a) as T | undefined;
-  const config = (): Config => {
+  const mine = "substr(conversation_key, 1, length(?1) + 1) = ?1 || '.'"; // this bot's conversations
+  const configOf = (key: string): Config | null => {
     const c = one<{ channel_id: string; bot_user_id: string; crew: string; exchange_cap: number }>("SELECT channel_id, bot_user_id, crew, exchange_cap FROM tool_config WHERE conversation_key = ?", key);
-    if (!c) throw new ToolError("the bridge has not started for this bot yet; nothing can be posted");
-    return { ...c, crew: JSON.parse(c.crew) as Config["crew"] };
+    return c ? { ...c, crew: JSON.parse(c.crew) as Config["crew"] } : null;
   };
-  const inLog = (id: string) => one<{ id: string }>("SELECT id FROM channel_message WHERE id = ?", id) !== undefined;
+  const channels = () => (db.prepare(`SELECT channel_id FROM tool_config WHERE ${mine} ORDER BY channel_id`).all(bot) as { channel_id: string }[]).map((r) => r.channel_id);
+  // The conversation a call's channel belongs to: one of the bot's channels, or (threadOk: sends) a tool thread it created there.
+  function resolve(channel: string, { threadOk = false } = {}): { key: string; c: Config; thread: boolean } {
+    const known = channels();
+    if (!known.length) throw new ToolError("the bridge has not started for this bot yet; nothing can be posted");
+    if (known.includes(channel)) { const key = conversationKeyFor(bot, channel); return { key, c: configOf(key)!, thread: false }; }
+    const t = threadOk && SNOWFLAKE.test(channel) ? one<{ conversation_key: string }>(`SELECT conversation_key FROM outbox WHERE ${mine} AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?2`, bot, channel) : undefined;
+    if (t) return { key: t.conversation_key, c: configOf(t.conversation_key)!, thread: true };
+    throw new ToolError(`channel ${channel} is not allowed; your channels are ${known.join(", ")}${threadOk ? " (or a thread this bot created in one of them)" : ""}`);
+  }
+  const inLog = (id: string, channelId: string) => one<{ id: string }>("SELECT id FROM channel_message WHERE id = ? AND channel_id = ?", id, channelId) !== undefined;
 
   // Bot-to-bot messages in the current episode (since the newest message of a person) plus reservations.
   function exchanges(c: Config): number {
     // The reset boundary is durable (human_message is never pruned, as on the receiving side), not the 7-day
     // channel log; its time is the snowflake's.
-    const hid = one<{ id: string }>("SELECT id FROM human_message ORDER BY length(id) DESC, id DESC LIMIT 1")?.id;
+    const hid = one<{ id: string }>("SELECT id FROM human_message WHERE channel_id = ? ORDER BY length(id) DESC, id DESC LIMIT 1", c.channel_id)?.id;
     const human = hid === undefined ? undefined : { id: hid, at: Number((BigInt(hid) >> 22n) + 1420070400000n) };
     const bots = [...c.crew.map((b) => b.id), c.bot_user_id];
-    const rows = db.prepare(`SELECT author_id, content FROM channel_message WHERE author_kind = 'bot'${human ? ` AND ${after("id")}` : ""}`)
-      .all(...(human ? [human.id, human.id, human.id] : [])) as { author_id: string; content: string }[];
+    const rows = db.prepare(`SELECT author_id, content FROM channel_message WHERE author_kind = 'bot' AND channel_id = ?${human ? ` AND ${after("id")}` : ""}`)
+      .all(c.channel_id, ...(human ? [human.id, human.id, human.id] : [])) as { author_id: string; content: string }[];
     const logged = rows.filter((m) => bots.some((id) => id !== m.author_id && names(m.content, id))).length;
     // R1: the budget belongs to the channel conversation, not to one bot, so every bot's
     // queued bot-addressed tool sends count (one shared DB), in the channel and in tool threads.
@@ -65,7 +77,6 @@ export function makeTools(tdb: ToolDb, key: string, { now = () => Date.now() }: 
   }
 
   type Row = { key: string; state: string; channel_message_id: string | null; reply_to: string | null };
-  const toolThread = (id: string) => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?", key, id)!.n > 0;
   const result = (op: Op, r: Row, replay: boolean): ToolResult => {
     const status = r.state === "posted" ? (op === "send" ? "posted" : "done") : r.state === "dropped" ? "rejected by the bridge" : "queued";
     const out = { status, ref: r.key, ...(r.channel_message_id ? { messageId: r.channel_message_id } : {}), ...(op === "thread" && r.state === "posted" ? { threadId: r.reply_to } : {}), ...(replay ? { replay: true } : {}) };
@@ -73,11 +84,13 @@ export function makeTools(tdb: ToolDb, key: string, { now = () => Date.now() }: 
   };
 
   // One request: replay check, validation (`check` may throw ToolError), insert; all in one IMMEDIATE transaction.
-  function request(op: Op, idem: unknown, args: Record<string, string | null>, check: (c: Config) => { content: string; replyTo: string | null; users: string[]; meta: Record<string, unknown> }): ToolResult {
+  function request(op: Op, idem: unknown, args: Record<string, string | null>, check: (r: ReturnType<typeof resolve>) => { content: string; replyTo: string | null; users: string[]; meta: Record<string, unknown> }, { threadOk = false } = {}): ToolResult {
     if (typeof idem !== "string" || !IDEM.test(idem)) throw new ToolError("idempotency_key: required, 1-100 characters of A-Z a-z 0-9 . _ : -");
     const canonical = JSON.stringify(args);
     db.exec("BEGIN IMMEDIATE");
     try {
+      const target = resolve(args.channel as string, { threadOk });
+      const key = target.key;
       const prior = one<{ args: string; outbox_id: number }>("SELECT args, outbox_id FROM tool_request WHERE conversation_key = ? AND op = ? AND idem_key = ?", key, op, idem);
       if (prior) {
         if (prior.args !== canonical) throw new ToolError(`idempotency_key ${idem} was already used with other arguments`);
@@ -85,7 +98,7 @@ export function makeTools(tdb: ToolDb, key: string, { now = () => Date.now() }: 
         db.exec("COMMIT");
         return result(op, r, true);
       }
-      const v = check(config());
+      const v = check(target);
       const hex = randomBytes(12).toString("hex");
       const okey = `${PREFIX[op]}:${hex}`;
       const ins = db.prepare(`INSERT INTO outbox (conversation_key, key, content, nonce, reply_to, users, meta, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
@@ -104,35 +117,33 @@ export function makeTools(tdb: ToolDb, key: string, { now = () => Date.now() }: 
   function send(a: Record<string, unknown>): ToolResult {
     const channel = str(a.channel, "channel"), content = str(a.content, "content").trim();
     const replyTo = a.reply_to === undefined || a.reply_to === null ? null : str(a.reply_to, "reply_to");
-    return request("send", a.idempotency_key, { channel, content, reply_to: replyTo }, (c) => {
-      const thread = channel !== c.channel_id && SNOWFLAKE.test(channel) && toolThread(channel);
-      if (channel !== c.channel_id && !thread) throw new ToolError(`channel ${channel} is not allowed; the channel is ${c.channel_id} (or a thread this bot created there)`);
+    return request("send", a.idempotency_key, { channel, content, reply_to: replyTo }, ({ c, thread }) => {
       if (thread && replyTo !== null) throw new ToolError("reply_to is not supported in a thread");
       if (!content) throw new ToolError("content is empty");
       if (content.length > MAX_CONTENT) throw new ToolError(`content is ${content.length} characters; at most ${MAX_CONTENT}`);
-      if (replyTo !== null && (!SNOWFLAKE.test(replyTo) || !inLog(replyTo))) throw new ToolError(`reply_to ${replyTo} is not a message of the channel`);
+      if (replyTo !== null && (!SNOWFLAKE.test(replyTo) || !inLog(replyTo, c.channel_id))) throw new ToolError(`reply_to ${replyTo} is not a message of the channel`);
       const users = c.crew.filter((b) => names(content, b.id)).map((b) => b.id);
       if (users.length && c.exchange_cap > 0) {
         const n = exchanges(c);
         if (n >= c.exchange_cap) throw new ToolError(`exchange cap reached: ${n} bot-to-bot messages since the user's last message (cap ${c.exchange_cap}); wait for the user`);
       }
       return { content, replyTo, users, meta: { channel, ...(thread ? { thread: 1 } : {}), ...(users.length ? { addressesBot: 1 } : {}) } };
-    });
+    }, { threadOk: true });
   }
 
   function react(a: Record<string, unknown>): ToolResult {
-    const messageId = str(a.message_id, "message_id"), emoji = str(a.emoji, "emoji");
-    return request("react", a.idempotency_key, { message_id: messageId, emoji }, (c) => {
-      if (!SNOWFLAKE.test(messageId) || !inLog(messageId)) throw new ToolError(`message_id ${messageId} is not a message of the channel`);
+    const channel = str(a.channel, "channel"), messageId = str(a.message_id, "message_id"), emoji = str(a.emoji, "emoji");
+    return request("react", a.idempotency_key, { channel, message_id: messageId, emoji }, ({ c }) => {
+      if (!SNOWFLAKE.test(messageId) || !inLog(messageId, c.channel_id)) throw new ToolError(`message_id ${messageId} is not a message of the channel`);
       if (emoji.length > 32 || !EMOJI.test(emoji)) throw new ToolError("emoji: one Unicode emoji (custom emoji are not supported)");
       return { content: emoji, replyTo: messageId, users: [], meta: { channel: c.channel_id } };
     });
   }
 
   function thread(a: Record<string, unknown>): ToolResult {
-    const messageId = str(a.message_id, "message_id"), name = str(a.name, "name").trim();
-    return request("thread", a.idempotency_key, { message_id: messageId, name }, (c) => {
-      if (!SNOWFLAKE.test(messageId) || !inLog(messageId)) throw new ToolError(`message_id ${messageId} is not a message of the channel`);
+    const channel = str(a.channel, "channel"), messageId = str(a.message_id, "message_id"), name = str(a.name, "name").trim();
+    return request("thread", a.idempotency_key, { channel, message_id: messageId, name }, ({ c }) => {
+      if (!SNOWFLAKE.test(messageId) || !inLog(messageId, c.channel_id)) throw new ToolError(`message_id ${messageId} is not a message of the channel`);
       if (!name || name.length > 100 || /[\r\n]/.test(name)) throw new ToolError("name: 1-100 characters, one line");
       return { content: name, replyTo: messageId, users: [], meta: { channel: c.channel_id } };
     });
@@ -141,35 +152,34 @@ export function makeTools(tdb: ToolDb, key: string, { now = () => Date.now() }: 
   // Read-only: the bridge's channel log (allowlisted people, allowed crew bots, this bot), newest `limit` before
   // `before` (or the newest), oldest first. Only the channel; threads are not in the log.
   function read(a: Record<string, unknown>): ToolResult {
-    const c = config();
     const channel = str(a.channel, "channel");
-    if (channel !== c.channel_id) throw new ToolError(`channel ${channel} cannot be read; the channel is ${c.channel_id}`);
+    resolve(channel);
     const limit = a.limit === undefined ? 20 : a.limit;
     if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > READ_MAX) throw new ToolError(`limit: an integer 1-${READ_MAX}`);
     const before = a.before === undefined || a.before === null ? null : str(a.before, "before");
     if (before !== null && !SNOWFLAKE.test(before)) throw new ToolError("before: a message id");
     const lt = "(length(id) < length(?) OR (length(id) = length(?) AND id < ?))";
-    const rows = (db.prepare(`SELECT id, author_id, author_name, author_kind, content, at FROM channel_message${before ? ` WHERE ${lt}` : ""} ORDER BY length(id) DESC, id DESC LIMIT ?`)
-      .all(...(before ? [before, before, before] : []), limit) as { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number }[]).reverse();
+    const rows = (db.prepare(`SELECT id, author_id, author_name, author_kind, content, at FROM channel_message WHERE channel_id = ?${before ? ` AND ${lt}` : ""} ORDER BY length(id) DESC, id DESC LIMIT ?`)
+      .all(channel, ...(before ? [before, before, before] : []), limit) as { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number }[]).reverse();
     const out = { channel, messages: rows.map((r) => ({ id: r.id, author: r.author_name, authorId: r.author_id, kind: r.author_kind, content: r.content, at: new Date(r.at).toISOString() })) };
     return { content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out };
   }
 
   const idemProp = { type: "string", description: "Required. Your own unique key for this action (e.g. a short slug). Re-sending the same key with the same arguments returns the first result instead of posting twice." };
   const tools: Tool[] = [
-    { name: "discord_send", description: "Post a message to the bot's Discord channel. The bridge posts it in order after anything already queued. Mention a crew bot with <@id> only to hand it work; that counts toward the bot-to-bot exchange cap. After posting with this tool, end your turn with exactly NO_REPLY so your final text is not posted as well.",
+    { name: "discord_send", description: "Post a message to one of the bot's Discord channels (usually the one the conversation came from). The bridge posts it in order after anything already queued. Mention a crew bot with <@id> only to hand it work; that counts toward the bot-to-bot exchange cap. After posting with this tool, end your turn with exactly NO_REPLY so your final text is not posted as well.",
       inputSchema: { type: "object", additionalProperties: false, required: ["channel", "content", "idempotency_key"],
-        properties: { channel: { type: "string", description: "Channel id (the bot's channel)." }, content: { type: "string", maxLength: MAX_CONTENT }, reply_to: { type: "string", description: "Optional: id of a message in the channel to reply to." }, idempotency_key: idemProp } },
+        properties: { channel: { type: "string", description: "Channel id: one of the bot's channels, or a thread this bot created in one." }, content: { type: "string", maxLength: MAX_CONTENT }, reply_to: { type: "string", description: "Optional: id of a message in the channel to reply to." }, idempotency_key: idemProp } },
       call: send },
-    { name: "discord_react", description: "Add a reaction (one Unicode emoji) to a message in the bot's Discord channel.",
-      inputSchema: { type: "object", additionalProperties: false, required: ["message_id", "emoji", "idempotency_key"],
-        properties: { message_id: { type: "string" }, emoji: { type: "string" }, idempotency_key: idemProp } },
+    { name: "discord_react", description: "Add a reaction (one Unicode emoji) to a message in one of the bot's Discord channels.",
+      inputSchema: { type: "object", additionalProperties: false, required: ["channel", "message_id", "emoji", "idempotency_key"],
+        properties: { channel: { type: "string", description: "Channel id of the message." }, message_id: { type: "string" }, emoji: { type: "string" }, idempotency_key: idemProp } },
       call: react },
-    { name: "discord_thread", description: "Start a thread from a message in the bot's Discord channel. Once created (status done, threadId), discord_send can post into it with channel = threadId.",
-      inputSchema: { type: "object", additionalProperties: false, required: ["message_id", "name", "idempotency_key"],
-        properties: { message_id: { type: "string" }, name: { type: "string", maxLength: 100 }, idempotency_key: idemProp } },
+    { name: "discord_thread", description: "Start a thread from a message in one of the bot's Discord channels. Once created (status done, threadId), discord_send can post into it with channel = threadId.",
+      inputSchema: { type: "object", additionalProperties: false, required: ["channel", "message_id", "name", "idempotency_key"],
+        properties: { channel: { type: "string", description: "Channel id of the message." }, message_id: { type: "string" }, name: { type: "string", maxLength: 100 }, idempotency_key: idemProp } },
       call: thread },
-    { name: "discord_read", description: "Read recent messages of the bot's Discord channel (the people and crew bots the bridge listens to), oldest first. Read-only.",
+    { name: "discord_read", description: "Read recent messages of one of the bot's Discord channels (the people and crew bots the bridge listens to), oldest first. Read-only.",
       inputSchema: { type: "object", additionalProperties: false, required: ["channel"],
         properties: { channel: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: READ_MAX }, before: { type: "string", description: "Optional: only messages older than this message id." } } },
       call: read },

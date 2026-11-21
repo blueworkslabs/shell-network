@@ -39,7 +39,7 @@ const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)
 export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
 type Found = { status: "found"; message: DiscordMessage } | { status: "absent" } | { status: "unknown" };
 export interface BotOptions {
-  name: string; conversationKey: string; channelId: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
+  name: string; conversationKey: string; channelId: string; threadLabel?: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
   buffer: Buffer; t3: T3Port; discord: DiscordPort; log: Log; now?: () => number;
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
@@ -60,7 +60,7 @@ const PAGE = 100;
 const DISCORD_EPOCH = 1420070400000n;
 const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) ) - DISCORD_EPOCH) << 22n;
 
-export function makeBot({ name, conversationKey, channelId, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
+export function makeBot({ name, conversationKey, channelId, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
   allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000 }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
@@ -112,7 +112,7 @@ export function makeBot({ name, conversationKey, channelId, botUserId, botRoleId
     // Channel log for the unread header: the allowlisted people, the allowed crew bots and this bot itself only.
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content: String(msg.content ?? ""), at: Date.parse(msg.timestamp as string) || now() });
+        content: String(msg.content ?? ""), at: Date.parse(msg.timestamp as string) || now(), channelId });
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
@@ -126,7 +126,7 @@ export function makeBot({ name, conversationKey, channelId, botUserId, botRoleId
     const stripped = (botRoleId ? withoutUser.replace(roleRe(), "") : withoutUser).trim();
     if (!stripped && fromBot) return { accepted: false, reason: "empty after mention" };
     const text = stripped || BARE_MENTION_TEXT;
-    const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now() };
+    const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
     if (crewBot) {
       const b = buffer.acceptFromBot(input, exchangeCap);
@@ -205,7 +205,7 @@ export function makeBot({ name, conversationKey, channelId, botUserId, botRoleId
       return new Error(`thread escalated: ${why}`);
     };
     let title = buffer.kvGet(K("threadTitle"));
-    if (!title) { title = `${name} (bridge ${now().toString(36)})`; buffer.kvSet(K("threadTitle"), title); }
+    if (!title) { title = `${threadLabel ?? name} (bridge ${now().toString(36)})`; buffer.kvSet(K("threadTitle"), title); }
     const listed = await t3.findThreads({ projectId, title });
     if (listed.some((t) => typeof t?.title !== "string" || typeof t?.threadId !== "string" || !t.threadId)) throw escalate("thread list item without a string title/threadId; lookup cannot rule out an earlier launch");
     const found = listed.filter((t) => t.title === title);
@@ -286,7 +286,7 @@ export function makeBot({ name, conversationKey, channelId, botUserId, botRoleId
     const inThread = h.key.startsWith("tool:") && meta.thread === 1;
     if (inThread ? !meta.channel || !buffer.isToolThread(conversationKey, meta.channel) : meta.channel !== channelId) return "channel not allowed";
     if (inThread && h.reply_to !== null) return "no reply targets in a thread";
-    if (h.reply_to !== null && !buffer.channelMessage(h.reply_to)) return "target is not a message of the channel";
+    if (h.reply_to !== null && buffer.channelMessage(h.reply_to)?.channel_id !== channelId) return "target is not a message of the channel";
     if (h.key.startsWith("tool:") && (!h.content.trim() || h.content.length > PART)) return "content empty or too long";
     return null;
   }
@@ -605,7 +605,7 @@ export function makeBot({ name, conversationKey, channelId, botUserId, botRoleId
     const since = buffer.kvGet(K("headerSince"));
     // Bounded read: at most `headerMaxMessages` lines can be shown, and lines are dropped oldest unaddressed first, then
     // oldest addressed (below), so only the newest `headerMaxMessages` of each kind can ever be shown; the rest is counted.
-    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages });
+    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId });
     const newest = [...(win.newestId ? [win.newestId] : []), ...rows.map((r) => r.source_message_id)].sort((a, b) => byId({ id: a }, { id: b })).at(-1);
     if (newest) buffer.kvSet(K("headerSince"), newest);
     const hint = [...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`);

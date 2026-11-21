@@ -27,7 +27,7 @@ export interface DiscordRole { id: string; tags?: { bot_id?: string } }
 export interface DiscordRest extends DiscordPort, CommandsPort {
   guildRoles(guildId: string): Promise<DiscordRole[]>;
   me(): Promise<{ id: string; [k: string]: unknown }>;
-  openDm(userId: string): Promise<{ id: string; type?: number }>; // the bot's DM channel with a user (the same one every time)
+  openDm(userId: string, signal?: AbortSignal): Promise<{ id: string; type?: number }>; // the bot's DM channel with a user (the same one every time); `signal` cancels the request
   interactions: InteractionPort;
 }
 const EPHEMERAL = 64;
@@ -76,7 +76,7 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
     }),
     guildRoles: (guildId: string) => api.guilds.getRoles(guildId),
     me: () => api.users.getCurrent() as unknown as Promise<{ id: string; [k: string]: unknown }>,
-    openDm: (userId: string) => { if (!SNOWFLAKE.test(userId)) throw new Error("user id malformed"); return api.users.createDM(userId) as unknown as Promise<{ id: string; type?: number }>; },
+    openDm: (userId: string, signal?: AbortSignal) => { if (!SNOWFLAKE.test(userId)) throw new Error("user id malformed"); return api.users.createDM(userId, { signal }) as unknown as Promise<{ id: string; type?: number }>; },
     // nonce + enforce_nonce: Discord returns the already-created message for a repeated nonce (dedupe window of a
     // few minutes), so a post repeated after a crash does not appear twice within that window.
     createMessage: (channelId: string, payload: CreateMessagePayload): Promise<DiscordMessage> => {

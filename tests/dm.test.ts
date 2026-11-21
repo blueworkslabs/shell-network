@@ -27,10 +27,12 @@ test("OPEN: the DM channel comes from Discord; a user whose DM cannot be opened 
   assert.deepEqual(await openDms({ discord, users: [HUMAN_ID, "2", "3"], log }), [{ userId: HUMAN_ID, channelId: DM_CH }]);
   assert.equal(log.events.filter((e) => e.event === "bridge.dm_open_failed").length, 2, "a failed open and a channel that is not a DM");
   // the whole startup lookup is bounded: lookups that never answer (e.g. rate-limit waits) end at the budget, in all
-  const slow = { async openDm() { return new Promise<never>(() => {}); } };
+  const aborted: string[] = [];
+  const slow = { async openDm(userId: string, signal?: AbortSignal) { signal?.addEventListener("abort", () => aborted.push(userId)); return new Promise<never>(() => {}); } };
   const t0 = Date.now();
   assert.deepEqual(await openDms({ discord: slow, users: ["4", "5", "6"], log, timeoutMs: 100 }), []);
   assert.ok(Date.now() - t0 < 1000, "three hung lookups share one budget, not 3 x the budget");
+  assert.deepEqual(aborted, ["4"], "the request running at the deadline is aborted; the others never start");
   assert.match(String(log.events.at(-1)!.error), /timed out/);
   // a fast user before a hung one is opened
   const mixed = { async openDm(userId: string) { return userId === "4" ? new Promise<never>(() => {}) : { id: DM_CH, type: 1 }; } };
@@ -44,6 +46,15 @@ test("REST: openDm posts to /users/@me/channels; a DM channel is writable only o
     seen.push({ path: new URL(url).pathname, body: init.body ? JSON.parse(String(init.body)) : undefined });
     return new URL(url).pathname.endsWith("/users/@me/channels") ? json({ id: DM_CH, type: 1 }) : json({ id: "m" });
   } });
+  // the abort reaches the HTTP request
+  let gotSignal: AbortSignal | undefined;
+  const r2 = discordRest({ token: "t", allowedChannels: [GUILD_CH], makeRequest: async (_url: string, init: any) => { gotSignal = init.signal; return new Promise((_, reject) => init.signal?.addEventListener("abort", () => reject(new Error("aborted")))); } });
+  const ac = new AbortController();
+  const p = r2.openDm(HUMAN_ID, ac.signal);
+  await new Promise((r) => setTimeout(r, 20));
+  ac.abort();
+  await assert.rejects(p);
+  assert.ok(gotSignal, "the request carried a signal");
   assert.deepEqual(await rest.openDm(HUMAN_ID), { id: DM_CH, type: 1 });
   assert.deepEqual(seen[0], { path: "/api/v10/users/@me/channels", body: { recipient_id: HUMAN_ID } });
   assert.throws(() => rest.createMessage(DM_CH, { content: "x" }), /refused/, "not before it is admitted");

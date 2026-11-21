@@ -105,9 +105,78 @@ test("imports SQLite rows, zstd archives and all five legacy forms into private 
 
 test("malformed transcript input fails without echoing the transcript", () => {
   const legacy = tempDir("legacy-");
-  writeFileSync(join(legacy, "broken.jsonl"), 'PRIVATE_SYNTHETIC_INVALID_JSON');
+  writeFileSync(join(legacy, "broken.jsonl"), jsonl(session("broken-session")) + 'PRIVATE_SYNTHETIC_INVALID_JSON');
   const result = run(tempDir("output-"), "--jsonl-dir", legacy);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Invalid transcript JSON/);
   assert.doesNotMatch(result.stderr, /PRIVATE_SYNTHETIC/);
+});
+
+
+test("skips legacy sidecars and headerless files by name and continues importing", () => {
+  const legacy = tempDir("legacy-"), output = tempDir("output-");
+  const sidecars = ["old.trajectory.jsonl", "old.trajectory.jsonl.bak.1", "old.trajectory-path.json", "legacy-store.sessions.json.bak"];
+  for (const name of sidecars) writeFileSync(join(legacy, name), jsonl(session("not-a-session"), msg("x", "user", "Sidecar")));
+  writeFileSync(join(legacy, "headerless.jsonl"), jsonl(msg("x", "user", "Missing header")));
+  writeFileSync(join(legacy, "garbage.jsonl"), "SYNTHETIC_DO_NOT_LOG");
+  writeFileSync(join(legacy, "valid.jsonl"), jsonl(session("good"), msg("x", "user", "Preserved")));
+  const result = run(output, "--jsonl-dir", legacy);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { sessions: 1, written: 1, unchanged: 0 });
+  for (const name of [...sidecars, "headerless.jsonl", "garbage.jsonl"]) assert.ok(result.stderr.includes(JSON.stringify(name)));
+  assert.doesNotMatch(result.stderr, /SYNTHETIC_DO_NOT_LOG|Missing header/);
+});
+
+test("recovers a legacy session key from the filename and a channel label from the database", () => {
+  const legacy = tempDir("legacy-"), output = tempDir("output-");
+  const database = join(tempDir("db-"), "copy.sqlite");
+  const db = new DatabaseSync(database);
+  db.exec(`
+    CREATE TABLE transcript_events(session_id TEXT, seq INTEGER, event_json TEXT, event_zstd BLOB);
+    CREATE TABLE session_nodes(session_key TEXT, current_session_id TEXT, label TEXT);
+    CREATE TABLE conversations(native_channel_id TEXT, label TEXT, kind TEXT);
+    CREATE TABLE session_transcript_archives(session_id TEXT, archive_blob BLOB, encoding TEXT);
+    INSERT INTO conversations VALUES ('202', 'Recovered Label', 'channel');
+  `);
+  db.close();
+  writeFileSync(join(legacy, "agent_sample_discord_channel_202.legacy-id.jsonl.imported-2"),
+    jsonl(session("legacy-id"), msg("one", "user", "A legacy conversation")));
+  const result = run(output, "--database", database, "--jsonl-dir", legacy);
+  assert.equal(result.status, 0, result.stderr);
+  const archive = readFileSync(join(output, "sessions", "2026-01-02--recovered-label--legacy-i.md"), "utf8");
+  assert.match(archive, /Session key: agent:sample:discord:channel:202/);
+  assert.match(archive, /Channel: Recovered Label/);
+});
+
+function importOne(...events: unknown[]) {
+  const legacy = tempDir("legacy-"), output = tempDir("output-");
+  writeFileSync(join(legacy, "test.jsonl"), jsonl(session("legacy-id"), ...events));
+  const result = run(output, "--jsonl-dir", legacy);
+  assert.equal(result.status, 0, result.stderr);
+  const dir = join(output, "sessions");
+  const files = readdirSync(dir);
+  return { counts: JSON.parse(result.stdout), files, text: files.map((f) => readFileSync(join(dir, f), "utf8")).join("\n") };
+}
+
+test("drops heartbeat marker messages with or without trailing instructions", () => {
+  const { text } = importOne(msg("bare", "user", "[OpenClaw heartbeat poll]"),
+    msg("variant", "user", [{ type: "text", text: "[OpenClaw heartbeat poll]\nExtra instructions." }]),
+    msg("normal", "user", "Retain this message."));
+  assert.match(text, /Retain this message/);
+  assert.doesNotMatch(text, /heartbeat poll|Extra instructions/);
+});
+
+test("drops tool-only assistant turns while preserving tool names attached to text", () => {
+  const { text } = importOne(msg("mixed", "assistant", [{ type: "text", text: "I checked." }, { type: "toolCall", name: "lookup" }]),
+    msg("tool-only", "assistant", [{ type: "thinking", text: "Omit me." }, { type: "toolCall", name: "skip-tool" }]));
+  assert.match(text, /I checked\.[\s\S]+→ tool: lookup/);
+  assert.doesNotMatch(text, /skip-tool|Omit me/);
+  assert.equal(text.match(/^## assistant/mg)?.length, 1);
+});
+
+test("leaves sessions without rendered turns out of the archive and count", () => {
+  const result = importOne(msg("poll", "user", "[OpenClaw heartbeat poll] More text"),
+    msg("answer", "assistant", "HEARTBEAT_OK"), msg("tool", "assistant", [{ type: "toolCall", name: "only" }]));
+  assert.deepEqual(result.files, []);
+  assert.deepEqual(result.counts, { sessions: 0, written: 0, unchanged: 0 });
 });

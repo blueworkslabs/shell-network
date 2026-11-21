@@ -11,7 +11,8 @@ try {
   if (values.help) console.log(usage);
   else {
     if (!values.output || (!values.database && !values["jsonl-dir"]?.length)) throw new Error(usage);
-    const result = importTranscripts({ database: values.database, jsonlDirectories: values["jsonl-dir"], output: values.output });
+    const result = importTranscripts({ database: values.database, jsonlDirectories: values["jsonl-dir"], output: values.output,
+      onSkip: (name) => console.error(`Skipping legacy file ${JSON.stringify(name)}`) });
     console.log(JSON.stringify(result));
   }
 } catch (e) {

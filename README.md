@@ -172,14 +172,17 @@ node bin/import-transcripts.ts --database /private/copy.sqlite \
 Supply the database, one or more `--jsonl-dir` options, or both. Use a SQLite backup or a consistent snapshot that
 includes committed WAL data. The importer opens the database read-only and never changes the transcripts. It reads
 plain and zstd database events, zstd transcript archives, and supported legacy JSONL variants. It merges duplicates
-by session and event ID. Markdown preserves user and assistant text, timestamps, tool names, and compaction
-summaries. Tool arguments, tool results, thinking and standard heartbeat polls are dropped. Archives still contain
+by session and event ID. Legacy sidecars and files without a session header are skipped and reported by filename.
+Recognized legacy filenames supply missing session keys, and copied database metadata supplies channel labels
+when available. Markdown preserves user and assistant text, timestamps, tool names attached to text, and compaction
+summaries. Tool-only turns, tool arguments, tool results, thinking and heartbeat polls are dropped. Archives still contain
 private conversation text, including anything participants pasted into messages.
 
-The command prints counts for unique sessions, written files, and unchanged files. Reuse the same output directory
+The command counts sessions with rendered turns, and reports written and unchanged files. Reuse the same output directory
 with a complete copy of the sources to update changed sessions. Existing filenames are retained for stable references,
 and files for sessions missing from later input stay in place. Keep the generated archive as importer-owned output.
-An unparseable source fails the import before any output is written. Decompressed zstd records and archives are
+Use a fresh output directory to compare counts after changing filters. Invalid event data after a valid transcript
+header, or in a database event, fails the import before any output is written. Decompressed zstd records and archives are
 limited to 128 MiB each. For the migration check, compare the count against the unique source session count and
 spot-check five sessions before enabling archive search.
 

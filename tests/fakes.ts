@@ -6,8 +6,8 @@ import type { CreateMessagePayload, DiscordMessage, ModelSelection, Projection, 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "rolled_back"]);
 
 export interface FakeRun { runId: string; ordinal: number; status: string; userMessageId: string; text: string; queueHeld?: boolean; inputType?: "user_message" | "notification" }
-export interface FakeThread { id: string; projectId: string; title: string; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[] }
-export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; launch?: "after"; post?: "before" | "after"; react?: "before" }
+export interface FakeThread { id: string; projectId: string; title: string; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[]; archived?: boolean }
+export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; launch?: "after"; archive?: "after"; post?: "before" | "after"; react?: "before" }
 export interface FakeCall { tool: string; title?: string; threadId?: string; mode?: string; clientRequestId?: string; message?: string }
 type SendArgs = { threadId: string; message: string; mode: string; clientRequestId: string };
 export interface FakeT3 {
@@ -19,6 +19,7 @@ export interface FakeT3 {
   projection(threadId: string): Promise<Projection>;
   queue(threadId: string): Promise<QueueList>;
   send(args: SendArgs): Promise<{ messageId: string; runId?: string; delivery?: string; status?: string }>;
+  archive(threadId: string): Promise<{ archived: true }>; // idempotent, like t3
   complete(threadId: string, runId: string, text: string | null): void;
   fail(threadId: string, runId: string, opts?: { holdQueue?: boolean }): void;
   resume(threadId: string): void; // t3's queue.resume: clears queueHeld on every queued run, then starts the next
@@ -33,7 +34,7 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
   const calls: FakeCall[] = [];
   const crash: Crash = {}; // { send: "before" | "after", launch: "after" } -> consumed once; needs crash.buffer
   let n = 0;
-  const die = (point: "send" | "launch"): never => { crash.buffer?.close(); delete crash[point]; throw new Error(`CRASH at ${point}`); };
+  const die = (point: "send" | "launch" | "archive"): never => { crash.buffer?.close(); delete crash[point]; throw new Error(`CRASH at ${point}`); };
   const th = (id: string) => { const t = threads.get(id); if (!t) throw new Error(`no thread ${id}`); return t; };
   const promote = (t: FakeThread) => {
     if (t.runs.some((r) => ["running", "preparing", "waiting"].includes(r.status))) return;
@@ -90,6 +91,12 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       }
       if (crash.send === "after") die("send");
       return { messageId, runId: run.runId, delivery, status: run.status };
+    },
+    async archive(threadId) {
+      calls.push({ tool: "archive", threadId });
+      th(threadId).archived = true;
+      if (crash.archive === "after") die("archive");
+      return { archived: true };
     },
     // test controls
     complete(threadId, runId, text) {

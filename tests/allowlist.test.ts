@@ -7,7 +7,7 @@ import { t3Adapter } from "../lib/t3.ts";
 import { memoryLog } from "../lib/log.ts";
 
 const DEPLOYED: string[] = JSON.parse(readFileSync(new URL("./fixtures/t3-mcp-tool-names.json", import.meta.url), "utf8")).names;
-const ALLOWED = ["t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send"];
+const ALLOWED = ["t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send", "t3_thread_organize"];
 const P = "proj-gem", I = "crewGemClaude", T = "thread-gem";
 
 type Harness = ReturnType<typeof harness>;
@@ -25,6 +25,7 @@ const ok: Record<string, Record<string, unknown>> = {
   t3_thread_read: { threadId: T, view: "activity", limit: 100, runLimit: 50, maxCharsPerItem: 50_000, afterPosition: 7 },
   t3_queue: { action: "list", threadId: T },
   t3_thread_send: { threadId: T, message: "hi", mode: "queue", clientRequestId: "bridge-gem-1" },
+  t3_thread_organize: { action: "archive", threadId: T },
 };
 const denied = async (h: Harness, name: string, args: unknown, re?: RegExp) => {
   const before = h.calls.length;
@@ -61,6 +62,18 @@ test("DENY send: any mode but queue, missing clientRequestId, another thread, ex
   await denied(h, "t3_thread_send", { ...ok.t3_thread_send, threadId: "someone-elses-thread" });
   await denied(h, "t3_thread_send", { ...ok.t3_thread_send, attachments: [] }, /not allowed/);
   await denied(h, "t3_thread_send", { ...ok.t3_thread_send, message: "" });
+});
+
+test("DENY organize: only archive, only the bound thread, no other argument, nothing while no thread is bound", async () => {
+  const h = harness();
+  for (const action of ["unarchive", "pin", "unpin", "snooze", "unsnooze", "settle", "unsettle", "mark_unread", "delete", "", null]) await denied(h, "t3_thread_organize", { action, threadId: T });
+  await denied(h, "t3_thread_organize", { action: "archive", threadId: "someone-elses-thread" });
+  await denied(h, "t3_thread_organize", { action: "archive" }, /threadId required/);
+  await denied(h, "t3_thread_organize", { threadId: T }, /action required/);
+  await denied(h, "t3_thread_organize", { action: "archive", threadId: T, environmentId: "other" }, /not allowed/);
+  await denied(h, "t3_thread_organize", { action: "snooze", threadId: T, snoozedUntil: "2030-01-01T00:00:00Z" });
+  h.state.bound = null;
+  await denied(h, "t3_thread_organize", ok.t3_thread_organize);
 });
 
 test("DENY launch: other project, other instance, or a thread already bound", async () => {
@@ -108,4 +121,5 @@ test("adapter: its real call shapes pass the allowlist (paged read, paged list, 
   assert.deepEqual((await a.read(T)).items!.map((x) => x.text), ["earlier input", "latest reply"]);
   assert.deepEqual((await a.queue(T)).items.map((x) => x.text), ["first", "second"]);
   await a.send({ threadId: T, message: "m", mode: "queue", clientRequestId: "c" });
+  await a.archive(T);
 });

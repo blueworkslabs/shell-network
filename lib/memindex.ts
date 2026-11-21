@@ -29,12 +29,14 @@ const MAX_FILE = 8 * 1024 * 1024, MAX_FILES = 50_000, MAX_ENTRIES = 200_000, MAX
 const SYNC_EVERY_MS = 5_000, CANDIDATES = 50, RRF_K = 60, EMBED_BATCH = 64, LEASE_MS = 5 * 60_000;
 // Below this cosine a chunk is not a meaning match at all (unrelated text with text-embedding-3-small sits around 0.1-0.2):
 // without a floor every chunk would come back as "semantic".
-export const MIN_SIMILARITY = 0.3;
+export const MIN_SIMILARITY = 0.3; // the default; DISCORD_TOOL_EMBED_MIN_SIMILARITY overrides it
 
 // ---- chunking ----
 export interface Chunk { start: number; end: number; text: string }
 const words = (s: string) => s.split(/\s+/).filter(Boolean).length;
-export function chunkMarkdown(text: string): Chunk[] {
+// groupTurns (session transcripts, `## user · …` / `## assistant · …` / `## summary`): adjacent short turns share a chunk
+// up to CHUNK_WORDS, so a question stays together with its answer; a long turn is cut like a long section.
+export function chunkMarkdown(text: string, { groupTurns = false }: { groupTurns?: boolean } = {}): Chunk[] {
   const lines = text.split(/\r?\n/);
   const out: Chunk[] = [];
   let heading = "";
@@ -63,6 +65,19 @@ export function chunkMarkdown(text: string): Chunk[] {
     }
     emit(s, to);
   };
+  if (groupTurns) {
+    // sections at headings, then greedy groups of whole sections up to CHUNK_WORDS
+    const starts = lines.map((l, i) => (i === 0 || /^#{1,6}\s/.test(l) ? i : -1)).filter((i) => i >= 0);
+    let gStart = 0, gWords = 0;
+    for (const [k, s] of starts.entries()) {
+      const e = k + 1 < starts.length ? starts[k + 1] - 1 : lines.length - 1;
+      const w = words(lines.slice(s, e + 1).join(" "));
+      if (s > gStart && gWords + w > CHUNK_WORDS) { section(gStart, s - 1); gStart = s; gWords = 0; }
+      gWords += w;
+    }
+    if (lines.length) section(gStart, lines.length - 1);
+    return out;
+  }
   for (let i = 0; i < lines.length; i++) {
     if (/^#{1,6}\s/.test(lines[i]) && i > sectionStart) { section(sectionStart, i - 1); sectionStart = i; }
     if (/^#{1,6}\s/.test(lines[i])) heading = lines[i].trim();
@@ -72,6 +87,8 @@ export function chunkMarkdown(text: string): Chunk[] {
 }
 
 // ---- embeddings ----
+// `model` names the vector space the index stores vectors under: a change of model or dimensions is a new space, and
+// vectors of any other space are dropped and re-embedded.
 export interface Embedder { model: string; embed(texts: string[]): Promise<Float32Array[]> }
 // Any OpenAI-compatible POST {baseUrl}/embeddings. The key is read once, sent only in the Authorization header and never
 // put into an error or a log line; 429, 5xx and network failures are retried with backoff.
@@ -81,7 +98,7 @@ export function httpEmbedder({ baseUrl, model, key, dimensions, fetchImpl = fetc
   const url = `${baseUrl.replace(/\/+$/, "")}/embeddings`;
   const clean = (s: string) => (key ? s.split(key).join("[key]") : s);
   return {
-    model,
+    model: dimensions ? `${model}@${dimensions}` : model,
     async embed(texts) {
       for (let attempt = 0; ; attempt++) {
         let res: Response | null = null, failure = "";
@@ -108,6 +125,9 @@ const normalize = (v: Float32Array) => { let n = 0; for (const x of v) n += x * 
 const blob = (v: Float32Array) => new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
 const fromBlob = (b: Uint8Array) => new Float32Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
 
+// Transcripts of earlier conversations live under `sessions/` in the notes root (#39); everything else is a note.
+export const isSession = (path: string) => path.startsWith("sessions/");
+
 // ---- the index ----
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -118,10 +138,10 @@ CREATE INDEX IF NOT EXISTS chunk_hash ON chunk(hash);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(text);
 CREATE TABLE IF NOT EXISTS vector (hash TEXT NOT NULL, model TEXT NOT NULL, v BLOB NOT NULL, PRIMARY KEY (hash, model));
 `;
-export interface MemMatch { file: string; line: number; text: string; match: "text" | "semantic" | "both" }
+export interface MemMatch { file: string; line: number; text: string; match: "text" | "semantic" | "both"; kind: "note" | "session" }
 export interface MemResult { matches: MemMatch[]; incomplete: boolean; semantic: boolean; reason?: string; unembedded?: number }
 
-export function openMemIndex({ root: dir, indexPath, embedder = null, now = () => Date.now() }: { root: string; indexPath: string; embedder?: Embedder | null; now?: () => number }) {
+export function openMemIndex({ root: dir, indexPath, embedder = null, now = () => Date.now(), minSimilarity = MIN_SIMILARITY }: { root: string; indexPath: string; embedder?: Embedder | null; now?: () => number; minSimilarity?: number }) {
   if (!isAbsolute(dir)) throw new Error("notes directory must be absolute");
   const info = lstatSync(dir);
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("notes directory must be a regular directory, not a symlink");
@@ -194,7 +214,7 @@ export function openMemIndex({ root: dir, indexPath, embedder = null, now = () =
       if (k && k.mtime_ms === f.mtime && k.size === f.size) continue;
       const text = readNote(f.abs);
       if (text === null) { incomplete = true; continue; }
-      const chunks = chunkMarkdown(text);
+      const chunks = chunkMarkdown(text, { groupTurns: isSession(path) });
       tx(() => {
         drop(path);
         db.prepare("INSERT INTO file (path, mtime_ms, size) VALUES (?, ?, ?)").run(path, f.mtime, f.size);
@@ -240,8 +260,8 @@ export function openMemIndex({ root: dir, indexPath, embedder = null, now = () =
         embedded += batch.length;
         if (!takeLease()) break; // renewed; someone else took over after an expiry
       }
-      // vectors of text that no chunk has any more
-      tx(() => db.prepare("DELETE FROM vector WHERE hash NOT IN (SELECT hash FROM chunk)").run());
+      // vectors of text that no chunk has any more, and of another model (or dimensions)
+      tx(() => { db.prepare("DELETE FROM vector WHERE hash NOT IN (SELECT hash FROM chunk)").run(); db.prepare("DELETE FROM vector WHERE model != ?").run(embedder.model); });
     } finally { dropLease(); }
     return { embedded };
   }
@@ -272,7 +292,7 @@ export function openMemIndex({ root: dir, indexPath, embedder = null, now = () =
           if (v.length !== qv.length) continue;
           let s = 0;
           for (let i = 0; i < v.length; i++) s += v[i] * qv[i];
-          if (s < MIN_SIMILARITY) continue;
+          if (s < minSimilarity) continue;
           if (best.length < CANDIDATES || s > best[best.length - 1].s) {
             best.push({ id: r.id, s });
             best.sort((a, b) => b.s - a.s);
@@ -305,7 +325,7 @@ export function openMemIndex({ root: dir, indexPath, embedder = null, now = () =
       const key = `${c.path}:${c.start_line + li}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      matches.push({ file: c.path, line: c.start_line + li, text: excerpt(lines[li] ?? "", at), match: f.match });
+      matches.push({ file: c.path, line: c.start_line + li, text: excerpt(lines[li] ?? "", at), match: f.match, kind: isSession(c.path) ? "session" : "note" });
     }
     return { matches, incomplete: sync.incomplete || ranked.length > matches.length, semantic, ...(reason ? { reason } : {}), ...(unembedded !== undefined ? { unembedded } : {}) };
   }
@@ -336,4 +356,13 @@ export function embedderFromEnv(env: Record<string, string | undefined>): Embedd
   const key = readFileSync(keyFile, "utf8").trim();
   if (!key) throw new Error("DISCORD_TOOL_EMBED_KEY: the key file is empty");
   return httpEmbedder({ baseUrl: base, model, key, dimensions: dims });
+}
+
+// The similarity floor from the environment (DISCORD_TOOL_EMBED_MIN_SIMILARITY), or the default.
+export function minSimilarityFromEnv(env: Record<string, string | undefined>): number {
+  const v = env.DISCORD_TOOL_EMBED_MIN_SIMILARITY;
+  if (v === undefined || v === "") return MIN_SIMILARITY;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < -1 || n > 1) throw new Error("DISCORD_TOOL_EMBED_MIN_SIMILARITY: a number from -1 to 1");
+  return n;
 }

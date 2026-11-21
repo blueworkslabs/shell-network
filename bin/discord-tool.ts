@@ -14,7 +14,9 @@
 //                           the plain file walk; the index is kept up to date in the background every
 //                           DISCORD_TOOL_INDEX_EVERY_MS (default 600000)
 //   DISCORD_TOOL_EMBED_URL, DISCORD_TOOL_EMBED_MODEL, DISCORD_TOOL_EMBED_KEY (a key file), DISCORD_TOOL_EMBED_DIMENSIONS
-//                           optional, an OpenAI-compatible embeddings endpoint; without them search is text only
+//                           optional, an OpenAI-compatible embeddings endpoint; without them search is text only. The
+//                           endpoint receives note and transcript excerpts and the queries.
+//   DISCORD_TOOL_EMBED_MIN_SIMILARITY  optional, the cosine below which a chunk is no meaning match (default 0.3)
 // stdout carries protocol messages only; diagnostics go to stderr.
 import { statSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
@@ -22,7 +24,7 @@ import { createInterface } from "node:readline";
 import { openToolDb } from "../lib/tooldb.ts";
 import { handle, parseLine } from "../lib/mcpserver.ts";
 import { memoryTool } from "../lib/memory.ts";
-import { embedderFromEnv, openMemIndex } from "../lib/memindex.ts";
+import { embedderFromEnv, minSimilarityFromEnv, openMemIndex } from "../lib/memindex.ts";
 import { preflight } from "../lib/preflight.ts";
 import { makeTools } from "../lib/tools.ts";
 
@@ -40,7 +42,7 @@ const { tools } = makeTools(db, key, { workspace, stagingDir: join(dirname(dbPat
 let indexTimer: ReturnType<typeof setInterval> | undefined;
 if (process.env.DISCORD_TOOL_NOTES !== undefined && process.env.DISCORD_TOOL_MEMORY_INDEX) {
   if (process.env.DISCORD_TOOL_EMBED_KEY) { try { preflight({ secretFiles: [process.env.DISCORD_TOOL_EMBED_KEY] }); } catch (e) { fatal((e as Error).message); } }
-  const index = (() => { try { return openMemIndex({ root: process.env.DISCORD_TOOL_NOTES!, indexPath: process.env.DISCORD_TOOL_MEMORY_INDEX!, embedder: embedderFromEnv(process.env) }); } catch (e) { return fatal(`memory index: ${(e as Error).message}`); } })();
+  const index = (() => { try { return openMemIndex({ root: process.env.DISCORD_TOOL_NOTES!, indexPath: process.env.DISCORD_TOOL_MEMORY_INDEX!, embedder: embedderFromEnv(process.env), minSimilarity: minSimilarityFromEnv(process.env) }); } catch (e) { return fatal(`memory index: ${(e as Error).message}`); } })();
   tools.push(index.tool);
   // in the background: text first (cheap), then embeddings; a failure only goes to stderr, search falls back to text
   const refresh = () => { try { index.syncText({ force: true }); } catch (e) { process.stderr.write(`discord-tool: index: ${(e as Error).message}\n`); }

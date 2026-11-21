@@ -148,8 +148,11 @@ they do not substitute for the provider's live tool configuration and recall che
 With `DISCORD_TOOL_MEMORY_INDEX` (a SQLite path outside the notes) `memory_search` uses an index instead of the file walk
 (`lib/memindex.ts`): Markdown chunks of about 300 words cut at headings, FTS5 full text, and embeddings from an
 OpenAI-compatible endpoint (`DISCORD_TOOL_EMBED_URL`, `DISCORD_TOOL_EMBED_MODEL`, `DISCORD_TOOL_EMBED_KEY` as a key file,
-optional `DISCORD_TOOL_EMBED_DIMENSIONS`), merged by reciprocal rank fusion. Each match says how it matched (`text`,
-`semantic` or `both`); `semantic: false` with a `reason` means text only (no endpoint, or it failed). A note is found by
+optional `DISCORD_TOOL_EMBED_DIMENSIONS`; a change of model or dimensions re-embeds everything; the similarity floor is
+`DISCORD_TOOL_EMBED_MIN_SIMILARITY`, default 0.3), merged by reciprocal rank fusion. The endpoint receives the text of notes and transcripts (in chunks) and every
+query. Each match says how it matched (`text`,
+`semantic` or `both`) and whether it is a `note` or a `session` (a transcript under `sessions/`, where short turns
+share a chunk); `semantic: false` with a `reason` means text only (no endpoint, or it failed). A note is found by
 text right after it is written; embeddings follow in the background (at tool start and every
 `DISCORD_TOOL_INDEX_EVERY_MS`, default 10 minutes; `unembedded` counts what is still waiting). Only new or changed
 text is embedded. For the first big import run `node bin/index-memory.ts` with the same settings once. Rollback: unset

@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { chunkMarkdown, httpEmbedder, openMemIndex, CHUNK_WORDS, type Embedder, type MemResult } from "../lib/memindex.ts";
+import { chunkMarkdown, httpEmbedder, minSimilarityFromEnv, openMemIndex, CHUNK_WORDS, MIN_SIMILARITY, type Embedder, type MemResult } from "../lib/memindex.ts";
 import { tempDir } from "./tmp.ts";
 
 const CONCEPTS = [["price", "cost", "costs", "pricing", "expensive", "cheap", "money"], ["deploy", "install", "release", "rollout", "ship"],
@@ -194,4 +194,41 @@ test("STDIO: the Discord tool with a memory index answers memory_search through 
   assert.equal(out.status, 0, out.stderr);
   const r = JSON.parse(out.stdout.trim().split("\n")[0]).result.structuredContent;
   assert.deepEqual([r.semantic, r.matches[0].file, r.matches[0].line, r.matches[0].match], [false, "2025-01-01.md", 2, "text"]);
+});
+
+test("SESSIONS: transcripts under sessions/ are kind session, short turns share a chunk so a question stays with its answer", async () => {
+  const turns = "## user · 2026-10-01T10:00:00Z\nWhat did we decide about the price?\n\n## assistant · 2026-10-01T10:00:05Z\nWe keep it cheap for teams.\n\n## summary\nPricing talk.\n";
+  const grouped = chunkMarkdown(turns, { groupTurns: true });
+  assert.equal(grouped.length, 1, "three short turns, one chunk");
+  assert.match(grouped[0].text, /What did we decide[\s\S]*We keep it cheap/);
+  const long = `## user · t1\n${"word ".repeat(CHUNK_WORDS - 10)}\n## assistant · t2\nshort answer\n## user · t3\nnext question`;
+  const g2 = chunkMarkdown(long, { groupTurns: true });
+  assert.ok(g2.length >= 2, "a turn that fills a chunk is not grouped with the next");
+  const w = world();
+  w.write("sessions/2026-10-01-abc.md", turns);
+  w.write("2026-11-01.md", "# Notes\nprice list updated\n");
+  const r = await w.search("price");
+  assert.deepEqual(r.matches.map((m) => [m.file, m.kind]).sort(), [["2026-11-01.md", "note"], ["sessions/2026-10-01-abc.md", "session"]]);
+  assert.equal(r.matches.find((m) => m.kind === "session")!.line, 2, "the line with the word, inside the grouped chunk");
+});
+
+test("MODEL CHANGE: vectors of another model or dimensions are dropped and re-embedded; the floor comes from the environment", async () => {
+  const w = world();
+  w.write("a.md", "# A\nkitten\n");
+  w.index.syncText({ force: true });
+  await w.index.embedPending();
+  const other = fakeEmbedder();
+  (other as { model: string }).model = "fake-4@2";
+  const again = openMemIndex({ root: w.notes, indexPath: join(w.dir, "index.db"), embedder: other });
+  assert.deepEqual(await again.embedPending(), { embedded: 1 }, "the new space is embedded from scratch");
+  assert.deepEqual((again.db.prepare("SELECT DISTINCT model FROM vector").all() as { model: string }[]).map((r) => r.model), ["fake-4@2"], "the old space is gone");
+  assert.equal(httpEmbedder({ baseUrl: "https://x", model: "m", key: "k", dimensions: 512 }).model, "m@512");
+  assert.equal(httpEmbedder({ baseUrl: "https://x", model: "m", key: "k" }).model, "m");
+  assert.equal(minSimilarityFromEnv({}), MIN_SIMILARITY);
+  assert.equal(minSimilarityFromEnv({ DISCORD_TOOL_EMBED_MIN_SIMILARITY: "0.2" }), 0.2);
+  assert.throws(() => minSimilarityFromEnv({ DISCORD_TOOL_EMBED_MIN_SIMILARITY: "high" }), /-1 to 1/);
+  // a lower floor lets a weaker meaning match through
+  const loose = openMemIndex({ root: w.notes, indexPath: join(w.dir, "index.db"), embedder: other, minSimilarity: -1 });
+  const r = (await loose.tool.call({ query: "zzz unrelated" })).structuredContent as MemResult;
+  assert.equal(r.matches[0]?.match, "semantic", "with floor -1 even an unrelated chunk counts");
 });

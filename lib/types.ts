@@ -188,6 +188,7 @@ export interface DiscordMessage {
   mention_roles?: string[];
   timestamp?: string;
   message_reference?: { message_id?: string; channel_id?: string };
+  attachments?: { id?: string; filename?: string; content_type?: string; size?: number; url?: string }[];
 }
 export interface CreateMessagePayload {
   content: string;
@@ -195,6 +196,7 @@ export interface CreateMessagePayload {
   enforce_nonce?: boolean;
   allowed_mentions?: { parse: string[]; users?: string[]; replied_user?: boolean };
   message_reference?: { message_id: string; channel_id: string; fail_if_not_exists: boolean };
+  files?: { name: string; data: Uint8Array }[]; // uploads (multipart); `content` may be empty then
 }
 export interface DiscordPort {
   createMessage(channelId: string, payload: CreateMessagePayload): Promise<DiscordMessage>;

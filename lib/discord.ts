@@ -78,7 +78,7 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
     // few minutes), so a post repeated after a crash does not appear twice within that window.
     createMessage: (channelId: string, payload: CreateMessagePayload): Promise<DiscordMessage> => {
       writeGuard(channelId);
-      return api.channels.createMessage(channelId, payload as RESTPostAPIChannelMessageJSONBody) as unknown as Promise<DiscordMessage>;
+      return api.channels.createMessage(channelId, payload as RESTPostAPIChannelMessageJSONBody & { files?: { name: string; data: Uint8Array }[] }) as unknown as Promise<DiscordMessage>;
     },
     typing: (channelId: string) => { writeGuard(channelId); return api.channels.showTyping(channelId); },
     react: (channelId: string, messageId: string, emoji: string) => { writeGuard(channelId); return api.channels.addMessageReaction(channelId, messageId, emoji); },

@@ -19,12 +19,13 @@
 // Writer lock: `<directory of BRIDGE_DB>/<bot>.lock.db`, held for the life of the process (lib/lock.ts); a second
 // bridge for the same bot exits with status 4 ("lease held"). Ops starts the successor once the holder has exited.
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { openBuffer } from "../lib/buffer.ts";
 import { acquireBotLock, LockHeldError, type BotLock } from "../lib/lock.ts";
 import { makeBot } from "../lib/bot.ts";
 import { discordRest, discordGateway } from "../lib/discord.ts";
 import { commandsHashKey, interactionDispatch, reconcileCommands } from "../lib/commands.ts";
+import { sweepStaging } from "../lib/attachments.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import type { LogFields } from "../lib/types.ts";
@@ -100,6 +101,11 @@ const modelSelection = { instanceId: cfg.instanceId, model: cfg.model };
 const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
 // live gateway session token; set below once the gateway exists (null until then: no dispatch)
 const session = () => (gateway?.state.connected ? gateway.state.gen : null);
+// Files of tool posts are staged here by the Discord tool and uploaded by this bridge (lib/attachments.ts); copies nobody
+// waits for any more (a tool killed mid-call) are swept at start.
+const attachmentsDir = join(dirname(dbPath), "attachments");
+const swept = sweepStaging({ stagingDir: attachmentsDir, inUse: (id) => buffer.stagedInUse(id) });
+if (swept) log.emit("bridge.staging_swept", { removed: swept });
 const bots: ReturnType<typeof makeBot>[] = [];
 for (const [i, channelId] of channelIds.entries()) {
   const conversationKey = keys[i];
@@ -109,7 +115,7 @@ for (const [i, channelId] of channelIds.entries()) {
   const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`) };
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap,
+    allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir,
     buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
 }

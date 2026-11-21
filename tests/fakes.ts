@@ -140,12 +140,13 @@ export const STRANGER_ID = "222222222222222222";
 
 export interface DiscordCrash { buffer?: { close(): void }; post?: "before" | "after"; react?: "before" | "after"; thread?: "before" | "after" }
 export interface FakeMessage extends DiscordMessage { author: { id: string; username?: string; bot?: boolean }; content: string }
+export type FakeAttachment = NonNullable<DiscordMessage["attachments"]>[number];
 export interface FakeDiscord {
   messages: FakeMessage[]; writes: { kind: string; channelId: string; payload?: CreateMessagePayload }[];
   reactions: { messageId: string; emoji: string; at: unknown }[]; nonces: Map<string | undefined, FakeMessage>; crash: DiscordCrash;
   threads: Map<string, { id: string; parent_id: string; name: string }>;
   onReact?: (messageId: string) => unknown;
-  userSays(content: string, opts?: { mention?: boolean; channel?: string; bot?: boolean; author?: string; authorId?: string; mentionRoles?: string[] }): FakeMessage;
+  userSays(content: string, opts?: { mention?: boolean; channel?: string; bot?: boolean; author?: string; authorId?: string; mentionRoles?: string[]; attachments?: FakeAttachment[] }): FakeMessage;
   createMessage(ch: string, payload: CreateMessagePayload): Promise<FakeMessage>;
   typing(ch: string): Promise<void>;
   react(ch: string, messageId: string, emoji: string): Promise<void>;
@@ -170,10 +171,10 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
     messages, writes, reactions, nonces, crash, threads,
     // a user message in a channel (not through the bridge)
     // author "user1" is the allowlisted sender in the tests (HUMAN_ID); any other name gets STRANGER_ID unless authorId is given
-    userSays(content, { mention = true, channel = channelId, bot = false, author = "user1", authorId, mentionRoles = [] } = {}) {
+    userSays(content, { mention = true, channel = channelId, bot = false, author = "user1", authorId, mentionRoles = [], attachments } = {}) {
       const aid = authorId ?? (author === "user1" ? HUMAN_ID : STRANGER_ID);
       const m: FakeMessage = { id: id(), channel_id: channel, author: { id: aid, username: author, bot }, content: mention ? `<@${botUserId}> ${content}` : content,
-        mentions: mention ? [{ id: botUserId }] : [], mention_roles: mentionRoles, timestamp: new Date(now()).toISOString() };
+        mentions: mention ? [{ id: botUserId }] : [], mention_roles: mentionRoles, timestamp: new Date(now()).toISOString(), ...(attachments ? { attachments } : {}) };
       messages.push(m);
       return m;
     },
@@ -182,7 +183,8 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
       if (crash.post === "before") die("post");
       if (nonceWindow && payload.enforce_nonce && nonces.has(payload.nonce)) return nonces.get(payload.nonce)!;
       const m: FakeMessage = { id: id(), channel_id: ch, author: { id: botUserId, username: "Gem", bot: true }, content: payload.content.trim(),
-        message_reference: payload.message_reference ? { message_id: payload.message_reference.message_id, channel_id: ch } : undefined, mentions: [], timestamp: new Date(now()).toISOString() };
+        message_reference: payload.message_reference ? { message_id: payload.message_reference.message_id, channel_id: ch } : undefined, mentions: [], timestamp: new Date(now()).toISOString(),
+        ...(payload.files?.length ? { attachments: payload.files.map((f, i) => ({ id: String(i), filename: f.name, size: f.data.length })) } : {}) };
       messages.push(m);
       if (payload.enforce_nonce) nonces.set(payload.nonce, m);
       if (crash.post === "after") die("post");

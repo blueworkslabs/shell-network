@@ -174,6 +174,18 @@ t3 `thread.updated` events, and the idle tick stays as a fallback.
   tool under one of its channels.
 - The bridge checks channel, target and mentions again right before the POST.
 - `discord_read` reads only the named channel's log, with no network access.
+- **Files** (`lib/attachments.ts`). *Inbound:* each attachment of an accepted message is described under its text, one
+  line each: `[attachment: name (type, size) url]`. The name and type are made harmless, the URL is kept only on Discord's
+  CDN hosts, at most 10 are listed. A mention with only files is not a bare mention. The unread header names files of
+  unaddressed messages. The bridge downloads nothing. *Outbound:* `discord_send` takes `files` (at most 4 paths, 8 MiB in
+  all). The tool, which has no Discord credential, resolves each path (symlinks included): it must be inside
+  `DISCORD_TOOL_WORKSPACE` and a regular file. It copies the files into `attachments/` next to the buffer DB (0700) and
+  the outbox entry names the copies in `meta.files`. Right before the POST the bridge validates every entry with a
+  `files` key again (strict staged name, inside the staging directory, plain file, same limits), uploads the bytes with
+  `createMessage` and removes the copies once the post is recorded; a failing check drops the entry. The text may be
+  empty with files; the recovery of a `posting` entry also matches the attachment names. At start the bridge removes
+  staged directories that no unsettled entry names and that are older than an hour. Without `DISCORD_TOOL_WORKSPACE`
+  `files` is refused.
 
 ## Code layout
 

@@ -84,7 +84,8 @@ every thread of the conversation's `archived` ledger is exported into `sessions/
 in the messages view (both pagination levels; the allowlist admits the ledger's threads for that view only) and written by
 the transcript importer, which finds an existing file by its session id. A marker in kv (`exported:<thread>`) is set after
 the write, so a crash in between repeats an unchanged write: one file per thread. It runs beside the step loop and never
-holds up the fresh session; a failure is retried with backoff and shows in `/status`. The memory index picks the file up.
+holds up the fresh session; a failure, including a thread that yields no messages, is retried with backoff and shows in
+`/status`. The memory index picks the file up.
 
 ## Conversation history (t3 0.1.11, checked 2026-11-21)
 

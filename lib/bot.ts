@@ -177,7 +177,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // Every thread of the conversation's `archived` ledger without an export marker (kv `exported:<thread>`, set after the
   // file is written) is read from t3 (messages view, both pagination levels) and written by the transcript importer, which
   // finds an existing file by its session id: a crash between the write and the marker repeats an unchanged write, still
-  // one file. Runs beside the step loop, single flight, only while no reset is pending; a failure waits (backoff) and is
+  // one file. A thread that yields no messages is a failure, not an empty export. Runs beside the step loop, single flight, only while no reset is pending; a failure waits (backoff) and is
   // retried, and shows in /status. The log carries counts and thread ids, never text.
   const exportState: { running: Promise<void> | null; failures: number; nextAt: number; lastError: string | null } = { running: null, failures: 0, nextAt: 0, lastError: null };
   const pendingExports = (): string[] => (notesRoot ? (JSON.parse(buffer.kvGet(K("archived")) ?? "[]") as { threadId: string }[]).map((a) => a.threadId).filter((id) => !buffer.kvGet(K(`exported:${id}`))) : []);
@@ -189,7 +189,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       for (const threadId of todo) {
         const archive = await readArchivedTranscript({ threadId, projectId }, (args) => t3.readArchived(args));
         const messages = archive.events.filter((e) => e.type === "message").length;
-        if (messages) importTranscripts({ output: notesRoot, t3Archives: [archive] });
+        // an archived thread always holds at least the /new wrap-up turn: zero means every item was filtered out (an
+        // answer shape we do not know), so it stays pending and shows instead of being marked done
+        if (!messages) throw new Error("no messages kept from the archived thread (unexpected t3 answer shape?)");
+        importTranscripts({ output: notesRoot, t3Archives: [archive] });
         buffer.kvSet(K(`exported:${threadId}`), String(messages));
         log.emit("bridge.session_exported", { bot: name, threadId, messages });
       }

@@ -49,7 +49,8 @@ The design is described in [ARCHITECTURE.md](ARCHITECTURE.md).
   - an MCP token for the bridge;
   - a read-only WS session;
   - an `operate` WS session for the watchdog.
-- One Discord bot application per agent, with the Message Content intent enabled.
+- One Discord bot application per agent, with the Message Content intent enabled. The bridge also asks for the Direct Messages
+  intent (not privileged, nothing to enable); it reads DMs only from `BRIDGE_DM_USERS`, see ARCHITECTURE.md.
 
 ## Install
 

@@ -38,7 +38,7 @@ function gateway(over: Partial<Parameters<typeof discordGateway>[0]> = {}) {
 
 test("gateway: manager built with the intents; READY/RESUMED open a new session token, every close ends it", async () => {
   const { g, m, seen } = gateway();
-  assert.equal(INTENTS, 1 | 512 | 32768);
+  assert.equal(INTENTS, 1 | 512 | 32768 | 4096);
   assert.equal(m.options!.intents, INTENTS);
   g.connect();
   assert.deepEqual([g.state.connected, g.state.gen], [false, 0]);

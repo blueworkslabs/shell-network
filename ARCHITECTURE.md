@@ -79,6 +79,23 @@ The first batch of the fresh thread starts with a line telling the agent to read
 while one is pending is ignored. Nothing is force-cut: a turn that never ends keeps the reset waiting. Archived threads
 stay readable and searchable in t3; there is no `/resume` or unarchive yet.
 
+## Direct messages
+
+With `BRIDGE_DM_USERS` (ids that must also be in `BRIDGE_ALLOWED_AUTHORS`), the bridge asks Discord at startup for its DM
+channel with each of those users (`POST /users/@me/channels`, the same channel every time) and serves it as one more
+conversation, `<bot>.<dm channel id>`: its own thread, header, outbox and Discord tool config. In it every message of
+that user is addressed to the bot (no mention needed); the REST write guard admits the DM channel only once it is
+opened. A DM nobody's conversation owns (someone else writing to the bot) is dropped at the channel check and logged as
+`bridge.dm_ignored`, without its text. A DM that cannot be opened is logged and left out; the guild channels go on.
+No bot-to-bot cap applies (no crew bot is in a DM). Text `/new` works there; the slash commands stay guild-only. The
+gateway asks for the `DIRECT_MESSAGES` intent, which is not privileged. All DM lookups together get 10 seconds at
+startup; a request still running at the deadline is aborted and its user left out until the next start.
+
+Privacy limit: the bot's Discord tool is one process per agent, shared by all its conversations, so a turn in a guild
+channel can still read or post to the DM channel when it names its id explicitly. The DM's text never enters a guild
+thread by itself (separate thread and header), but nothing stops the agent from looking; DMs are private from other
+people, not from the bot's other conversations.
+
 ## Slash commands (`lib/commands.ts`)
 
 Each bot application registers two global, guild-only commands without options: `/new` (the reset above) and `/status`

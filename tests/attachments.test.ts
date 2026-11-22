@@ -207,7 +207,7 @@ test("INBOUND IMAGES: a message counts as waiting until its batch is delivered",
   assert.equal(w.buffer.inboundWaiting("999"), false);
 });
 
-test("INBOX SWEEP: saved images older than seven days and stale partial writes are removed; recent, still waiting and foreign files stay", () => {
+test("INBOX SWEEP: saved images older than seven days and stale partial writes are removed; recent, still waiting and foreign files stay; a symlinked inbox is left alone", () => {
   const dir = tempDir("inbox-"), t = 1_792_500_000_000;
   const files: [string, number][] = [["1792-0-old.png", INBOX_KEEP_MS + 1], ["1792-1-new.jpg", INBOX_KEEP_MS - 60_000], [".1792-2-x.png.0123456789ab.part", 2 * 3_600_000],
     [".1792-3-y.png.0123456789ab.part", 60_000], ["notes.md", INBOX_KEEP_MS * 2]];
@@ -216,6 +216,15 @@ test("INBOX SWEEP: saved images older than seven days and stale partial writes a
   assert.equal(sweepInbox({ inboxDir: dir, inUse: (id) => id === "1793", now: () => t }), 2);
   assert.deepEqual(readdirSync(dir).sort(), [".1792-3-y.png.0123456789ab.part", "1792-1-new.jpg", "1793-0-waiting.png", "notes.md"], "a waiting message keeps its image");
   assert.equal(sweepInbox({ inboxDir: join(dir, "missing") }), 0);
+  const ws = tempDir("inbox-ws-"), outside = tempDir("inbox-out-");
+  writeFileSync(join(outside, "1792-0-old.png"), "x"); utimesSync(join(outside, "1792-0-old.png"), (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);
+  symlinkSync(outside, join(ws, ".inbox"));
+  assert.equal(sweepInbox({ inboxDir: join(ws, ".inbox"), now: () => t }), 0, "a symlinked inbox is not swept");
+  mkdirSync(join(outside, ".inbox"));
+  writeFileSync(join(outside, ".inbox", "1792-0-old.png"), "x"); utimesSync(join(outside, ".inbox", "1792-0-old.png"), (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);
+  symlinkSync(outside, join(ws, "link"));
+  assert.equal(sweepInbox({ inboxDir: join(ws, "link", ".inbox"), now: () => t }), 0, "nor one behind a symlinked parent");
+  assert.deepEqual([readdirSync(outside).sort(), readdirSync(join(outside, ".inbox"))], [[".inbox", "1792-0-old.png"], ["1792-0-old.png"]], "nothing outside the workspace is deleted");
 });
 
 // ---------- outbound: the tool ----------

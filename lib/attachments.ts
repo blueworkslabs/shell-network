@@ -130,7 +130,8 @@ export function removeSaved(saved: Saved[]): void {
 export function sweepInbox({ inboxDir, inUse = () => false, maxAgeMs = INBOX_KEEP_MS, now = () => Date.now() }:
   { inboxDir: string; inUse?: (messageId: string) => boolean; maxAgeMs?: number; now?: () => number }): number {
   let removed = 0, names: string[];
-  try { names = readdirSync(inboxDir); } catch { return 0; }
+  // the same check as saving: a symlinked inbox (or a symlink on the way to it) is not swept, so nothing outside is deleted
+  try { const st = lstatSync(inboxDir); if (!st.isDirectory() || realpathSync(inboxDir) !== resolve(inboxDir)) return 0; names = readdirSync(inboxDir); } catch { return 0; }
   for (const n of names) {
     const limit = INBOX_NAME.test(n) ? maxAgeMs : INBOX_PART.test(n) ? 3_600_000 : null;
     if (limit === null) continue;

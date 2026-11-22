@@ -224,6 +224,10 @@ turn, queued message or pending `/new` remains.
 
 ## Bounded diagnostic logs (#56)
 
+Rollout hold (2026-11-22): do not enable the timer or run its first pass until
+the polling-log filter in #62 is installed. Preserve the existing trial logs
+until then; boot/crash recovery can be installed independently.
+
 `ops/rotate-logs.py` is an operator-installed helper, independent of the pinned
 bridge release. Install it under `~/.local/lib/t3-bridge-ops/rotate-logs.py` and run
 it with Python 3 from a user oneshot service (`UMask=0077`) and a persistent,

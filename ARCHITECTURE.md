@@ -240,7 +240,7 @@ a timing SLA. No bridge code change was required.
 
 - **Refused posts** (#55): a post Discord answers with 400, 403, 404 or 413 was not created; it goes back to pending
   and is tried again on the next step, and after 3 refusals it is dropped so the queue moves on. What waited for it is
-  closed (a reply counts as answered with nothing posted, a relay as empty), and one notice in the channel says a message
+  settled per part (other reply or relay parts still post), and one notice in the channel says a message
   was skipped, without ids or the error; `/status` counts skipped posts. A refused notice or alert is dropped without
   another notice. 401 stops the
   bridge as before; 5xx, network errors and timeouts keep the recovery path (the post may exist).

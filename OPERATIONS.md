@@ -196,3 +196,63 @@ restart it. Reverting to a release with identical commands needs no cleanup.
 A second operator must perform an install and rollback from these steps and record
 commit IDs, backup path, health and live-message results. Until that happens, issue
 #30 remains open; writing the runbook alone is not acceptance.
+
+## Boot and crash recovery (#54)
+
+For every installed bridge, `t3-staging.service` and `t3-watchdog.service`, enable
+user lingering and install an override with `Restart=on-failure`, `RestartSec=10`,
+`StartLimitIntervalSec=300`, `StartLimitBurst=6`, and `[Install] WantedBy=default.target`.
+Run `systemctl --user enable` for all five units after `daemon-reload`.
+For bridge/watchdog overrides, use `Wants=t3-staging.service` and
+`After=t3-staging.service`. Do not bind their lifetime to a particular t3 PID.
+Add a t3 `ExecStartPost` readiness probe that waits up to 120 seconds for its local
+HTTP endpoint before dependent services start. A failed probe fails startup and
+uses the same restart backoff. Validate units with `systemd-analyze --user verify`.
+After a persistent failure hits the start limit, inspect the journal, fix the cause,
+and use `systemctl --user reset-failed UNIT` followed by `start UNIT`.
+
+The hypervisor's VM autostart is separate from guest service enablement; enable it
+for the crew VM if host-boot recovery is required. Retain the existing t3 binary,
+provider configuration, credentials and LAN binding. No upstream t3 patch is needed.
+
+Acceptance: in an agreed idle window, kill one bridge's main PID with SIGKILL and
+verify a new PID and an incremented restart count without a manual start. Reboot
+the guest and verify all five units start, all conversation bindings remain, and
+each bot answers a real Discord message. Check provider readiness too: enabled
+units alone do not prove that an agent can answer. Never reboot while a provider
+turn, queued message or pending `/new` remains.
+
+## Bounded diagnostic logs (#56)
+
+Rollout hold (2026-11-22): do not enable the timer or run its first pass until
+the polling-log filter in #62 is installed. Preserve the existing trial logs
+until then; boot/crash recovery can be installed independently.
+
+`ops/rotate-logs.py` is an operator-installed helper, independent of the pinned
+bridge release. Install it under `~/.local/lib/t3-bridge-ops/rotate-logs.py` and run
+it with Python 3 from a user oneshot service (`UMask=0077`) and a persistent,
+enabled timer: `OnBootSec=2min`, `OnUnitActiveSec=1min`, `AccuracySec=10s`.
+The script takes a nonblocking lock to prevent overlapping runs.
+
+Scope: top-level bridge/watchdog JSONL and service logs in
+`~/.local/state/t3-bridge`, t3's `server.log`, and active-data provider diagnostic
+`.log` files (including captured tool diagnostics). It does not touch memory,
+conversation archives, SQLite databases or retained rollback-data directories.
+
+Policy: rotate after 8 MiB; keep up to three local rotations per source for at most
+seven days, and enforce a shared 128 MiB budget after each pass. Oversized sources
+retain only their newest complete lines, up to 8 MiB, before truncation. Oldest
+rotations are deleted first when enforcing the shared budget; if necessary the
+oldest current diagnostic logs are truncated too. No logs are backed up elsewhere.
+Rotations are owner-only. Symlinks, hardlinks and files owned by another user are
+not processed. Open source inodes are preserved with copy/truncate, including
+systemd's open stdout/stderr files. As with logrotate's copytruncate, concurrent
+writes in the copy/truncate gap can be lost; these are diagnostic logs, not the
+durable message buffer. The 128 MiB cap is enforced per pass, not a filesystem
+quota: growth between minute checks can temporarily exceed it.
+
+Check timer/service state, its counts-only journal result and actual disk usage.
+A dry run on synthetic logs verified recent-line retention, inode preservation,
+private rotation permissions, generation retention and the aggregate budget.
+Disabling the timer stops future pruning; already-expired log content cannot be
+restored. Roll back service overrides independently of the bridge code.

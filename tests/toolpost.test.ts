@@ -138,7 +138,7 @@ test("TOOL EDIT collapse: edits of one message queued faster than they go out se
   const a = ref(t.send({ channel: CH, content: "job A: starting", idempotency_key: "pa" }));
   const b = ref(t.send({ channel: CH, content: "job B: starting", idempotency_key: "pb" }));
   await w.steps(1);
-  const edits = [1, 2, 3, 4].map((i) => ref(t.edit({ channel: CH, ref: a, content: `job A: ${i}/5`, idempotency_key: `ea${i}` })));
+  const edits = [1, 2, 3].map((i) => ref(t.edit({ channel: CH, ref: a, content: `job A: ${i}/5`, idempotency_key: `ea${i}` })));
   const other = ref(t.edit({ channel: CH, ref: b, content: "job B: 1/2", idempotency_key: "eb1" }));
   const last = ref(t.edit({ channel: CH, ref: a, content: "job A: 5/5", idempotency_key: "ea5" }));
   const tampered = ref(t.edit({ channel: CH, ref: a, content: "job A: done", idempotency_key: "ea6" }));

@@ -32,6 +32,8 @@ type Op = "send" | "edit" | "react" | "thread";
 const PREFIX: Record<Op, string> = { send: "tool", edit: "edit", react: "react", thread: "thread" };
 const NONCE: Record<Op, string> = { send: "t", edit: "e", react: "x", thread: "h" };
 export const READ_MAX = 50;
+// unsent edits of one message (by ref or by message id) the tool lets wait; the bridge sends only the latest of them
+export const EDIT_QUEUE_MAX = 5;
 
 interface Config { channel_id: string; bot_user_id: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchange_cap: number }
 const after = (col: string) => `(length(${col}) > length(?) OR (length(${col}) = length(?) AND ${col} > ?))`;
@@ -165,6 +167,9 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
       const where = post ? (JSON.parse(post.meta) as { thread?: number; channel?: string }) : null;
       if (!post || post.state === "dropped" || (thread ? where!.thread !== 1 || where!.channel !== channel : where!.thread === 1))
         throw new ToolError(`${byRef ? "ref" : "message_id"} ${target} is not a post of this bot in channel ${channel}`);
+      const waiting = one<{ n: number }>(`SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state IN ('pending','posting')
+        AND (reply_to = ? OR (? IS NOT NULL AND reply_to = ?))`, key, `outbox:${post.id}`, post.channel_message_id, post.channel_message_id)!.n;
+      if (waiting >= EDIT_QUEUE_MAX) throw new ToolError(`${EDIT_QUEUE_MAX} edits of this message are still waiting to go out; only the latest is sent, so wait a moment and edit again`);
       const added = c.crew.filter((b) => names(content, b.id) && !names(post.content, b.id));
       if (added.length) throw new ToolError(`an edit cannot add mentions (${added.map((b) => b.name).join(", ")}); use discord_send to hand work over`);
       // posted: its message id; still queued: a reference the bridge resolves once that post is out (it goes first)
@@ -213,7 +218,7 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
         properties: { channel: { type: "string", description: "Channel id: one of the bot's channels, or a thread this bot created in one." }, content: { type: "string", maxLength: MAX_CONTENT, description: "May be empty when files are given." }, reply_to: { type: "string", description: "Optional: id of a message in the channel to reply to." },
           files: { type: "array", maxItems: ATTACH_MAX_FILES, items: { type: "string" }, description: "Optional: paths of files in your workspace to attach (absolute, or relative to the workspace; at most 8 MiB in all)." }, idempotency_key: idemProp } },
       call: send },
-    { name: "discord_edit", description: "Replace the text of a message this bot already posted, e.g. one progress message you keep updating during long work instead of posting new ones. Name the message by the `ref` a discord_send returned (also while it is still queued) or by its message id. An edit pings nobody and cannot add mentions. Your final text is still posted unless it is exactly NO_REPLY.",
+    { name: "discord_edit", description: "Replace the text of a message this bot already posted, e.g. one progress message you keep updating during long work instead of posting new ones. Name the message by the `ref` a discord_send returned (also while it is still queued) or by its message id. An edit pings nobody and cannot add mentions. Edits queued faster than they go out collapse into the latest; at most 5 may wait per message. Your final text is still posted unless it is exactly NO_REPLY.",
       inputSchema: { type: "object", additionalProperties: false, required: ["channel", "content", "idempotency_key"],
         properties: { channel: { type: "string", description: "Channel id where the message is (or the thread id)." }, ref: { type: "string", description: "The ref of an earlier discord_send (tool:...). Give this or message_id." },
           message_id: { type: "string", description: "Id of a message this bot posted. Give this or ref." }, content: { type: "string", maxLength: MAX_CONTENT, description: "The new text, replacing the old." }, idempotency_key: idemProp } },

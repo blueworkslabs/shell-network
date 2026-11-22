@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { openToolDb } from "../lib/tooldb.ts";
-import { makeTools, ToolError, MAX_CONTENT } from "../lib/tools.ts";
+import { makeTools, ToolError, MAX_CONTENT, EDIT_QUEUE_MAX } from "../lib/tools.ts";
 import { conversationKeyFor } from "../lib/bots.ts";
 import { openTempBuffer, tempDir, track } from "./tmp.ts";
 
@@ -156,6 +156,25 @@ test("TOOL EDIT: a post of this bot by ref (also while queued) or by message id;
   const before = (b.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n;
   for (const [args, re] of refused) assert.throws(() => t.edit({ channel: CH, content: "new text", idempotency_key: `x${Math.random()}`.replace("0.", ""), ...args }), (e) => e instanceof ToolError && re.test(e.message), JSON.stringify(args));
   assert.equal((b.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n, before, "nothing was queued");
+});
+
+test("TOOL EDIT limit: at most EDIT_QUEUE_MAX unsent edits wait per message, counted across ref and message id; other messages and sent edits do not count", () => {
+  const { b, t, out } = setup();
+  const key = conversationKeyFor("gem", CH);
+  const a = out(t.send({ channel: CH, content: "job A", idempotency_key: "pa" })), other = out(t.send({ channel: CH, content: "job B", idempotency_key: "pb" }));
+  const queuedRef = out(t.edit({ channel: CH, ref: a.ref, content: "A 0", idempotency_key: "q0" })); // made while the send was queued
+  const posted = sf();
+  b.outboxPosted(b.outboxEntry(key, a.ref)!.id, posted);
+  const keys = [queuedRef.ref];
+  for (let i = 1; i < EDIT_QUEUE_MAX; i++) keys.push(out(t.edit({ channel: CH, ...(i % 2 ? { message_id: posted } : { ref: a.ref }), content: `A ${i}`, idempotency_key: `q${i}` })).ref);
+  const before = (b.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n;
+  for (const target of [{ ref: a.ref }, { message_id: posted }])
+    assert.throws(() => t.edit({ channel: CH, ...target, content: "A more", idempotency_key: "q-over" }), (e) => e instanceof ToolError && /5 edits of this message are still waiting/.test(e.message));
+  assert.equal((b.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n, before, "nothing was queued");
+  assert.equal(out(t.edit({ channel: CH, ref: other.ref, content: "B 1", idempotency_key: "b1" })).status, "queued", "another message has its own limit");
+  assert.equal(out(t.edit({ channel: CH, message_id: posted, content: "A 1", idempotency_key: "q1" })).replay, true, "a replay is not a new edit");
+  b.outboxApplied(b.outboxEntry(key, keys[0])!.id); // the bridge sent (or collapsed) one
+  assert.equal(out(t.edit({ channel: CH, ref: a.ref, content: "A latest", idempotency_key: "q-next" })).status, "queued");
 });
 
 test("R1 SHARED CAP: Gem's and Hermes's queued tool sends to each other share one conversation budget", () => {

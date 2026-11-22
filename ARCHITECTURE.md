@@ -273,7 +273,9 @@ a timing SLA. No bridge code change was required.
   counted and dropped after three refusals with one notice, like a refused post, so the queue moves on. The channel
   log gets the new text. Edits of one message queued faster than they go out collapse, whether they name it by `ref`
   or by message id: an edit (pending, or attempted and not settled, e.g. throttled) followed by a newer valid edit of
-  the same message is marked done without a PATCH, so only the latest text is sent.
+  the same message is marked done without a PATCH, so only the latest text is sent. The tool only inserts (its
+  connection has no UPDATE or DELETE), so it does not collapse queued edits itself; it refuses a new edit while 5
+  unsent edits of the same message are waiting.
 - `discord_read` reads only the named channel's log, with no network access.
 - **Files** (`lib/attachments.ts`). *Inbound:* each attachment of an accepted message is described under its text, one
   line each: `[attachment: name (type, size) url]`. The name and type are made harmless, the URL is kept only on Discord's

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { bridgeConfig } from "../lib/bots.ts";
+import { bridgeConfig, modelSelectionFor } from "../lib/bots.ts";
 import { crewFile, exampleCrew } from "./crew-fixture.ts";
 
 const config = (members: unknown, extra = {}) => bridgeConfig({ BRIDGE_BOT: "gem", BRIDGE_CREW_FILE: crewFile(members), ...extra });
@@ -10,10 +10,28 @@ const config = (members: unknown, extra = {}) => bridgeConfig({ BRIDGE_BOT: "gem
 test("crew file selects identity, includes talk-only members, and keeps cap settings", () => {
   const c = config([...exampleCrew, { key: "advisor", name: "Advisor", id: "666666666666666666" }]);
   assert.deepEqual(c.bot, exampleCrew[0]);
+  assert.equal("options" in c.bot, false);
+  assert.deepEqual(modelSelectionFor(c.bot), { instanceId: exampleCrew[0].instanceId, model: exampleCrew[0].model });
+  assert.equal("options" in modelSelectionFor(c.bot), false);
   assert.deepEqual(c.allowedBots, [{ id: exampleCrew[1].id, name: "Hermes" }, { id: "666666666666666666", name: "Advisor", talkOnly: true }]);
   assert.equal(c.exchangeCap, 2);
   assert.equal(config(exampleCrew, { BRIDGE_EXCHANGE_CAP: "0" }).exchangeCap, 0);
   for (const cap of ["-1", "two"]) assert.throws(() => config(exampleCrew, { BRIDGE_EXCHANGE_CAP: cap }), /BRIDGE_EXCHANGE_CAP/);
+});
+
+test("crew file carries optional provider model options unchanged", () => {
+  const withOptions = [
+    { ...exampleCrew[0], options: { thought_level: "high", fastMode: false } },
+    { ...exampleCrew[1], options: { reasoningEffort: "high" } },
+  ];
+  const c = config(withOptions);
+  assert.deepEqual(c.bot.options, { thought_level: "high", fastMode: false });
+  assert.deepEqual(modelSelectionFor(c.bot), {
+    instanceId: exampleCrew[0].instanceId,
+    model: exampleCrew[0].model,
+    options: { thought_level: "high", fastMode: false },
+  });
+  assert.deepEqual(c.allowedBots, [{ id: exampleCrew[1].id, name: "Hermes" }]);
 });
 
 test("startup refuses invalid crew files before opening the database or reading secrets", () => {
@@ -24,6 +42,15 @@ test("startup refuses invalid crew files before opening the database or reading 
     [[{ ...exampleCrew[0], id: 123 }], /id/],
     [[{ ...exampleCrew[0], instanceId: undefined }], /instanceId and model/],
     [[{ ...exampleCrew[0], model: "" }], /instanceId and model/],
+    [[{ ...exampleCrew[0], options: null }], /options/],
+    [[{ ...exampleCrew[0], options: [] }], /options/],
+    [[{ ...exampleCrew[0], options: {} }], /options/],
+    [[{ ...exampleCrew[0], options: { " ": "high" } }], /options key/],
+    [[{ ...exampleCrew[0], options: { effort: "" } }], /option effort/],
+    [[{ ...exampleCrew[0], options: { effort: 2 } }], /option effort/],
+    [[{ ...exampleCrew[0], options: { effort: null } }], /option effort/],
+    [[{ key: "gem", name: "Gem", id: "333333333333333333", options: { effort: "high" } }], /instanceId and model/],
+    [[exampleCrew[0], { key: "advisor", name: "Advisor", id: "666666666666666666", options: { effort: "high" } }], /instanceId and model/],
     [[exampleCrew[0], { ...exampleCrew[1], key: "gem" }], /duplicate key/],
     [[exampleCrew[0], { ...exampleCrew[1], id: exampleCrew[0].id }], /duplicate id/],
     [[exampleCrew[1]], /own bot gem missing/],

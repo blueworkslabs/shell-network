@@ -12,12 +12,12 @@ const ALLOWED = ["list_scheduled_tasks", "t3_thread_launch", "t3_thread_list", "
 const P = "proj-gem", I = "crewGemClaude", T = "thread-gem";
 
 type Harness = ReturnType<typeof harness>;
-function harness({ bound = T as string | null } = {}) {
+function harness({ bound = T as string | null, modelOptions }: { bound?: string | null; modelOptions?: Record<string, string | boolean> } = {}) {
   const calls: { name: string; args: unknown }[] = [];
   const raw = { sessionId: "s", call: async (name: string, args?: Record<string, unknown>) => { calls.push({ name, args }); return {}; }, reconnect: async () => {} };
   const state = { bound };
   const log = memoryLog();
-  const mcp = allowlistedMcp(raw, { projectId: P, instanceId: I, boundThread: () => state.bound }, log);
+  const mcp = allowlistedMcp(raw, { projectId: P, instanceId: I, ...(modelOptions ? { modelOptions } : {}), boundThread: () => state.bound }, log);
   return { calls, mcp, state };
 }
 const ok: Record<string, Record<string, unknown>> = {
@@ -78,12 +78,44 @@ test("DENY organize: only archive, only the bound thread, no other argument, not
   await denied(h, "t3_thread_organize", ok.t3_thread_organize);
 });
 
-test("DENY launch: other project, other instance, or a thread already bound", async () => {
+test("DENY launch: other project, other instance, unexpected options, or a thread already bound", async () => {
   const h = harness({ bound: null });
   await denied(h, "t3_thread_launch", { ...ok.t3_thread_launch, projectId: "other" });
   await denied(h, "t3_thread_launch", { ...ok.t3_thread_launch, modelSelection: { instanceId: "t1ClaudePersona", model: "m" } });
+  await denied(h, "t3_thread_launch", { ...ok.t3_thread_launch, modelSelection: { instanceId: I, model: "m", options: { effort: "high" } } });
+  await denied(h, "t3_thread_launch", { ...ok.t3_thread_launch, modelSelection: { instanceId: I, model: "m", options: {} } });
+  await denied(h, "t3_thread_launch", { ...ok.t3_thread_launch, modelSelection: { instanceId: I, model: "m", options: undefined } });
   h.state.bound = T;
   await denied(h, "t3_thread_launch", ok.t3_thread_launch, /already bound/);
+});
+
+test("launch with configured modelOptions admits exactly those options and refuses everything else", async () => {
+  const configured: Record<string, string | boolean> = { thought_level: "high", fastMode: false };
+  const h = harness({ bound: null, modelOptions: configured });
+  // mutating the caller's object after setup cannot change the allowlist policy
+  configured.thought_level = "low";
+
+  const exact = { projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "gemini-4-neon", options: { fastMode: false, thought_level: "high" } } };
+  await h.mcp.call("t3_thread_launch", exact);
+  assert.deepEqual(h.calls, [{ name: "t3_thread_launch", args: exact }]);
+
+  await denied(h, "t3_thread_launch", ok.t3_thread_launch); // missing options
+  await denied(h, "t3_thread_launch", { ...exact, modelSelection: { instanceId: I, model: "gemini-4-neon", options: { thought_level: "low", fastMode: false } } });
+  await denied(h, "t3_thread_launch", { ...exact, modelSelection: { instanceId: I, model: "gemini-4-neon", options: { thought_level: "high" } } });
+  await denied(h, "t3_thread_launch", { ...exact, modelSelection: { instanceId: I, model: "gemini-4-neon", options: { thought_level: "high", fastMode: false, effort: "high" } } });
+  await denied(h, "t3_thread_launch", { ...exact, modelSelection: { instanceId: I, model: "gemini-4-neon", options: { thought_level: "high", fastMode: "false" } } });
+  await denied(h, "t3_thread_launch", { ...exact, modelSelection: { instanceId: I, model: "gemini-4-neon", options: [{ id: "thought_level", value: "high" }] } });
+  await denied(h, "t3_thread_launch", { ...exact, modelSelection: { instanceId: I, model: "gemini-4-neon", options: null } });
+
+  const calls: { name: string; args: unknown }[] = [];
+  const raw = { sessionId: "s", reconnect: async () => {}, call: async (name: string, args?: Record<string, unknown>) => { calls.push({ name, args }); return { threadId: T }; } };
+  const a = t3Adapter({ mcp: raw, policy: { projectId: P, instanceId: I, modelOptions: { thought_level: "high" }, boundThread: () => null }, log: memoryLog() });
+  await a.launch({ projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "gemini-4-neon", options: { thought_level: "high" } } });
+  assert.deepEqual(calls, [{ name: "t3_thread_launch", args: { projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "gemini-4-neon", options: { thought_level: "high" } } } }]);
+
+  for (const bad of [{}, [], null, { "": "high" }, { effort: "" }, { effort: 1 }]) {
+    assert.throws(() => allowlistedMcp(raw, { projectId: P, instanceId: I, modelOptions: bad as unknown as Record<string, string | boolean>, boundThread: () => null }), /modelOptions/);
+  }
 });
 
 test("DENY list/read/queue: other project, subagents, other or no bound thread, other views", async () => {

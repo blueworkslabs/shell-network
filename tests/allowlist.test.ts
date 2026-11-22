@@ -3,11 +3,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { allowlistedMcp, ToolDenied } from "../lib/allowlist.ts";
-import { t3Adapter } from "../lib/t3.ts";
+import { mcpCallLog, t3Adapter } from "../lib/t3.ts";
+import { handoffInput, type ScheduleHandoff } from "../lib/schedule-handoff.ts";
 import { memoryLog } from "../lib/log.ts";
 
 const DEPLOYED: string[] = JSON.parse(readFileSync(new URL("./fixtures/t3-mcp-tool-names.json", import.meta.url), "utf8")).names;
-const ALLOWED = ["t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send", "t3_thread_organize"];
+const ALLOWED = ["list_scheduled_tasks", "t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send", "t3_thread_organize"];
 const P = "proj-gem", I = "crewGemClaude", T = "thread-gem";
 
 type Harness = ReturnType<typeof harness>;
@@ -20,6 +21,7 @@ function harness({ bound = T as string | null } = {}) {
   return { calls, mcp, state };
 }
 const ok: Record<string, Record<string, unknown>> = {
+  list_scheduled_tasks: { projectId: P },
   t3_thread_launch: { projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "claude-sonnet-5-5" } },
   t3_thread_list: { projectId: P, titleContains: "Gem (bridge x)", includeSubagents: false, limit: 100, cursor: 100 },
   t3_thread_read: { threadId: T, view: "activity", limit: 100, runLimit: 50, maxCharsPerItem: 50_000, afterPosition: 7 },
@@ -122,4 +124,54 @@ test("adapter: its real call shapes pass the allowlist (paged read, paged list, 
   assert.deepEqual((await a.queue(T)).items.map((x) => x.text), ["first", "second"]);
   await a.send({ threadId: T, message: "m", mode: "queue", clientRequestId: "c" });
   await a.archive(T);
+});
+
+test("schedule handoff permits only its persisted replacement launch and exact queued input", async () => {
+  const state: ScheduleHandoff & { conversationKey: string } = {
+    resetId: "123", oldThread: T, newTitle: "replacement", jobs: [{ scheduledTaskId: "j1", enabled: false }], conversationKey: "gem.test",
+  };
+  const h = harness();
+  let pending = true;
+  const mcp = allowlistedMcp({ sessionId: null, reconnect: async () => {}, call: async () => ({}) },
+    { projectId: P, instanceId: I, boundThread: () => h.state.bound, handoff: () => pending ? state : null });
+  await assert.rejects(mcp.call("list_scheduled_tasks", {}), ToolDenied);
+  await assert.rejects(mcp.call("list_scheduled_tasks", { projectId: "other" }), ToolDenied);
+  await assert.rejects(mcp.call("schedule_task", { scheduledTaskId: "j1" }), ToolDenied);
+  await assert.rejects(mcp.call("delete_scheduled_task", { scheduledTaskId: "j1" }), ToolDenied);
+  await assert.rejects(mcp.call("t3_thread_launch", ok.t3_thread_launch), ToolDenied);
+  const launch = { ...ok.t3_thread_launch, title: state.newTitle };
+  await mcp.call("t3_thread_launch", launch);
+  const send = { threadId: "new", mode: "queue", ...handoffInput(state.conversationKey, state) };
+  await assert.rejects(mcp.call("t3_thread_send", send), ToolDenied);
+  state.replacement = "new";
+  await assert.rejects(mcp.call("t3_thread_launch", launch), ToolDenied);
+  await mcp.call("t3_thread_send", send);
+  for (const extra of [{ threadId: "other" }, { message: "other" }, { clientRequestId: "other" }]) {
+    await assert.rejects(mcp.call("t3_thread_send", { ...send, ...extra }), ToolDenied);
+  }
+  await assert.rejects(mcp.call("t3_thread_organize", { action: "archive", threadId: "new" }), ToolDenied);
+  pending = false;
+  await assert.rejects(mcp.call("t3_thread_send", send), ToolDenied);
+});
+
+test("schedule listing keeps only verification fields and redacts transport diagnostics", async () => {
+  const log = memoryLog();
+  const safeLog = mcpCallLog(log, new Set());
+  const secret = "private schedule prompt";
+  let failed = false;
+  const adapter = t3Adapter({
+    policy: { projectId: P, instanceId: I, boundThread: () => T }, log: safeLog,
+    mcp: { sessionId: null, reconnect: async () => {}, async call(tool, args, ctx) {
+      assert.equal(tool, "list_scheduled_tasks");
+      assert.deepEqual(args, { projectId: P });
+      const result = { tasks: [{ projectId: P, scheduledTaskId: "j1", boundThreadId: T, enabled: false, prompt: secret }] };
+      safeLog.emit(failed ? "call.error" : "call.end", { tool, label: ctx?.label, result, error: secret });
+      if (failed) throw new Error(secret);
+      return result;
+    } },
+  });
+  assert.deepEqual(await adapter.listStandingJobs(), [{ scheduledTaskId: "j1", boundThreadId: T, enabled: false }]);
+  failed = true;
+  await assert.rejects(adapter.listStandingJobs(), { message: "schedule list failed" });
+  assert.doesNotMatch(JSON.stringify(log.events), /private schedule prompt/);
 });

@@ -218,6 +218,7 @@ export interface ThreadListItem {
   [k: string]: unknown;
 }
 export interface T3Port {
+  listStandingJobs(): Promise<{ scheduledTaskId: string; boundThreadId: string | null; enabled: boolean }[]>;
   launch(args: { projectId: string; title: string; modelSelection: ModelSelection }): Promise<{ threadId?: unknown } | null | undefined>;
   findThreads(args: { projectId: string; title: string }): Promise<ThreadListItem[]>;
   read(threadId: string): Promise<ThreadRead>;

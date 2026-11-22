@@ -125,8 +125,10 @@ export async function saveInbound({ atts, messageId, inboxDir, fetchFile = fetch
 export function removeSaved(saved: Saved[]): void {
   for (const s of saved) if (s && "path" in s) rmSync(s.path, { force: true });
 }
-// Inbox files older than `maxAgeMs`, and partial writes older than an hour, removed. Only names of the saved form are touched.
-export function sweepInbox({ inboxDir, maxAgeMs = INBOX_KEEP_MS, now = () => Date.now() }: { inboxDir: string; maxAgeMs?: number; now?: () => number }): number {
+// Inbox files older than `maxAgeMs`, and partial writes older than an hour, removed, unless their message is still
+// waiting (`inUse`, by message id). Only names of the saved form are touched.
+export function sweepInbox({ inboxDir, inUse = () => false, maxAgeMs = INBOX_KEEP_MS, now = () => Date.now() }:
+  { inboxDir: string; inUse?: (messageId: string) => boolean; maxAgeMs?: number; now?: () => number }): number {
   let removed = 0, names: string[];
   try { names = readdirSync(inboxDir); } catch { return 0; }
   for (const n of names) {
@@ -134,7 +136,7 @@ export function sweepInbox({ inboxDir, maxAgeMs = INBOX_KEEP_MS, now = () => Dat
     if (limit === null) continue;
     try {
       const st = lstatSync(join(inboxDir, n));
-      if (!st.isFile() || now() - st.mtimeMs < limit) continue;
+      if (!st.isFile() || now() - st.mtimeMs < limit || inUse(n.replace(/^\./, "").split("-")[0])) continue;
       rmSync(join(inboxDir, n), { force: true });
       removed++;
     } catch {}

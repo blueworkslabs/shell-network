@@ -194,13 +194,27 @@ test("INBOUND IMAGES: a crew bot's message the exchange cap holds back leaves no
   assert.equal(readdirSync(w.inbox).length, cdn.calls.length - 1, "the delivered messages keep theirs");
 });
 
-test("INBOX SWEEP: saved images older than seven days and stale partial writes are removed; recent and foreign files stay", () => {
+test("INBOUND IMAGES: a message counts as waiting until its batch is delivered", async () => {
+  const w = world({ fetchFile: fakeCdn({ [`${CDN}/shot.png`]: PNG }).fetchFile });
+  const m = w.discord.userSays("look", { attachments: [img("1", "shot.png")] });
+  await w.bot.accept(m);
+  assert.equal(w.buffer.inboundWaiting(m.id), true, "buffered");
+  await w.steps(1);
+  const thread = w.t3.threads.get(w.buffer.kvGet(`${KEY}:threadId`)!)!;
+  w.t3.complete(thread.id, thread.runs.at(-1)!.runId, "ok");
+  await w.steps(4);
+  assert.equal(w.buffer.inboundWaiting(m.id), false, "delivered");
+  assert.equal(w.buffer.inboundWaiting("999"), false);
+});
+
+test("INBOX SWEEP: saved images older than seven days and stale partial writes are removed; recent, still waiting and foreign files stay", () => {
   const dir = tempDir("inbox-"), t = 1_792_500_000_000;
   const files: [string, number][] = [["1792-0-old.png", INBOX_KEEP_MS + 1], ["1792-1-new.jpg", INBOX_KEEP_MS - 60_000], [".1792-2-x.png.0123456789ab.part", 2 * 3_600_000],
     [".1792-3-y.png.0123456789ab.part", 60_000], ["notes.md", INBOX_KEEP_MS * 2]];
   for (const [n, age] of files) { writeFileSync(join(dir, n), "x"); utimesSync(join(dir, n), (t - age) / 1000, (t - age) / 1000); }
-  assert.equal(sweepInbox({ inboxDir: dir, now: () => t }), 2);
-  assert.deepEqual(readdirSync(dir).sort(), [".1792-3-y.png.0123456789ab.part", "1792-1-new.jpg", "notes.md"]);
+  writeFileSync(join(dir, "1793-0-waiting.png"), "x"); utimesSync(join(dir, "1793-0-waiting.png"), (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);
+  assert.equal(sweepInbox({ inboxDir: dir, inUse: (id) => id === "1793", now: () => t }), 2);
+  assert.deepEqual(readdirSync(dir).sort(), [".1792-3-y.png.0123456789ab.part", "1792-1-new.jpg", "1793-0-waiting.png", "notes.md"], "a waiting message keeps its image");
   assert.equal(sweepInbox({ inboxDir: join(dir, "missing") }), 0);
 });
 

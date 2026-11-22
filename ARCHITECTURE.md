@@ -274,7 +274,7 @@ a timing SLA. No bridge code change was required.
   own tool. Only attachments Discord calls `image/*` are downloaded, and the first bytes decide what is kept (png,
   jpeg, gif, webp, saved under the real extension). At most 4 images and 8 MiB per message, enforced while
   downloading. Files are named `<message id>-<index>-<safe name>.<ext>`, so a repeated accept downloads nothing. A
-  message the exchange cap holds back keeps no file. Saved images are swept after 7 days. Native t3 image attachments
+  message the exchange cap holds back keeps no file. Saved images are swept after 7 days unless their message still waits. Native t3 image attachments
   (`t3_thread_send_attachments`) are not used: that call steers a running turn and has no retry key. *Outbound:* `discord_send` takes `files` (at most 4 paths, 8 MiB in
   all). The tool, which has no Discord credential, resolves each path (symlinks included): it must be inside
   `DISCORD_TOOL_WORKSPACE` and a regular file (the type is checked before anything is opened, so a FIFO cannot block

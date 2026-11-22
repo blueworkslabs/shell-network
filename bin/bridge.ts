@@ -124,8 +124,8 @@ const session = () => (gateway?.state.connected ? gateway.state.gen : null);
 const attachmentsDir = join(dirname(dbPath), "attachments");
 const swept = sweepStaging({ stagingDir: attachmentsDir, inUse: (id) => buffer.stagedInUse(id) });
 if (swept) log.emit("bridge.staging_swept", { removed: swept });
-// Saved images are kept INBOX_KEEP_MS (7 days), checked at start and hourly.
-const sweepImages = () => { if (inboxDir) { const removed = sweepInbox({ inboxDir }); if (removed) log.emit("bridge.inbox_swept", { removed, keepMs: INBOX_KEEP_MS }); } };
+// Saved images are kept INBOX_KEEP_MS (7 days), and as long as their message waits; checked at start and hourly.
+const sweepImages = () => { if (inboxDir) { const removed = sweepInbox({ inboxDir, inUse: (id) => buffer.inboundWaiting(id) }); if (removed) log.emit("bridge.inbox_swept", { removed, keepMs: INBOX_KEEP_MS }); } };
 sweepImages();
 setInterval(sweepImages, 3_600_000).unref();
 const bots: ReturnType<typeof makeBot>[] = [];

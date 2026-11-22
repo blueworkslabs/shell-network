@@ -68,9 +68,8 @@ export interface BotOptions {
   allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
   // the bot's DM with the user: every message of an allowlisted person is addressed to the bot (no mention needed)
   dm?: boolean;
-  // Discord thread conversation (#77): parent channel context, optional starter message, and parent session handoff for standing jobs
+  // Discord thread conversation (#77): parent channel context and optional starter message
   threadContext?: ThreadContext;
-  parentSession?: { conversationKey: string; sendHandoff: (input: { message: string; clientRequestId: string }) => Promise<string> };
   // parent channels: active Discord thread conversations for `/status`
   activeThreads?: () => ActiveThreadSummary[];
   // the bot's notes root (the tool's DISCORD_TOOL_NOTES): archived sessions are exported into its sessions/ (#50); none = no export
@@ -104,7 +103,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, parentSession, activeThreads, notesRoot }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, activeThreads, notesRoot }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -313,16 +312,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const stopLine = st ? ["/stop: stopping running turn"]
       : lastStop ? [`Last /stop: stopped at ${new Date(lastStop.at).toISOString().slice(0, 16).replace("T", " ")} UTC`] : [];
     const threads = activeThreads?.() ?? [];
-    const publicThreads = threads.filter((t) => !t.isPrivate).map((t) => {
-      const note = t.state === "closing" ? (t.pendingJobs ? ` (closing, ${t.pendingJobs} standing job${t.pendingJobs === 1 ? "" : "s"})` : " (closing)") : "";
-      return `"${t.name}"${note}`;
-    });
+    const publicThreads = threads.filter((t) => !t.isPrivate).map((t) => `"${t.name}"${t.state === "closing" ? " (closing)" : ""}`);
     const privateThreads = threads.filter((t) => t.isPrivate);
-    const privateJobs = privateThreads.reduce((sum, t) => sum + (t.pendingJobs ?? 0), 0);
-    const privateSummary = privateThreads.length
-      ? [`${privateThreads.length} private${privateJobs ? ` (${privateJobs} standing job${privateJobs === 1 ? "" : "s"} awaiting move)` : ""}`]
-      : [];
-    const threadParts = [...publicThreads, ...privateSummary];
+    const threadParts = [...publicThreads, ...(privateThreads.length ? [`${privateThreads.length} private`] : [])];
+    const threadsWithJobs = threads.filter((t) => (t.pendingJobs ?? 0) > 0);
+    const pendingJobCount = threadsWithJobs.reduce((sum, t) => sum + (t.pendingJobs ?? 0), 0);
     const header = threadContext
       ? `**${name}** in thread "${threadContext.threadName}" (#${threadContext.parentName})`
       : `**${name}** in #${channelName ?? channelId}`;
@@ -332,6 +326,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,
       ...stopLine,
       ...(threads.length ? [`Active threads (${threads.length}): ${threadParts.join(", ")}`] : []),
+      ...(pendingJobCount > 0 ? [`Warning: ${threadsWithJobs.length} closed thread${threadsWithJobs.length === 1 ? "" : "s"} still ${threadsWithJobs.length === 1 ? "has" : "have"} ${pendingJobCount} scheduled job${pendingJobCount === 1 ? "" : "s"} (archive held until moved or deleted)`] : []),
       ...(rs?.stage === "handoff" ? [`Standing jobs: ${rs.jobsPending ?? rs.handoff?.jobs.length ?? 0} awaiting verification`] : []),
       ...(Number(buffer.kvGet(K("skippedPosts")) ?? 0) ? [`Skipped posts (Discord refused them): ${buffer.kvGet(K("skippedPosts"))}`] : []),
       ...(notesRoot ? [`Archive export: ${pendingExports().length} pending${exportState.lastError ? `; last error: ${exportState.lastError}` : ""}`] : []),
@@ -580,7 +575,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // If a previously closed Discord thread is later unarchived and mentioned again, start a fresh session cleanly.
   function reopen(): void {
     const dropped = buffer.atomically(() => {
-      for (const k of ["threadClosing", "threadClosed", "threadIntro", "threadTitle", "watermark", "headerSince", "reset", "stop", "closeJobs", "closeHandoff", "resetAlert", "threadAlert"]) {
+      for (const k of ["threadClosing", "threadClosed", "threadIntro", "threadTitle", "watermark", "headerSince", "reset", "stop", "closeJobs", "resetAlert", "threadAlert"]) {
         buffer.kvDelete(K(k));
       }
       return buffer.purgeClosedConversation(conversationKey);
@@ -589,12 +584,6 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     publishToolConfig();
   }
   const isClosed = (): boolean => buffer.kvGet(K("threadClosed")) === "1" && pendingExports().length === 0 && !exportState.running;
-  // Used by a closing child Discord thread to hand off its standing scheduled jobs into this parent channel's session.
-  async function sendHandoff({ message, clientRequestId }: { message: string; clientRequestId: string }): Promise<string> {
-    const tid = await ensureThread();
-    await t3.send({ threadId: tid, message, mode: "queue", clientRequestId });
-    return tid;
-  }
 
   function backfill(): Promise<number> {
     if (catchUp.inFlight) return catchUp.inFlight;
@@ -1218,7 +1207,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const bound = buffer.kvGet(K("threadId"));
     if (!bound) {
       const dropped = buffer.atomically(() => {
-        for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "closeHandoff", "resetAlert", "threadAlert"]) buffer.kvDelete(K(k));
+        for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "resetAlert", "threadAlert"]) buffer.kvDelete(K(k));
         buffer.kvSet(K("threadClosed"), "1");
         return buffer.purgeClosedConversation(conversationKey);
       });
@@ -1263,54 +1252,25 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       }
     }
     if (isBusy(read)) return { phase: "closing" };
-    // Standing scheduled jobs (enabled and paused) bound to this thread's t3 session must not be lost when the thread
-    // closes: surface them in the parent channel and /status, and move them to the parent channel's session (#58 handoff)
-    // before archiving. Fail closed if listStandingJobs fails.
-    type CloseHandoff = ScheduleHandoff & { sent?: boolean };
-    const allJobs = await t3.listStandingJobs();
-    const byId = new Map(allJobs.map((j) => [j.scheduledTaskId, j]));
-    const boundJobs = allJobs.filter((j) => j.boundThreadId === bound);
-    let ch = ((): CloseHandoff | null => { const v = buffer.kvGet(K("closeHandoff")); return v ? (JSON.parse(v) as CloseHandoff) : null; })();
-    const parentKey = parentSession?.conversationKey ?? (threadContext ? `${conversationKey.slice(0, conversationKey.indexOf("."))}.${threadContext.parentId}` : null);
-    const label = threadContext?.isPrivate ? "a private thread" : `thread "${threadContext?.threadName ?? channelId}"`;
-    const unverified = ch ? ch.jobs.filter((job) => {
-      const current = byId.get(job.scheduledTaskId);
-      if (!current) return false; // deleted explicitly
-      return current.boundThreadId === bound || (ch!.replacement ? (current.boundThreadId !== ch!.replacement || current.enabled !== job.enabled) : true);
-    }) : [];
-    if (boundJobs.length > 0 || unverified.length > 0) {
+    // Standing scheduled jobs (enabled and paused) bound to this thread's t3 session must not be lost or silently
+    // redirected when the thread closes: fail closed if inventory fails, hold archive, persist a redacted warning for
+    // parent /status and post one redacted notice in the parent channel until a person moves or deletes them.
+    const boundJobs = (await t3.listStandingJobs()).filter((j) => j.boundThreadId === bound);
+    if (boundJobs.length > 0) {
       const activeJobs = boundJobs.filter((j) => j.enabled).length;
       const pausedJobs = boundJobs.length - activeJobs;
-      const pendingCount = Math.max(boundJobs.length, unverified.length);
+      const parentKey = threadContext ? `${conversationKey.slice(0, conversationKey.indexOf("."))}.${threadContext.parentId}` : null;
+      const label = threadContext?.isPrivate ? "a private thread" : `thread "${threadContext?.threadName ?? channelId}"`;
+      const prev = buffer.kvGet(K("closeJobs"));
       buffer.atomically(() => {
-        buffer.kvSet(K("closeJobs"), JSON.stringify({ count: pendingCount, active: activeJobs, paused: pausedJobs }));
+        buffer.kvSet(K("closeJobs"), JSON.stringify({ count: boundJobs.length, active: activeJobs, paused: pausedJobs }));
         if (parentKey && threadContext) {
           buffer.addNotice(`thread-jobs:${channelId}:${bound}`,
-            parentSession
-              ? `⚠️ ${name}: ${label} closed with ${pendingCount} standing scheduled job${pendingCount === 1 ? "" : "s"} (${activeJobs} active, ${pausedJobs} paused). Moving ${pendingCount === 1 ? "it" : "them"} to this channel's session before archiving.`
-              : `⚠️ ${name}: ${label} closed with ${pendingCount} standing scheduled job${pendingCount === 1 ? "" : "s"} (${activeJobs} active, ${pausedJobs} paused). Holding session archive until moved or deleted.`,
+            `⚠️ ${name}: ${label} closed with ${boundJobs.length} scheduled job${boundJobs.length === 1 ? "" : "s"} (${activeJobs} active, ${pausedJobs} paused). Holding session archive until a person moves or deletes ${boundJobs.length === 1 ? "it" : "them"}.`,
             parentKey);
         }
       });
-      if (parentSession && boundJobs.length > 0) {
-        if (!ch) {
-          ch = { resetId: `close-${channelId}-${bound}`, oldThread: bound, newTitle: "parent", jobs: boundJobs.map(({ scheduledTaskId, enabled }) => ({ scheduledTaskId, enabled })) };
-          buffer.kvSet(K("closeHandoff"), JSON.stringify(ch));
-        } else {
-          const known = new Set(ch.jobs.map((j) => j.scheduledTaskId));
-          const late = boundJobs.filter((j) => !known.has(j.scheduledTaskId)).map(({ scheduledTaskId, enabled }) => ({ scheduledTaskId, enabled }));
-          if (late.length) {
-            ch = { ...ch, jobs: [...ch.jobs, ...late], followup: { number: (ch.followup?.number ?? 0) + 1, jobs: late }, sent: false };
-            buffer.kvSet(K("closeHandoff"), JSON.stringify(ch));
-          }
-        }
-        if (!ch.sent) {
-          const replacement = await parentSession.sendHandoff(handoffInput(parentSession.conversationKey, ch));
-          ch = { ...ch, replacement, sent: true };
-          buffer.kvSet(K("closeHandoff"), JSON.stringify(ch));
-          log.emit("bridge.thread_close_jobs_handoff", { bot: name, discordThreadId: channelId, threadId: bound, count: boundJobs.length });
-        }
-      }
+      if (!prev) log.emit("bridge.thread_close_held_jobs", { bot: name, discordThreadId: channelId, threadId: bound, count: boundJobs.length, active: activeJobs, paused: pausedJobs });
       return { phase: "closing" };
     }
     try {
@@ -1326,7 +1286,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (!list.some((a) => a.threadId === bound)) list.push({ threadId: bound, title: title ?? null, resetMessageId: "thread-close" });
       buffer.kvSet(K("archived"), JSON.stringify(list));
       buffer.kvDelete(K("threadId"));
-      for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "closeHandoff", "resetAlert", "threadAlert"]) buffer.kvDelete(K(k));
+      for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "resetAlert", "threadAlert"]) buffer.kvDelete(K(k));
       buffer.kvSet(K("threadClosed"), "1");
       return buffer.purgeClosedConversation(conversationKey);
     });
@@ -1397,5 +1357,5 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { phase: "sent", batchId: b.id };
   }
 
-  return { accept, backfill, initWatermark, initWatermarkAt, step, ensureThread, requestNew, requestStop, requestClose, reopen, isClosed, sendHandoff, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
+  return { accept, backfill, initWatermark, initWatermarkAt, step, ensureThread, requestNew, requestStop, requestClose, reopen, isClosed, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
 }

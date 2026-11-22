@@ -56,12 +56,14 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
 - **Discord threads.** Only threads whose `parent_id` is one of `BRIDGE_CHANNEL_IDS` and whose Discord type is a guild
   thread (`10`/`11`/`12`) are admitted, lazily on the first mention from an allowlisted person or allowed crew bot, up
   to 10 threads per bot (counting both active and closing threads until archive and export complete). Restored threads
-  stay disabled after a restart until type, parent allowlist and bot access are revalidated (closing on `403`/`404` or
-  removed parent). Closing, closed, archived, deleted or unrevalidated threads are denied immediately at the REST write
-  guard, including when a legacy `discord_thread` outbox record exists. Parent `/status` and notices never expose
-  private thread names. Starter-message lookup (`getMessage`) is restricted to configured parent channels and skips
-  messages from unlisted authors. Each thread conversation uses the exact same per-conversation MCP allowlist policy (no
-  wider grant).
+  stay disabled after a restart (with their saved `tool_config` cleared) until type, parent allowlist and bot access
+  are revalidated (closing on `403`/`404` or removed parent). Closing, closed, archived, deleted or unrevalidated
+  threads are denied immediately at the REST write guard, including when a legacy `discord_thread` outbox record exists.
+  Closing threads with bound scheduled jobs hold archive with a redacted warning in parent `/status` and notices until a
+  person moves or deletes them (no automatic move across audiences). Parent `/status` and notices never expose private
+  thread names. Starter-message lookup (`getMessage`) is restricted to configured parent channels and skips messages
+  from unlisted authors. Each thread conversation uses the exact same per-conversation MCP allowlist policy (no wider
+  grant).
 - **Files.** An agent can attach only files inside its workspace (`DISCORD_TOOL_WORKSPACE`; the path is resolved
   through symlinks and the target opened without following one). The Discord tool copies them into a staging directory
   and has no credential; the bridge validates the staged copies again before uploading them, so a tampered outbox

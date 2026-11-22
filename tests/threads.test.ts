@@ -74,7 +74,6 @@ function world({ maxThreads = MAX_ACTIVE_THREADS, notesRoot, cap = 2 }: { maxThr
           botUserId: BOT, botRoleId, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }],
           exchangeCap: cap, projectId: "proj-gem", modelSelection: { instanceId: "crewGemAntigravity", model: "m" },
           threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
-          ...(parentChannels.has(record.parentId) ? { parentSession: { conversationKey: parentKey, sendHandoff: (inp) => w.parentBot.sendHandoff(inp) } } : {}),
           notesRoot, buffer: w.buffer, t3, discord, log, now, session: () => "s1",
         }),
       });
@@ -455,10 +454,12 @@ test("THREADS: restore fails closed until READY revalidates type, parent channel
   await w.steps(2);
   const sendsBeforeRestart = w.t3.sends().length;
 
-  // Restart: saved active threads stay inactive until READY revalidates them
+  // Restart: saved active threads stay inactive and their tool_config is revoked until READY revalidates them
   w.restart();
   assert.equal(w.threads.botFor(thA), undefined, "restored thread is not active before READY");
   assert.equal(w.threads.isAllowedThread(thA), false, "restored thread is not writable before READY");
+  assert.equal(w.buffer.db.prepare("SELECT 1 FROM tool_config WHERE conversation_key = ?").get(conversationKeyFor("gem", thA)), undefined, "pending restore revokes old tool_config");
+  assert.equal(w.buffer.db.prepare("SELECT 1 FROM tool_config WHERE conversation_key = ?").get(conversationKeyFor("gem", thB)), undefined, "pending restore revokes old tool_config");
   await w.dispatch("MESSAGE_CREATE", w.discord.userSays("too early A", { channel: thA, guildId: GUILD }));
   await w.dispatch("MESSAGE_CREATE", w.discord.userSays("too early B", { channel: thB, guildId: GUILD }));
   await w.steps(2);
@@ -472,6 +473,8 @@ test("THREADS: restore fails closed until READY revalidates type, parent channel
   // thA revalidated and resumed (catching up "too early A"); thB closed & archived on 403 without ever accepting "too early B"
   assert.ok(w.threads.botFor(thA), "revalidated thread is active after READY");
   assert.equal(w.threads.isAllowedThread(thA), true);
+  assert.ok(w.buffer.db.prepare("SELECT 1 FROM tool_config WHERE conversation_key = ?").get(conversationKeyFor("gem", thA)), "verified active thread restores tool_config");
+  assert.equal(w.buffer.db.prepare("SELECT 1 FROM tool_config WHERE conversation_key = ?").get(conversationKeyFor("gem", thB)), undefined, "403 thread never restores tool_config");
   assert.equal(w.t3.threads.get(t3B)!.archived, true, "403 on restore closes and archives t3 session");
   assert.equal(w.t3ThreadOf(thB), null);
   assert.equal(w.t3.sends().some((s) => s.threadId === t3B && s.message?.includes("too early B")), false, "403 thread never accepts pre-READY messages");
@@ -588,7 +591,7 @@ test("THREADS: close -> restart -> reopen purges stale buffered input, pending e
   assert.deepEqual(contents, ["first post", "fresh reopened answer"]);
 });
 
-test("THREADS: closing a thread with enabled and paused standing jobs holds archive, warns in parent + /status without leaking private name, hands off to parent, then archives after verification", async () => {
+test("THREADS: closing a thread with enabled and paused standing jobs holds archive and surfaces redacted parent /status + notice without automatic move", async () => {
   const notesRoot = tempDir("thread-jobs-notes-");
   const w = world({ notesRoot });
   const thId = "200000000000000071";
@@ -613,47 +616,40 @@ test("THREADS: closing a thread with enabled and paused standing jobs holds arch
   assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "fails closed when listStandingJobs errors");
   w.t3.listStandingJobs = origList;
 
-  // Step again: discovers both jobs, holds archive, posts parent notice, hands off to parent session, surfaces in parent /status
+  // Step again: discovers both jobs, holds archive, posts one redacted parent notice, surfaces redacted parent /status warning,
+  // and does NOT automatically move jobs or send any handoff to the parent session
   await w.steps(3);
   assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "holds archive while enabled + paused jobs remain bound");
-  const parentT3 = w.t3ThreadOf(PARENT_CH)!;
-  assert.ok(parentT3, "parent session launched to receive job handoff");
+  assert.equal(w.t3.sends().some((s) => s.clientRequestId?.includes("schedule-handoff")), false, "no automatic job handoff to parent");
 
-  // Parent channel received one notice without leaking private thread name or job IDs
-  const notices = w.discord.botPosts(PARENT_CH).filter((m) => m.content.includes("standing scheduled job"));
+  // Parent channel received one redacted notice without leaking private thread name or job IDs
+  const notices = w.discord.botPosts(PARENT_CH).filter((m) => m.content.includes("scheduled job"));
   assert.equal(notices.length, 1);
-  assert.match(notices[0].content, /a private thread closed with 2 standing scheduled jobs \(1 active, 1 paused\)/);
+  assert.match(notices[0].content, /a private thread closed with 2 scheduled jobs \(1 active, 1 paused\)/);
   assert.doesNotMatch(notices[0].content, /secret-job-thread|job-active|job-paused/);
 
-  // Parent /status surfaces the pending jobs even though the Discord thread is already archived, without leaking private name
+  // Parent /status surfaces the redacted warning even though the Discord thread is already archived
   await w.runCmd("status", PARENT_CH);
   const statusReply = w.ixCalls.at(-1)!;
-  assert.match(statusReply, /Active threads \(1\): 1 private \(2 standing jobs awaiting move\)/);
+  assert.match(statusReply, /Active threads \(1\): 1 private/);
+  assert.match(statusReply, /Warning: 1 closed thread still has 2 scheduled jobs/);
   assert.doesNotMatch(statusReply, /secret-job-thread|job-active|job-paused/);
 
-  // Parent t3 session received the #58 handoff prompt listing both job IDs
-  const handoffSend = w.t3.sends().find((s) => s.threadId === parentT3 && s.clientRequestId?.includes("schedule-handoff"));
-  assert.ok(handoffSend, "handoff prompt sent to parent session");
-  assert.match(handoffSend.message!, /job-active/);
-  assert.match(handoffSend.message!, /job-paused/);
+  // Even after restart, the redacted /status warning persists while jobs remain bound
+  w.restart();
+  await w.runCmd("status", PARENT_CH);
+  assert.match(w.ixCalls.at(-1)!, /Warning: 1 closed thread still has 2 scheduled jobs/);
 
-  // Moving both jobs to parent but flipping the paused job's enabled state must still hold archive
-  w.t3.standingJobs[0].boundThreadId = parentT3;
-  w.t3.standingJobs[1].boundThreadId = parentT3;
-  w.t3.standingJobs[1].enabled = true; // wrong: paused job was enabled
-  await w.steps(2);
-  assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "holds archive when paused state was not preserved");
-
-  // Restore paused state -> verification passes -> thread archives & exports cleanly
-  w.t3.standingJobs[1].enabled = false;
-  w.finish(parentT3, "NO_REPLY");
+  // Once a person moves one job elsewhere and deletes the other, the closed thread archives, exports, and clears the warning
+  w.t3.standingJobs[0].boundThreadId = "manual-destination-thread";
+  w.t3.standingJobs.splice(1, 1);
   await w.steps(4);
   await new Promise((r) => setTimeout(r, 30));
   await w.steps(2);
-  assert.equal(w.t3.threads.get(thT3)!.archived, true, "archives once jobs are verified moved with enabled state preserved");
+  assert.equal(w.t3.threads.get(thT3)!.archived, true, "archives once no jobs remain bound");
   assert.equal(w.threads.records().length, 0);
-  // Parent handoff completion (NO_REPLY + bridge clientRequestId) was not relayed as a stray post
-  assert.equal(w.discord.botPosts(PARENT_CH).length, 1, "only the single standing-job notice was posted in parent");
+  await w.runCmd("status", PARENT_CH);
+  assert.doesNotMatch(w.ixCalls.at(-1)!, /Warning: .*scheduled job/);
 });
 
 test("THREADS: existing per-conversation allowlist policy covers launch, archive and export without any wider grant", async () => {

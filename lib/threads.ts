@@ -305,7 +305,9 @@ export function makeThreadManager({
         log.emit("bridge.thread_closing", { bot: botName, threadId: r.threadId, why: !parentChannels.has(r.parentId) ? "parent-removed" : "invalid-type" });
         continue;
       }
-      // Keep active restored threads disabled until checkThreads() revalidates Discord type, parent, and bot access.
+      // Keep active restored threads disabled (and revoke their saved tool_config) until checkThreads() revalidates
+      // Discord type, parent, and bot access.
+      buffer.deleteToolConfig(`${botKey}.${r.threadId}`);
       pendingRestore.add(r.threadId);
     }
     if (changed) saveRecords(records);

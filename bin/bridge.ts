@@ -182,7 +182,6 @@ threads = makeThreadManager({
   buffer, discord, nudge, log,
   createBot: (record, botRoleId) => {
     const conversationKey = conversationKeyFor(cfg.key, record.threadId);
-    const parentBot = channelBots.get(record.parentId);
     const shortName = record.name.length > 40 ? `${record.name.slice(0, 40)}…` : record.name;
     return makeBot({
       name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
@@ -190,7 +189,6 @@ threads = makeThreadManager({
       botUserId: cfg.id, botRoleId, projectId, modelSelection,
       allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, inboxDir, dm: false, notesRoot,
       threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
-      ...(parentBot ? { parentSession: { conversationKey: conversationKeyFor(cfg.key, record.parentId), sendHandoff: parentBot.sendHandoff } } : {}),
       buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
     });
   },

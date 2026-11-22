@@ -274,7 +274,7 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
       if (crash.thread === "before") die("thread");
       if (!messages.some((m) => m.id === messageId && m.channel_id === ch)) throw Object.assign(new Error("Unknown Message"), { status: 404, code: 10008 });
       if (threads.has(messageId)) throw Object.assign(new Error("A thread has already been created for this message"), { status: 400, code: 160004 });
-      threads.set(messageId, { id: messageId, parent_id: ch, name });
+      threads.set(messageId, { id: messageId, parent_id: ch, name, type: 11 });
       if (crash.thread === "after") die("thread");
       return { id: messageId };
     },

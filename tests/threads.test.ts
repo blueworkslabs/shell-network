@@ -124,12 +124,13 @@ test("THREADS: mention in a child thread starts a separate conversation with sta
   const th = w.openThread(thId, { name: "flaky-build", type: 11 });
   await w.dispatch("THREAD_CREATE", th);
 
-  // Unmentioned message in the thread must not start a session
+  // Unmentioned message in the thread must not start a session or open the REST write guard
   const unmentioned = w.discord.userSays("just talking here", { mention: false, channel: thId, guildId: GUILD });
   await w.dispatch("MESSAGE_CREATE", unmentioned);
   await w.steps(2);
   assert.equal(w.t3ThreadOf(thId), null);
   assert.equal(w.threads.records().length, 0);
+  assert.equal(w.threads.isAllowedThread(thId), false, "unadmitted thread is not writable");
 
   // First mention starts a separate conversation & t3 thread
   const m1 = w.discord.userSays("please check this", { channel: thId, guildId: GUILD });
@@ -172,6 +173,14 @@ test("THREADS: threads outside configured channels, strangers, and stranger star
   assert.equal(w.threads.records().length, 0);
   assert.equal(w.t3ThreadOf(foreignId), null);
   assert.equal(w.threads.isAllowedThread(foreignId), false);
+
+  // Non-thread channel type (e.g. type 0 text channel) is refused even if parent_id matches
+  const nonThreadId = "200000000000000002";
+  w.openThread(nonThreadId, { parentId: PARENT_CH, name: "not-a-thread", type: 0 });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("hi", { channel: nonThreadId, guildId: GUILD }));
+  await w.steps(2);
+  assert.equal(w.t3ThreadOf(nonThreadId), null);
+  assert.equal(w.threads.isAllowedThread(nonThreadId), false);
 
   // Starter message not in local channel_message log is fetched via discord.getMessage for an allowlisted author
   const oldStarter = w.discord.userSays("older parent context", { mention: false, channel: PARENT_CH, guildId: GUILD });
@@ -273,6 +282,16 @@ test("THREADS: cap refuses the (N+1)th thread with one fixed notice and frees a 
   assert.equal(notices.length, 1);
   assert.match(notices[0].content, /already has 2 active thread conversations/);
 
+  // Cap holds across restarts before closing an older thread
+  w.restart();
+  const t3bId = "200000000000000025";
+  w.openThread(t3bId, { name: "t3b" });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("hi t3b", { channel: t3bId, guildId: GUILD }));
+  await w.steps(2);
+  assert.equal(w.t3ThreadOf(t3bId), null);
+  assert.equal(w.threads.isAllowedThread(t3bId), false, "write guard closes immediately after cap notice");
+  assert.equal(w.discord.botPosts(t3bId).length, 1);
+
   // Close t1 (after its turn finishes) -> slot frees -> a new thread t4 can start
   const t1T3 = w.t3ThreadOf("200000000000000021")!;
   w.finish(t1T3, "done t1");
@@ -299,6 +318,9 @@ test("THREADS: archiving or deleting a thread waits for open work, archives the 
   const thT3 = w.t3ThreadOf(thId)!;
   assert.ok(thT3);
 
+  // Standing job still bound to the closing thread's t3 session posts one warning notice in the parent channel
+  w.t3.standingJobs.push({ scheduledTaskId: "job-1", boundThreadId: thT3, enabled: true });
+
   // Thread archived while turn is still running: must wait until turn completes before archiving t3
   await w.dispatch("THREAD_UPDATE", { id: thId, parent_id: PARENT_CH, name: "export-me", type: 11, thread_metadata: { archived: true } });
   await w.steps(2);
@@ -314,6 +336,7 @@ test("THREADS: archiving or deleting a thread waits for open work, archives the 
   assert.equal(w.t3.threads.get(thT3)!.archived, true);
   assert.equal(w.t3ThreadOf(thId), null);
   assert.equal(w.threads.records().length, 0);
+  assert.ok(w.discord.botPosts(PARENT_CH).some((m) => m.content.includes("standing scheduled job") && !m.content.includes("job-1")), "parent channel warned without leaking job id");
 
   const sessionsDir = join(notesRoot, "sessions");
   assert.ok(existsSync(sessionsDir), "sessions/ created");

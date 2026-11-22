@@ -1230,6 +1230,13 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       }
     }
     if (isBusy(read)) return { phase: "closing" };
+    // Check whether any standing scheduled jobs are still bound to this thread's t3 session before archiving it.
+    let boundJobs = 0;
+    try {
+      boundJobs = (await t3.listStandingJobs()).filter((job) => job.boundThreadId === bound).length;
+    } catch (e) {
+      log.emit("bridge.thread_close_jobs_check_failed", { bot: name, discordThreadId: channelId, error: errText(e) });
+    }
     try {
       await t3.archive(bound);
     } catch (e) {
@@ -1238,6 +1245,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       log.emit("bridge.archive_already", { bot: name, threadId: bound });
     }
     const title = buffer.kvGet(K("threadTitle"));
+    const parentKey = threadContext ? `${conversationKey.slice(0, conversationKey.indexOf("."))}.${threadContext.parentId}` : null;
     buffer.atomically(() => {
       const list = JSON.parse(buffer.kvGet(K("archived")) ?? "[]") as { threadId: string; title: string | null; resetMessageId: string }[];
       if (!list.some((a) => a.threadId === bound)) list.push({ threadId: bound, title: title ?? null, resetMessageId: "thread-close" });
@@ -1245,7 +1253,13 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       buffer.kvDelete(K("threadId"));
       buffer.kvDelete(K("reset"));
       buffer.kvSet(K("threadClosed"), "1");
+      if (boundJobs > 0 && parentKey && threadContext) {
+        buffer.addNotice(`thread-jobs:${channelId}:${bound}`,
+          `⚠️ ${name}'s thread "${threadContext.threadName}" was closed while ${boundJobs} standing scheduled job${boundJobs === 1 ? " was" : "s were"} still bound to its session; move or delete ${boundJobs === 1 ? "it" : "them"} so nothing is missed.`,
+          parentKey);
+      }
     });
+    if (boundJobs > 0) log.emit("bridge.thread_closed_with_jobs", { bot: name, discordThreadId: channelId, threadId: bound, count: boundJobs });
     for (let head = buffer.outboxHead(conversationKey); head && head.state === "pending" && buffer.outboxDrop(head.id); head = buffer.outboxHead(conversationKey)) {
       unstage(head);
     }

@@ -62,6 +62,7 @@ export function makeThreadManager({
   const metaCache = new Map<string, ThreadMeta | null>();
   const resolving = new Map<string, Promise<ThreadMeta | null>>();
   const activating = new Map<string, Promise<void>>();
+  let capNoticeTarget: string | null = null;
 
   const loadRecords = (): ThreadRecord[] => {
     const raw = buffer.kvGet(REGISTRY_KEY);
@@ -74,7 +75,7 @@ export function makeThreadManager({
 
   const isChildThread = (ch: DiscordChannel | null | undefined): ch is DiscordChannel & { id: string; parent_id: string } =>
     Boolean(ch && typeof ch.id === "string" && SNOWFLAKE.test(ch.id) && typeof ch.parent_id === "string" && parentChannels.has(ch.parent_id)
-      && (ch.type === undefined || THREAD_TYPES.has(ch.type)));
+      && typeof ch.type === "number" && THREAD_TYPES.has(ch.type));
 
   const cacheChannel = (ch: DiscordChannel | null | undefined): ThreadMeta | null => {
     if (!isChildThread(ch)) return null;
@@ -154,12 +155,15 @@ export function makeThreadManager({
     const key = `${botKey}:threadCapNoticed:${threadId}`;
     if (buffer.kvGet(key)) return;
     const content = `⏸ ${botName} already has ${maxThreads} active thread conversations (the limit). Archive an older thread before starting a new one here.`;
+    capNoticeTarget = threadId;
     try {
       await discord.createMessage(threadId, { content, nonce: `c${threadId.slice(-18)}`, enforce_nonce: true, allowed_mentions: { parse: [] } });
       buffer.kvSet(key, "1");
       log.emit("bridge.thread_cap_reached", { bot: botName, threadId, limit: maxThreads });
     } catch (e) {
       log.emit("bridge.thread_cap_notice_failed", { bot: botName, threadId, error: errText(e) });
+    } finally {
+      if (capNoticeTarget === threadId) capNoticeTarget = null;
     }
   }
 
@@ -327,7 +331,8 @@ export function makeThreadManager({
       const r = recordOf(channelId);
       return r?.state === "active" ? bots.get(channelId) : undefined;
     },
-    isAllowedThread: (channelId: string): boolean => bots.has(channelId) || Boolean(metaCache.get(channelId)),
+    // Only admitted thread conversations (and a verified child thread receiving its single cap notice) are writable.
+    isAllowedThread: (channelId: string): boolean => bots.has(channelId) || capNoticeTarget === channelId,
     activeThreadsFor: (parentId: string): { name: string; state: "active" | "closing" }[] =>
       loadRecords().filter((r) => r.parentId === parentId).map((r) => ({ name: r.name, state: r.state })),
     activeT3ThreadIds: (): Set<string> => {

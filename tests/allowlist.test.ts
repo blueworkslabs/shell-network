@@ -2,22 +2,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { allowlistedMcp, ToolDenied } from "../lib/allowlist.ts";
+import { allowlistedMcp, stopClientRequestId, ToolDenied, type StopGrant } from "../lib/allowlist.ts";
 import { mcpCallLog, t3Adapter } from "../lib/t3.ts";
 import { handoffInput, type ScheduleHandoff } from "../lib/schedule-handoff.ts";
 import { memoryLog } from "../lib/log.ts";
 
 const DEPLOYED: string[] = JSON.parse(readFileSync(new URL("./fixtures/t3-mcp-tool-names.json", import.meta.url), "utf8")).names;
-const ALLOWED = ["list_scheduled_tasks", "t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send", "t3_thread_organize"];
-const P = "proj-gem", I = "crewGemClaude", T = "thread-gem";
+const ALLOWED = ["list_scheduled_tasks", "t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send", "t3_thread_organize", "t3_thread_interrupt"];
+const P = "proj-gem", I = "crewGemClaude", T = "thread-gem", STOP_KEY = "gem.test", STOP_ID = "999", STOP_RUN = "run:thread-gem:1";
 
 type Harness = ReturnType<typeof harness>;
-function harness({ bound = T as string | null, modelOptions }: { bound?: string | null; modelOptions?: Record<string, string | boolean> } = {}) {
+function harness({ bound = T as string | null, modelOptions, stop = null as StopGrant | null }: { bound?: string | null; modelOptions?: Record<string, string | boolean>; stop?: StopGrant | null } = {}) {
   const calls: { name: string; args: unknown }[] = [];
   const raw = { sessionId: "s", call: async (name: string, args?: Record<string, unknown>) => { calls.push({ name, args }); return {}; }, reconnect: async () => {} };
-  const state = { bound };
+  const state = { bound, stop };
   const log = memoryLog();
-  const mcp = allowlistedMcp(raw, { projectId: P, instanceId: I, ...(modelOptions ? { modelOptions } : {}), boundThread: () => state.bound }, log);
+  const mcp = allowlistedMcp(raw, { projectId: P, instanceId: I, ...(modelOptions ? { modelOptions } : {}), boundThread: () => state.bound, stop: () => state.stop }, log);
   return { calls, mcp, state };
 }
 const ok: Record<string, Record<string, unknown>> = {
@@ -28,6 +28,7 @@ const ok: Record<string, Record<string, unknown>> = {
   t3_queue: { action: "list", threadId: T },
   t3_thread_send: { threadId: T, message: "hi", mode: "queue", clientRequestId: "bridge-gem-1" },
   t3_thread_organize: { action: "archive", threadId: T },
+  t3_thread_interrupt: { threadId: T, runId: STOP_RUN, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) },
 };
 const denied = async (h: Harness, name: string, args: unknown, re?: RegExp) => {
   const before = h.calls.length;
@@ -36,7 +37,7 @@ const denied = async (h: Harness, name: string, args: unknown, re?: RegExp) => {
 };
 
 test("fixture: current t3 exposes the bridge tools and other operations", () => {
-  for (const n of [...ALLOWED, "t3_thread_interrupt", "t3_project_delete", "t3_thread_configure"]) assert.ok(DEPLOYED.includes(n), n);
+  for (const n of [...ALLOWED, "t3_project_delete", "t3_thread_configure", "t3_thread_send_attachments"]) assert.ok(DEPLOYED.includes(n), n);
 });
 
 test("DENY: every deployed tool outside the allowlist is refused before the client is called", async () => {
@@ -48,7 +49,7 @@ test("DENY: every deployed tool outside the allowlist is refused before the clie
 
 test("NEG control: each allowed tool with the bridge's own argument shapes passes through unchanged", async () => {
   for (const [name, args] of Object.entries(ok)) {
-    const h = harness({ bound: name === "t3_thread_launch" ? null : T });
+    const h = harness({ bound: name === "t3_thread_launch" ? null : T, stop: name === "t3_thread_interrupt" ? { id: STOP_ID, conversationKey: STOP_KEY, threadId: T, runId: STOP_RUN } : null });
     await h.mcp.call(name, args);
     assert.deepEqual(h.calls, [{ name, args }]);
   }
@@ -76,6 +77,34 @@ test("DENY organize: only archive, only the bound thread, no other argument, not
   await denied(h, "t3_thread_organize", { action: "snooze", threadId: T, snoozedUntil: "2030-01-01T00:00:00Z" });
   h.state.bound = null;
   await denied(h, "t3_thread_organize", ok.t3_thread_organize);
+});
+
+test("DENY interrupt: only on the bound thread while a person's /stop is pending, with its recorded runId and fixed clientRequestId and no extra args", async () => {
+  const h = harness();
+  // denied while no /stop is pending
+  await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt, /no \/stop is pending/);
+  // denied when the pending /stop belongs to a different thread
+  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: "other-thread", runId: STOP_RUN };
+  await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt, /no \/stop is pending/);
+  // active grant on bound thread
+  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: T, runId: STOP_RUN };
+  await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, threadId: "other-thread" });
+  await denied(h, "t3_thread_interrupt", { threadId: T, runId: STOP_RUN }, /clientRequestId required/);
+  await denied(h, "t3_thread_interrupt", { threadId: T, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) }, /runId required/);
+  await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, runId: "run:other:2" }, /only the pending \/stop run/);
+  await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, clientRequestId: "wrong-id" }, /only the pending \/stop request/);
+  for (const extra of [{ stop: true }, { stop: false }, { reason: "x" }, { environmentId: "other" }]) {
+    await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, ...extra }, /not allowed/);
+  }
+  await h.mcp.call("t3_thread_interrupt", ok.t3_thread_interrupt);
+  assert.deepEqual(h.calls, [{ name: "t3_thread_interrupt", args: ok.t3_thread_interrupt }]);
+  // once the pending grant closes, calls are refused again
+  h.state.stop = null;
+  await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt, /no \/stop is pending/);
+  // denied while no thread is bound
+  h.state.bound = null;
+  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: T, runId: STOP_RUN };
+  await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt);
 });
 
 test("DENY launch: other project, other instance, unexpected options, or a thread already bound", async () => {
@@ -148,13 +177,14 @@ test("adapter: its real call shapes pass the allowlist (paged read, paged list, 
       return {};
     },
   };
-  const a = t3Adapter({ mcp: raw, policy: { projectId: P, instanceId: I, boundThread: () => bound }, log: memoryLog() });
+  const a = t3Adapter({ mcp: raw, policy: { projectId: P, instanceId: I, boundThread: () => bound, stop: () => (bound ? { id: STOP_ID, conversationKey: STOP_KEY, threadId: bound, runId: STOP_RUN } : null) }, log: memoryLog() });
   assert.equal((await a.findThreads({ projectId: P, title: "Gem (bridge x)" })).length, 1);
   await a.launch({ projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "m" } });
   bound = T;
   assert.deepEqual((await a.read(T)).items!.map((x) => x.text), ["earlier input", "latest reply"]);
   assert.deepEqual((await a.queue(T)).items.map((x) => x.text), ["first", "second"]);
   await a.send({ threadId: T, message: "m", mode: "queue", clientRequestId: "c" });
+  await a.interrupt({ threadId: T, runId: STOP_RUN, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) });
   await a.archive(T);
 });
 

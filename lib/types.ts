@@ -221,6 +221,11 @@ export interface ThreadListItem {
   title?: unknown;
   [k: string]: unknown;
 }
+export interface InterruptResult {
+  threadId?: string;
+  runId?: string | null;
+  status?: "interrupt_requested" | "no_active_run" | RunStatus;
+}
 export interface T3Port {
   listStandingJobs(): Promise<{ scheduledTaskId: string; boundThreadId: string | null; enabled: boolean }[]>;
   launch(args: { projectId: string; title: string; modelSelection: ModelSelection }): Promise<{ threadId?: unknown } | null | undefined>;
@@ -229,6 +234,8 @@ export interface T3Port {
   projection(threadId: string): Promise<Projection>;
   queue(threadId: string): Promise<QueueList>;
   send(args: { threadId: string; message: string; mode: "queue"; clientRequestId: string }): Promise<{ messageId?: string; runId?: string; delivery?: string }>;
+  // /stop: interrupt the bound thread's recorded running turn (never `stop: true`, so queued input is not held)
+  interrupt(args: { threadId: string; runId: string; clientRequestId: string }): Promise<InterruptResult>;
   // /new: archive the bot's own (bound) thread; archived threads stay readable by id (native search excludes them)
   archive(threadId: string): Promise<unknown>;
   // the export after /new: one page of an archived thread in the messages view (lib/t3-transcript.ts)

@@ -90,6 +90,8 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
       if (mode !== "queue") throw new Error(`t3 send mode ${mode} refused: the bridge sends queue only`);
       return call("t3_thread_send", { threadId, message, mode, clientRequestId }, "bridge-send");
     },
+    interrupt: ({ threadId, runId, clientRequestId }: { threadId: string; runId: string; clientRequestId: string }) =>
+      call("t3_thread_interrupt", { threadId, runId, clientRequestId }, "bridge-interrupt"),
     archive: (threadId: string) => call("t3_thread_organize", { action: "archive", threadId }, "bridge-archive"),
     readArchived: (args) => call("t3_thread_read", args, "bridge-archive-read"),
   };

@@ -78,7 +78,5 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   They are capped on the receiving side, where the other bot's bridge counts and refuses them.
 - **Not an isolation boundary for agents.** As stated above, an agent with shell access as the bridge user can read
   the bridge's secret files and the buffer DB.
-- **Saved images are not separated between bots.** Every bot runs as the same system user, so one bot's `.inbox/`
-  (images from its channels and DMs) is readable by the others, like the rest of its workspace. The DM text itself is
-  already in the same place (t3 state, the buffer DB, the bot's notes), so an image adds no new kind of exposure. Separate
-  users per bot would be the boundary.
+- **No filesystem boundary between agents.** All crew agents run as one Unix user, so there is no filesystem boundary
+  between agents, for DM text and images alike. Separate users would be the fix.

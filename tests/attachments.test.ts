@@ -215,6 +215,11 @@ test("INBOX SWEEP: saved images older than seven days and stale partial writes a
   writeFileSync(join(dir, "1793-0-waiting.png"), "x"); utimesSync(join(dir, "1793-0-waiting.png"), (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);
   assert.equal(sweepInbox({ inboxDir: dir, inUse: (id) => id === "1793", now: () => t }), 2);
   assert.deepEqual(readdirSync(dir).sort(), [".1792-3-y.png.0123456789ab.part", "1792-1-new.jpg", "1793-0-waiting.png", "notes.md"], "a waiting message keeps its image");
+  const target = join(tempDir("inbox-target-"), "keep.png");
+  writeFileSync(target, "x"); utimesSync(target, (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);
+  symlinkSync(target, join(dir, "1794-0-link.png"));
+  assert.equal(sweepInbox({ inboxDir: dir, inUse: (id) => id === "1793", now: () => t }), 0, "a symlink inside the inbox is not a saved file");
+  assert.ok(existsSync(target) && readdirSync(dir).includes("1794-0-link.png"), "the link and its target stay");
   assert.equal(sweepInbox({ inboxDir: join(dir, "missing") }), 0);
   const ws = tempDir("inbox-ws-"), outside = tempDir("inbox-out-");
   writeFileSync(join(outside, "1792-0-old.png"), "x"); utimesSync(join(outside, "1792-0-old.png"), (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);

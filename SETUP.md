@@ -79,6 +79,93 @@ The full list of settings is in the header of each entrypoint:
 
 The `T1_` prefix on the t3 connection variables is historical.
 
+## Gemini through Antigravity
+
+Verified combination: t3 **0.1.11**, Google's official **agy 1.5.14**, and
+`gemini-4-neon` (2026-11-22). This uses t3's built-in `antigravity` driver and the
+CLI's ACP mode, not a proxy or a separate Google client. The bridge needs no
+provider-specific code. Recheck these steps when upgrading either runtime.
+
+### Provider and sign-in
+
+1. Install `agy` from [Google's official installer](https://antigravity.google/cli/install.sh)
+   as the service user; inspect the installer and verify its published checksum.
+   Set the t3 instance's `config.binaryPath` to the installed absolute path if the
+   service PATH does not include it.
+2. Create a dedicated t3 provider instance with driver `antigravity`, a stable ID
+   such as `crewGemAntigravity`, and a descriptive display name. Pick the ID
+   **before signing in**: t3 0.1.11 derives the private profile path from its hash.
+3. Choose the authentication method explicitly. The verified subscription path
+   uses `config.authMethod: "oauth-personal"`. Start sign-in from this t3 instance
+   using its native authentication flow. On a headless/SSH host, the CLI supplies
+   a Google authorization URL; the user signs in and returns a code to that same
+   flow. Deliver URLs/codes privately, never in a shared Discord channel, repository
+   or diagnostic log. Finish through t3; do not launch a second client against
+   the same credentials. Authentication success alone is not a model/tool test.
+4. Refresh the instance's model catalog and select `gemini-4-neon` explicitly;
+   do not assume the catalog's default is the intended model. Test one disposable
+   conversation before moving a live crew member.
+
+**Subscription policy:** the user must choose this route knowing that using an
+account through a third-party integration can lead to suspension. Using the
+official CLI is not a guarantee of permission or account safety. Treat Google's
+reported **one-appeal limit** as an operational constraint: on an account-suspended
+response, stop the trial and tell the user; no retry loops, alternate clients or
+attempts to evade the suspension. One test conversation at a time; no proxy.
+See the decision and sources in [#65](https://github.com/blueworkslabs/shell-network/issues/65).
+t3 also exposes API-key authentication choices; those are a separate setup and
+were not verified by this subscription trial.
+
+### Persona, Discord and memory
+
+Use the existing agent workspace as the t3 project root. Add `GEMINI.md` there
+with imports of the existing persona files, rather than maintaining a second
+persona. The trial verified automatic `GEMINI.md` loading with:
+
+```markdown
+@CREW.md
+@SOUL.md
+@IDENTITY.md
+@USER.md
+@MEMORY.md
+```
+
+Configure the `discord` stdio MCP server in **this instance's private Antigravity
+profile**, at `<profile>/config/mcp_config.json`. Its command is the absolute Node
+path and its arguments name the reviewed installed `bin/discord-tool.ts`. Use
+that bot's `DISCORD_TOOL_BOT`, shared `DISCORD_TOOL_DB`, own
+`DISCORD_TOOL_WORKSPACE`, own `DISCORD_TOOL_NOTES` and own memory-index settings
+from [MEMORY.md](MEMORY.md). Keep embedding credentials as protected file paths;
+do not put Discord tokens in the provider's environment.
+
+Do not assume `GEMINI_HOME=... agy mcp add` targets the right file: in the verified
+CLI version it wrote the global MCP config instead. Inspect the actual t3 launch
+profile and place only the intended MCP server definition there; preserve all
+other config. Keep profile directories owner-only and config files private.
+
+For a new bridge, set the private crew entry to the exact t3 instance ID and model:
+
+```json
+{
+  "key": "gem",
+  "name": "Gem",
+  "id": "<Discord bot id>",
+  "instanceId": "crewGemAntigravity",
+  "model": "gemini-4-neon"
+}
+```
+
+For an existing bridge, use the preservation steps in
+[OPERATIONS.md](OPERATIONS.md#antigravity-cutover-and-rollback); editing the crew
+file alone does not change already-bound conversations. Verify a real model turn,
+its persona, `memory_search`, `discord_read`, and the delivered Discord reply.
+The tested Neon catalog defaults `thought_level` to `high`; it can be pinned as
+`options: [{"id":"thought_level","value":"high"}]` in t3's conversation
+model selection. Until [#66](https://github.com/blueworkslabs/shell-network/issues/66)
+is installed, the bridge passes only the crew provider/model for new conversations;
+a conversation pin is not a durable bridge default. Read back selections rather
+than assuming a project-default update persisted.
+
 ## Upgrading from t3 0.1.0
 
 Upgrading requires this adapter's `t3_queue` list action and explicit oldest-first activity pagination. Stop the

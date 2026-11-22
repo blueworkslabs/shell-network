@@ -111,7 +111,11 @@ try { dmUserIds = dmUsers(process.env.BRIDGE_DM_USERS, allowedAuthors); } catch 
 const dmChannels = new Set<string>();
 const keys: string[] = channelIds.map((ch) => conversationKeyFor(cfg.key, ch));
 let threads: ReturnType<typeof makeThreadManager> | null = null;
-const discord = discordRest({ token, allowedChannels: channelIds, alsoAllowed: (id) => dmChannels.has(id) || keys.some((k) => buffer.isToolThread(k, id)) || Boolean(threads?.isAllowedThread(id)), log });
+const discord = discordRest({
+  token, allowedChannels: channelIds,
+  alsoAllowed: (id) => dmChannels.has(id) || (threads ? threads.isAllowedWrite(id, keys.some((k) => buffer.isToolThread(k, id))) : keys.some((k) => buffer.isToolThread(k, id))),
+  log,
+});
 const me = await discord.me();
 if (me.id !== cfg.id) { console.error("BRIDGE_CREW_FILE: own bot id does not match Discord token"); process.exit(2); }
 // Every conversation: the guild channels, then one per DM (the user's DM channel, from Discord).

@@ -74,7 +74,16 @@ export function makeThreadManager({
   };
   const saveRecords = (records: ThreadRecord[]) => buffer.kvSet(REGISTRY_KEY, JSON.stringify(records));
   const recordOf = (threadId: string): ThreadRecord | undefined => loadRecords().find((r) => r.threadId === threadId);
-  const activeCount = () => loadRecords().filter((r) => r.state === "active").length;
+  // Count every live record (active and closing) toward the cap until archive and export finish and remove it.
+  const activeCount = () => loadRecords().length;
+  const deniedKey = (threadId: string) => `${botKey}:deniedThread:${threadId}`;
+  const isDeniedThread = (channelId: string): boolean =>
+    pendingRestore.has(channelId)
+    || recordOf(channelId)?.state === "closing"
+    || buffer.kvGet(`${botKey}.${channelId}:threadClosing`) === "1"
+    || buffer.kvGet(`${botKey}.${channelId}:threadClosed`) === "1"
+    || buffer.kvGet(deniedKey(channelId)) === "1"
+    || (metaCache.has(channelId) && (metaCache.get(channelId) === null || metaCache.get(channelId)!.archived));
 
   const isChildThread = (ch: DiscordChannel | null | undefined): ch is DiscordChannel & { id: string; parent_id: string; type: number } =>
     Boolean(ch && typeof ch.id === "string" && SNOWFLAKE.test(ch.id) && typeof ch.parent_id === "string" && parentChannels.has(ch.parent_id)
@@ -217,9 +226,11 @@ export function makeThreadManager({
         }
       } catch (e) {
         const status = (e as { status?: number } | null)?.status;
-        if (status === 403) markClosing(r.threadId, "access-denied");
-        else if (status === 404) markClosing(r.threadId, "deleted-offline");
-        else log.emit("bridge.thread_check_error", { bot: botName, threadId: r.threadId, error: errText(e) });
+        if (status === 403 || status === 404) {
+          metaCache.set(r.threadId, null);
+          buffer.kvSet(deniedKey(r.threadId), "1");
+          markClosing(r.threadId, status === 403 ? "access-denied" : "deleted-offline");
+        } else log.emit("bridge.thread_check_error", { bot: botName, threadId: r.threadId, error: errText(e) });
       }
     }
   }
@@ -262,7 +273,8 @@ export function makeThreadManager({
       const records = loadRecords();
       if (!records.some((r) => r.threadId === threadId)) saveRecords([...records, record]);
       const bot = instantiate(record);
-      // Clear any closing markers and stale state if this Discord thread was previously archived and later unarchived.
+      // Clear any closing/denied markers and stale state if this Discord thread was previously archived and later unarchived.
+      buffer.kvDelete(deniedKey(threadId));
       bot.reopen();
       // Start watermark right before the activating message so catch-up starts here without missing it.
       bot.initWatermarkAt(String(BigInt(msg.id) - 1n));
@@ -316,8 +328,11 @@ export function makeThreadManager({
     if (type === "THREAD_CREATE" || type === "THREAD_UPDATE") {
       const meta = cacheChannel(d as DiscordChannel);
       if (!meta) return undefined;
-      if (meta.archived) markClosing(d.id, "archived");
-      else {
+      if (meta.archived) {
+        buffer.kvSet(deniedKey(d.id), "1");
+        markClosing(d.id, "archived");
+      } else {
+        if (recordOf(d.id)?.state !== "closing") buffer.kvDelete(deniedKey(d.id));
         const records = loadRecords();
         const idx = records.findIndex((r) => r.threadId === d.id);
         if (idx >= 0 && (records[idx].name !== meta.name || records[idx].type !== meta.type)) {
@@ -328,13 +343,20 @@ export function makeThreadManager({
       return undefined;
     }
     if (type === "THREAD_DELETE") {
-      if (typeof d?.id === "string") markClosing(d.id, "deleted");
+      if (typeof d?.id === "string") {
+        metaCache.set(d.id, null);
+        buffer.kvSet(deniedKey(d.id), "1");
+        markClosing(d.id, "deleted");
+      }
       return undefined;
     }
     if (type === "THREAD_LIST_SYNC" && Array.isArray(d?.threads)) {
       for (const t of d.threads) {
         const meta = cacheChannel(t as DiscordChannel);
-        if (meta?.archived) markClosing(t.id, "archived-sync");
+        if (meta?.archived) {
+          buffer.kvSet(deniedKey(t.id), "1");
+          markClosing(t.id, "archived-sync");
+        }
       }
       return undefined;
     }
@@ -380,7 +402,12 @@ export function makeThreadManager({
       return r?.state === "active" ? bots.get(channelId) : undefined;
     },
     // Only admitted (and revalidated) active thread conversations (plus the single cap-notice send) are writable.
-    isAllowedThread: (channelId: string): boolean => (!pendingRestore.has(channelId) && bots.has(channelId) && recordOf(channelId)?.state === "active") || capNoticeTarget === channelId,
+    isDeniedThread,
+    isAllowedThread: (channelId: string): boolean => capNoticeTarget === channelId || (!isDeniedThread(channelId) && bots.has(channelId) && recordOf(channelId)?.state === "active"),
+    // Combined write guard for thread IDs: a closing, closed, archived, deleted, or unrevalidated thread is denied
+    // immediately even if it was previously created by this bot's discord_thread tool.
+    isAllowedWrite: (channelId: string, fallbackToolThread = false): boolean =>
+      capNoticeTarget === channelId || (!isDeniedThread(channelId) && ((bots.has(channelId) && recordOf(channelId)?.state === "active") || fallbackToolThread)),
     activeThreadsFor: (parentId: string): ActiveThreadSummary[] =>
       loadRecords().filter((r) => r.parentId === parentId).map((r) => {
         const jobs = (() => { try { return (JSON.parse(buffer.kvGet(`${botKey}.${r.threadId}:closeJobs`) ?? "null") as { count?: number } | null)?.count ?? 0; } catch { return 0; } })();

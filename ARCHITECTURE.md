@@ -185,15 +185,16 @@ channels are ignored.
   so `discord_send`, `discord_read`, `discord_edit` and `discord_react` target the thread directly (`discord_thread` is
   refused inside a thread). `/new`, `/stop` and `/status` work inside the thread for that thread's conversation, and
   `/status` in the parent channel lists public active threads by name and private threads by count only.
-- **Cap and lifecycle:** at most 10 active thread conversations per bot (`MAX_ACTIVE_THREADS`); an 11th receives one
-  fixed notice and starts no session. After a restart, saved active threads stay disabled until `READY`/`RESUMED`
-  revalidates thread type, configured parent and bot access (a `403`, `404` or removed parent closes the thread). When
-  Discord archives or deletes the thread, the bridge stops accepting new input, waits for any running t3 turn to
-  settle, hands any bound standing scheduled jobs (enabled and paused) into the parent channel's session via the #58
-  rebind flow (and warns in the parent channel and `/status` while holding archive until moved or deleted), archives
-  the t3 session, purges leftover buffered input and pending/posting outbox rows so reopening cannot replay stale work,
-  exports to `sessions/` (same as `/new`), removes its `tool_config`, and frees the slot. The existing per-conversation
-  MCP allowlist needs no wider grant.
+- **Cap and lifecycle:** at most 10 live thread conversations per bot (`MAX_ACTIVE_THREADS`, counting both active and
+  closing threads until archive and export finish); an 11th receives one fixed notice and starts no session. After a
+  restart, saved active threads stay disabled until `READY`/`RESUMED` revalidates thread type, configured parent and
+  bot access (a `403`, `404` or removed parent closes the thread). When Discord archives or deletes the thread, the
+  bridge immediately revokes REST writes (including any legacy `discord_thread` fallback), stops accepting new input,
+  waits for any running t3 turn to settle, hands any bound standing scheduled jobs (enabled and paused) into the parent
+  channel's session via the #58 rebind flow (and warns in the parent channel and `/status` while holding archive until
+  moved or deleted), archives the t3 session, purges leftover buffered input and pending/posting outbox rows so
+  reopening cannot replay stale work, exports to `sessions/` (same as `/new`), removes its `tool_config`, and frees
+  the slot. The existing per-conversation MCP allowlist needs no wider grant.
 
 ## Output: one outbox per bot
 

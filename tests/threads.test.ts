@@ -269,14 +269,27 @@ test("THREADS: tools (send/read/edit/react), slash commands (/status, /stop, /ne
   assert.notEqual(w.t3ThreadOf(thId), thT3);
 });
 
-test("THREADS: cap refuses the (N+1)th thread with one fixed notice and frees a slot when an older thread closes", async () => {
-  const w = world({ maxThreads: 2 });
-  for (const [id, name] of [["200000000000000021", "t1"], ["200000000000000022", "t2"]] as const) {
+test("THREADS: cap refuses the (N+1)th thread with one fixed notice, holds the slot until close and export finish, and denies writes immediately (including isToolThread fallback)", async () => {
+  const notesRoot = tempDir("thread-cap-notes-");
+  const w = world({ maxThreads: 2, notesRoot });
+  const parentKey = conversationKeyFor("gem", PARENT_CH);
+
+  // Create a parent message and a legacy discord_thread tool post on it so buffer.isToolThread(parentKey, t1) is true
+  const starter = w.discord.userSays("tool thread starter", { mention: false, channel: PARENT_CH, guildId: GUILD });
+  await w.dispatch("MESSAGE_CREATE", starter);
+  const t1 = starter.id;
+  w.buffer.enqueue(parentKey, { key: `thread:${t1}`, content: "", nonce: `th-${t1}`, replyTo: t1, state: "pending" });
+  w.buffer.outboxPosted(w.buffer.outboxEntry(parentKey, `thread:${t1}`)!.id, t1);
+  assert.equal(w.buffer.isToolThread(parentKey, t1), true, "legacy isToolThread is true for t1");
+
+  const t2 = "200000000000000022";
+  for (const [id, name] of [[t1, "t1"], [t2, "t2"]] as const) {
     w.openThread(id, { name });
     await w.dispatch("MESSAGE_CREATE", w.discord.userSays(`hi ${name}`, { channel: id, guildId: GUILD }));
   }
   await w.steps(3);
   assert.equal(w.threads.records().length, 2);
+  assert.equal(w.threads.isAllowedWrite(t1, w.buffer.isToolThread(parentKey, t1)), true);
 
   // 3rd thread hits the cap: one fixed notice, no session started, repeated mention does not spam
   const t3Id = "200000000000000023";
@@ -299,15 +312,58 @@ test("THREADS: cap refuses the (N+1)th thread with one fixed notice and frees a 
   assert.equal(w.t3ThreadOf(t3bId), null);
   assert.equal(w.threads.isAllowedThread(t3bId), false, "write guard closes immediately after cap notice");
   assert.equal(w.discord.botPosts(t3bId).length, 1);
+  // Restored unrevalidated t1 is also denied even with isToolThread fallback
+  assert.equal(w.threads.isAllowedWrite(t1, w.buffer.isToolThread(parentKey, t1)), false, "unrevalidated thread denied despite isToolThread");
 
-  // Close t1 (after its turn finishes) -> slot frees -> a new thread t4 can start
-  const t1T3 = w.t3ThreadOf("200000000000000021")!;
-  w.finish(t1T3, "done t1");
+  // Archive t1 while its turn is STILL running:
+  // 1) writes are revoked immediately even though bots.has(t1) and isToolThread(t1) are true
+  // 2) cap slot remains occupied while t1 is closing (running turn)
+  await w.dispatch("THREAD_UPDATE", { id: t1, parent_id: PARENT_CH, name: "t1", type: 11, thread_metadata: { archived: true } });
+  assert.equal(w.threads.bots.has(t1), true);
+  assert.equal(w.threads.isAllowedThread(t1), false, "closing thread denied immediately");
+  assert.equal(w.threads.isAllowedWrite(t1, w.buffer.isToolThread(parentKey, t1)), false, "isToolThread fallback cannot bypass closing denial");
+
+  const t3cId = "200000000000000026";
+  w.openThread(t3cId, { name: "t3c" });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("hi t3c", { channel: t3cId, guildId: GUILD }));
   await w.steps(2);
-  await w.dispatch("THREAD_UPDATE", { id: "200000000000000021", parent_id: PARENT_CH, name: "t1", type: 11, thread_metadata: { archived: true } });
-  await w.steps(3);
+  assert.equal(w.t3ThreadOf(t3cId), null, "cap slot stays occupied while closing thread is still running");
+  assert.equal(w.discord.botPosts(t3cId).length, 1);
+
+  // Finish t1's turn, but stall export -> t1 archives in t3 yet its cap slot STILL stays occupied until export finishes
+  const t1T3 = w.t3ThreadOf(t1)!;
+  w.t3.archiveReadError = "export paused";
+  w.finish(t1T3, "done t1");
+  await w.steps(4);
+  await new Promise((r) => setTimeout(r, 30));
+  await w.steps(2);
   assert.equal(w.t3.threads.get(t1T3)!.archived, true);
+  assert.equal(w.threads.records().length, 2, "record kept while export is still pending");
+  const t3dId = "200000000000000027";
+  w.openThread(t3dId, { name: "t3d" });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("hi t3d", { channel: t3dId, guildId: GUILD }));
+  await w.steps(2);
+  assert.equal(w.t3ThreadOf(t3dId), null, "cap slot stays occupied until export completes");
+
+  // Unblock export, advance past export backoff -> closure/export completes -> slot frees for t4
+  w.t3.archiveReadError = null;
+  w.advance(60_000);
+  await w.steps(2);
+  await new Promise((r) => setTimeout(r, 30));
+  await w.steps(2);
   assert.equal(w.threads.records().length, 1);
+  assert.equal(w.threads.isAllowedWrite(t1, w.buffer.isToolThread(parentKey, t1)), false, "closed thread stays denied despite isToolThread");
+
+  // Even after restart, closed t1 and a deleted unadmitted tool thread stay denied despite isToolThread
+  const deletedToolTh = "200000000000000028";
+  w.buffer.enqueue(parentKey, { key: `thread:${deletedToolTh}`, content: "", nonce: `th-${deletedToolTh}`, replyTo: deletedToolTh, state: "pending" });
+  w.buffer.outboxPosted(w.buffer.outboxEntry(parentKey, `thread:${deletedToolTh}`)!.id, deletedToolTh);
+  assert.equal(w.threads.isAllowedWrite(deletedToolTh, w.buffer.isToolThread(parentKey, deletedToolTh)), true);
+  await w.dispatch("THREAD_DELETE", { id: deletedToolTh });
+  assert.equal(w.threads.isAllowedWrite(deletedToolTh, w.buffer.isToolThread(parentKey, deletedToolTh)), false);
+  w.restart();
+  assert.equal(w.threads.isAllowedWrite(t1, w.buffer.isToolThread(parentKey, t1)), false, "closed t1 stays denied after restart");
+  assert.equal(w.threads.isAllowedWrite(deletedToolTh, w.buffer.isToolThread(parentKey, deletedToolTh)), false, "deleted tool thread stays denied after restart");
 
   const t4Id = "200000000000000024";
   w.openThread(t4Id, { name: "t4" });

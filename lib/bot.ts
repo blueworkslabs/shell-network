@@ -93,6 +93,8 @@ export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() =
 // plus such an image (an agent pointing at a file it made) counts as NO_REPLY (#79). Images on the web (`https://`)
 // stay, and so does anything in code (fenced blocks, inline code of any backtick run) or escaped (`\![...]`). A final
 // without such an image is returned as it is; with one, only the image goes, plus its line when nothing else was on it.
+// Known gaps, left as they are: reference-style images (`![x][ref]`), HTML `<img>`, paths with nested parentheses,
+// relative paths, and inline code spans that run over a line break.
 const LOCAL_PATH = String.raw`(?:[^\s()<>]|\([^\s()]*\))+`; // one level of parentheses, as in chart(1).png
 const LOCAL_IMAGE = String.raw`!\[[^\]\n]*\]\(\s*(?:<(?:\/|file:)[^>\n]*>|(?:\/|file:)${LOCAL_PATH})(?:\s+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?\s*\)`;
 // left to right: code and escapes are consumed as they are, so an image inside them is never seen

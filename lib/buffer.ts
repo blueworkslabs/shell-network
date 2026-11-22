@@ -588,6 +588,23 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     deleteToolConfig(conversationKey: string): void {
       db.prepare("DELETE FROM tool_config WHERE conversation_key = ?").run(conversationKey);
     },
+    // Clear any leftover input, pending/posting outbox rows (including edits), unposted replies and alerts when a
+    // Discord thread conversation closes, so reopening the same thread later can never replay stale work.
+    purgeClosedConversation(conversationKey: string): OutboxRow[] {
+      return tx(() => {
+        const dropped = all<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND state IN ('pending','posting') ORDER BY id", conversationKey);
+        db.prepare("UPDATE outbox SET state = 'dropped', boundary = NULL WHERE conversation_key = ? AND state IN ('pending','posting')").run(conversationKey);
+        db.prepare("DELETE FROM inbound WHERE conversation_key = ? AND state = 'buffered'").run(conversationKey);
+        db.prepare("UPDATE inbound SET acked_at = ? WHERE conversation_key = ? AND acked_at IS NULL").run(now(), conversationKey);
+        const unposted = all<BatchRow>(`SELECT b.* FROM batch b WHERE b.conversation_key = ? AND b.status = 'delivered'
+          AND NOT EXISTS (SELECT 1 FROM reply r WHERE r.batch_id = b.id AND r.part = r.parts - 1)
+          AND NOT EXISTS (SELECT 1 FROM reply_none n WHERE n.batch_id = b.id)`, conversationKey);
+        for (const b of unposted) db.prepare("INSERT OR IGNORE INTO reply_none (batch_id, at) VALUES (?, ?)").run(b.id, now());
+        db.prepare("UPDATE alert SET cleared_at = ? WHERE cleared_at IS NULL AND batch_id IN (SELECT id FROM batch WHERE conversation_key = ?)").run(now(), conversationKey);
+        db.prepare("UPDATE notice SET posted_at = ? WHERE conversation_key = ? AND posted_at IS NULL").run(now(), conversationKey);
+        return dropped;
+      });
+    },
     // A message of the channel log (allowlisted people, allowed crew bots, this bot): tool targets must be one.
     // An edit of the bot's own post (discord_edit), applied: the channel log shows the new text.
     editChannelMessage: (id: string, authorId: string, content: string): void => { db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND author_id = ?").run(content, id, authorId); },

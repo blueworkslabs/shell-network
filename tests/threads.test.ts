@@ -28,6 +28,13 @@ function world({ maxThreads = MAX_ACTIVE_THREADS, notesRoot, cap = 2 }: { maxThr
   const now = () => clock;
   const t3 = fakeT3();
   const discord = fakeDiscord({ channelId: PARENT_CH, botUserId: BOT, now });
+  const channelErrors = new Map<string, number>();
+  const origGetChannel = discord.getChannel.bind(discord);
+  discord.getChannel = async (id: string) => {
+    const status = channelErrors.get(id);
+    if (status) throw Object.assign(new Error(`HTTP ${status}`), { status });
+    return origGetChannel(id);
+  };
   const log = memoryLog();
   let nudges = 0, ixSeq = 0;
   const ixCalls: string[] = [];
@@ -38,29 +45,16 @@ function world({ maxThreads = MAX_ACTIVE_THREADS, notesRoot, cap = 2 }: { maxThr
   };
   const snow = () => String(((BigInt(clock) - 1420070400000n) << 22n) + BigInt(++ixSeq));
   const w = {
-    path, t3, discord, log, ixCalls, nudges: () => nudges, advance: (ms: number) => { clock += ms; },
+    path, t3, discord, channelErrors, log, ixCalls, nudges: () => nudges, advance: (ms: number) => { clock += ms; },
     buffer: null as unknown as Buffer,
     parentBot: null as unknown as ReturnType<typeof makeBot>,
     threads: null as unknown as ReturnType<typeof makeThreadManager>,
     interact: null as unknown as ReturnType<typeof interactionDispatch>,
-    start() {
+    start({ parentIds = [PARENT_CH] }: { parentIds?: string[] } = {}) {
       w.buffer = openTempBuffer(path, { now });
       t3.crash.buffer = w.buffer;
       const parentKey = conversationKeyFor("gem", PARENT_CH);
-      const parentChannels = new Map([[PARENT_CH, { name: "shell-network", botRoleId: null }]]);
-      w.threads = makeThreadManager({
-        botKey: "gem", botName: "Gem", botUserId: BOT, parentChannels,
-        allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }],
-        maxThreads, buffer: w.buffer, discord, nudge: () => { nudges++; }, log, now,
-        createBot: (record: ThreadRecord, botRoleId: string | null) => makeBot({
-          name: "Gem", conversationKey: conversationKeyFor("gem", record.threadId), channelId: record.threadId,
-          channelName: record.name, threadLabel: `Gem #${record.parentName} / ${record.name}`,
-          botUserId: BOT, botRoleId, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }],
-          exchangeCap: cap, projectId: "proj-gem", modelSelection: { instanceId: "crewGemAntigravity", model: "m" },
-          threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, starter: record.starter ?? null },
-          notesRoot, buffer: w.buffer, t3, discord, log, now, session: () => "s1",
-        }),
-      });
+      const parentChannels = new Map(parentIds.map((id) => [id, { name: "shell-network", botRoleId: null }]));
       w.parentBot = makeBot({
         name: "Gem", conversationKey: parentKey, channelId: PARENT_CH, channelName: "shell-network",
         threadLabel: "Gem #shell-network", botUserId: BOT, allowedAuthors: [HUMAN_ID],
@@ -70,12 +64,26 @@ function world({ maxThreads = MAX_ACTIVE_THREADS, notesRoot, cap = 2 }: { maxThr
         notesRoot, buffer: w.buffer, t3, discord, log, now, session: () => "s1",
       });
       w.parentBot.initWatermark(clock - 60_000);
+      w.threads = makeThreadManager({
+        botKey: "gem", botName: "Gem", botUserId: BOT, parentChannels,
+        allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }],
+        maxThreads, buffer: w.buffer, discord, nudge: () => { nudges++; }, log, now,
+        createBot: (record: ThreadRecord, botRoleId: string | null) => makeBot({
+          name: "Gem", conversationKey: conversationKeyFor("gem", record.threadId), channelId: record.threadId,
+          channelName: record.name, threadLabel: `Gem #${record.parentName} / ${record.name}`,
+          botUserId: BOT, botRoleId, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }],
+          exchangeCap: cap, projectId: "proj-gem", modelSelection: { instanceId: "crewGemAntigravity", model: "m" },
+          threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
+          ...(parentChannels.has(record.parentId) ? { parentSession: { conversationKey: parentKey, sendHandoff: (inp) => w.parentBot.sendHandoff(inp) } } : {}),
+          notesRoot, buffer: w.buffer, t3, discord, log, now, session: () => "s1",
+        }),
+      });
       w.threads.restore();
-      const channelBots = new Map([[PARENT_CH, w.parentBot]]);
+      const channelBots = new Map(parentIds.includes(PARENT_CH) ? [[PARENT_CH, w.parentBot]] : []);
       w.interact = interactionDispatch({ port: ixPort, bots: { get: (ch) => channelBots.get(ch) ?? w.threads.botFor(ch) }, allowedAuthors: [HUMAN_ID], nudge: () => { nudges++; }, log, now });
       return w;
     },
-    restart() { try { w.buffer.close(); } catch {} return w.start(); },
+    restart(opts?: { parentIds?: string[] }) { try { w.buffer.close(); } catch {} return w.start(opts); },
     openThread(threadId: string, { parentId = PARENT_CH, name = "deep-dive", type = 11, archived = false } = {}) {
       discord.threads.set(threadId, { id: threadId, parent_id: parentId, name, type, thread_metadata: { archived } });
       return { id: threadId, parent_id: parentId, name, type, thread_metadata: { archived } };
@@ -318,9 +326,6 @@ test("THREADS: archiving or deleting a thread waits for open work, archives the 
   const thT3 = w.t3ThreadOf(thId)!;
   assert.ok(thT3);
 
-  // Standing job still bound to the closing thread's t3 session posts one warning notice in the parent channel
-  w.t3.standingJobs.push({ scheduledTaskId: "job-1", boundThreadId: thT3, enabled: true });
-
   // Thread archived while turn is still running: must wait until turn completes before archiving t3
   await w.dispatch("THREAD_UPDATE", { id: thId, parent_id: PARENT_CH, name: "export-me", type: 11, thread_metadata: { archived: true } });
   await w.steps(2);
@@ -336,7 +341,6 @@ test("THREADS: archiving or deleting a thread waits for open work, archives the 
   assert.equal(w.t3.threads.get(thT3)!.archived, true);
   assert.equal(w.t3ThreadOf(thId), null);
   assert.equal(w.threads.records().length, 0);
-  assert.ok(w.discord.botPosts(PARENT_CH).some((m) => m.content.includes("standing scheduled job") && !m.content.includes("job-1")), "parent channel warned without leaking job id");
 
   const sessionsDir = join(notesRoot, "sessions");
   assert.ok(existsSync(sessionsDir), "sessions/ created");
@@ -377,6 +381,223 @@ test("THREADS: archiving or deleting a thread waits for open work, archives the 
   await w.steps(2);
   assert.equal(w.t3.threads.get(th2T3)!.archived, true);
   assert.equal(w.threads.records().length, 0);
+});
+
+test("THREADS: restore fails closed until READY revalidates type, parent channel, and bot access (403/removed parent close)", async () => {
+  const w = world();
+  const thA = "200000000000000041";
+  const thB = "200000000000000042";
+  w.openThread(thA, { name: "still-accessible", type: 11 });
+  w.openThread(thB, { name: "revoked-access", type: 12 });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("start A", { channel: thA, guildId: GUILD }));
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("start B", { channel: thB, guildId: GUILD }));
+  await w.steps(3);
+  const t3A = w.t3ThreadOf(thA)!;
+  const t3B = w.t3ThreadOf(thB)!;
+  w.finish(t3A, "ok A");
+  w.finish(t3B, "ok B");
+  await w.steps(2);
+  const sendsBeforeRestart = w.t3.sends().length;
+
+  // Restart: saved active threads stay inactive until READY revalidates them
+  w.restart();
+  assert.equal(w.threads.botFor(thA), undefined, "restored thread is not active before READY");
+  assert.equal(w.threads.isAllowedThread(thA), false, "restored thread is not writable before READY");
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("too early A", { channel: thA, guildId: GUILD }));
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("too early B", { channel: thB, guildId: GUILD }));
+  await w.steps(2);
+  assert.equal(w.t3.sends().length, sendsBeforeRestart, "messages before READY revalidation are ignored");
+
+  // Revoke bot access to thB (403) before READY
+  w.channelErrors.set(thB, 403);
+  await w.dispatch("READY", { user: { id: BOT } });
+  await w.steps(4);
+
+  // thA revalidated and resumed (catching up "too early A"); thB closed & archived on 403 without ever accepting "too early B"
+  assert.ok(w.threads.botFor(thA), "revalidated thread is active after READY");
+  assert.equal(w.threads.isAllowedThread(thA), true);
+  assert.equal(w.t3.threads.get(t3B)!.archived, true, "403 on restore closes and archives t3 session");
+  assert.equal(w.t3ThreadOf(thB), null);
+  assert.equal(w.t3.sends().some((s) => s.threadId === t3B && s.message?.includes("too early B")), false, "403 thread never accepts pre-READY messages");
+  assert.equal(w.threads.records().length, 1);
+
+  assert.ok(w.t3.sends().some((s) => s.threadId === t3A && s.message?.includes("too early A")));
+  w.finish(t3A, "ok A caught up");
+  await w.steps(2);
+
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("after ready", { channel: thA, guildId: GUILD }));
+  await w.steps(3);
+  assert.ok(w.t3.sends().some((s) => s.threadId === t3A && s.message?.includes("after ready")));
+  w.finish(t3A, "ok A2");
+  await w.steps(2);
+
+  // Losing access while already active (403 on RESUMED) also closes and archives
+  w.channelErrors.set(thA, 403);
+  await w.dispatch("RESUMED", {});
+  await w.steps(4);
+  assert.equal(w.t3.threads.get(t3A)!.archived, true, "403 on RESUMED closes active thread");
+  assert.equal(w.threads.records().length, 0);
+
+  // Removing the parent channel from config before restart closes saved child threads immediately on restore
+  const thC = "200000000000000043";
+  w.openThread(thC, { name: "parent-removed-thread", type: 11 });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("start C", { channel: thC, guildId: GUILD }));
+  await w.steps(3);
+  const t3C = w.t3ThreadOf(thC)!;
+  w.finish(t3C, "ok C");
+  await w.steps(2);
+
+  w.restart({ parentIds: [] });
+  assert.equal(w.threads.botFor(thC), undefined, "removed-parent thread never reactivates");
+  assert.equal(w.threads.isAllowedThread(thC), false);
+  assert.equal(w.threads.records()[0]?.state, "closing");
+  await w.steps(4);
+  assert.equal(w.t3.threads.get(t3C)!.archived, true, "removed-parent thread archives its t3 session");
+  assert.equal(w.threads.records().length, 0);
+});
+
+test("THREADS: parent /status lists public threads by name and private threads by count only", async () => {
+  const w = world();
+  const pubId = "200000000000000051";
+  const priv1 = "200000000000000052";
+  const priv2 = "200000000000000053";
+  w.openThread(pubId, { name: "public-topic", type: 11 });
+  w.openThread(priv1, { name: "secret-alpha", type: 12 });
+  w.openThread(priv2, { name: "secret-beta", type: 12 });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("hi pub", { channel: pubId, guildId: GUILD }));
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("hi p1", { channel: priv1, guildId: GUILD }));
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("hi p2", { channel: priv2, guildId: GUILD }));
+  await w.steps(3);
+
+  await w.runCmd("status", PARENT_CH);
+  const reply = w.ixCalls.at(-1)!;
+  assert.match(reply, /Active threads \(3\): "public-topic", 2 private/);
+  assert.doesNotMatch(reply, /secret-alpha|secret-beta/);
+  assert.doesNotMatch(reply, new RegExp(`${pubId}|${priv1}|${priv2}`));
+});
+
+test("THREADS: close -> restart -> reopen purges stale buffered input, pending edits, posting outbox entries, and old replies", async () => {
+  const w = world();
+  const thId = "200000000000000061";
+  const convKey = conversationKeyFor("gem", thId);
+  w.openThread(thId, { name: "reopen-clean", type: 11 });
+
+  // Turn 1: produce a bot post so we can queue a stale edit against it
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("first turn", { channel: thId, guildId: GUILD }));
+  await w.steps(3);
+  const oldT3 = w.t3ThreadOf(thId)!;
+  w.finish(oldT3, "first post");
+  await w.steps(2);
+  const firstBotPost = w.discord.botPosts(thId)[0];
+  assert.ok(firstBotPost);
+
+  // Turn 2: leave a running batch, a buffered follow-up message, a pending edit, a posting outbox row, and a pending notice
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("second turn", { channel: thId, guildId: GUILD }));
+  await w.steps(2);
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("stale buffered input", { channel: thId, guildId: GUILD }));
+  assert.equal(w.buffer.buffered(convKey).length, 1);
+  const tools = w.tools();
+  tools.edit({ channel: thId, message_id: firstBotPost.id, content: "stale edit text", idempotency_key: "stale-edit-1" });
+  w.buffer.enqueue(convKey, { key: "tool:stale-posting", content: "stale posting text", nonce: "sp1", state: "posting", boundary: firstBotPost.id });
+  w.buffer.addNotice(`stale-notice:${thId}`, "stale thread notice", convKey);
+
+  // Close the thread while turn 2 is still running, then finish turn 2 so archive completes
+  await w.dispatch("THREAD_UPDATE", { id: thId, parent_id: PARENT_CH, name: "reopen-clean", type: 11, thread_metadata: { archived: true } });
+  await w.steps(2);
+  w.finish(oldT3, "stale reply from closed session");
+  await w.steps(4);
+  assert.equal(w.t3.threads.get(oldT3)!.archived, true);
+  assert.equal(w.threads.records().length, 0);
+
+  // Restart, READY, unarchive, and reopen with a fresh message
+  w.restart();
+  await w.dispatch("READY", { user: { id: BOT } });
+  await w.dispatch("THREAD_UPDATE", { id: thId, parent_id: PARENT_CH, name: "reopen-clean", type: 11, thread_metadata: { archived: false } });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("fresh reopened question", { channel: thId, guildId: GUILD }));
+  await w.steps(3);
+
+  const newT3 = w.t3ThreadOf(thId)!;
+  assert.ok(newT3 && newT3 !== oldT3);
+  const newSends = w.t3.sends().filter((s) => s.threadId === newT3);
+  assert.equal(newSends.length, 1);
+  assert.match(newSends[0].message!, /fresh reopened question/);
+  assert.doesNotMatch(newSends[0].message!, /stale buffered input/);
+
+  w.finish(newT3, "fresh reopened answer");
+  await w.steps(2);
+
+  // Confirm no stale edit, posting outbox row, notice, or old reply ever went out
+  assert.equal(w.discord.writes.filter((x) => x.kind === "edit" && x.channelId === thId).length, 0, "stale edit was purged");
+  const contents = w.discord.botPosts(thId).map((m) => m.content);
+  assert.deepEqual(contents, ["first post", "fresh reopened answer"]);
+});
+
+test("THREADS: closing a thread with enabled and paused standing jobs holds archive, warns in parent + /status without leaking private name, hands off to parent, then archives after verification", async () => {
+  const notesRoot = tempDir("thread-jobs-notes-");
+  const w = world({ notesRoot });
+  const thId = "200000000000000071";
+  w.openThread(thId, { name: "secret-job-thread", type: 12 });
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("schedule work", { channel: thId, guildId: GUILD }));
+  await w.steps(3);
+  const thT3 = w.t3ThreadOf(thId)!;
+  w.finish(thT3, "jobs created");
+  await w.steps(2);
+
+  // Bind both an enabled job and a paused job to the private thread's t3 session
+  w.t3.standingJobs.push(
+    { scheduledTaskId: "job-active", boundThreadId: thT3, enabled: true },
+    { scheduledTaskId: "job-paused", boundThreadId: thT3, enabled: false },
+  );
+
+  // Fail closed if listStandingJobs fails on close
+  const origList = w.t3.listStandingJobs;
+  w.t3.listStandingJobs = async () => { throw new Error("t3 unavailable"); };
+  await w.dispatch("THREAD_UPDATE", { id: thId, parent_id: PARENT_CH, name: "secret-job-thread", type: 12, thread_metadata: { archived: true } });
+  await w.steps(2);
+  assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "fails closed when listStandingJobs errors");
+  w.t3.listStandingJobs = origList;
+
+  // Step again: discovers both jobs, holds archive, posts parent notice, hands off to parent session, surfaces in parent /status
+  await w.steps(3);
+  assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "holds archive while enabled + paused jobs remain bound");
+  const parentT3 = w.t3ThreadOf(PARENT_CH)!;
+  assert.ok(parentT3, "parent session launched to receive job handoff");
+
+  // Parent channel received one notice without leaking private thread name or job IDs
+  const notices = w.discord.botPosts(PARENT_CH).filter((m) => m.content.includes("standing scheduled job"));
+  assert.equal(notices.length, 1);
+  assert.match(notices[0].content, /a private thread closed with 2 standing scheduled jobs \(1 active, 1 paused\)/);
+  assert.doesNotMatch(notices[0].content, /secret-job-thread|job-active|job-paused/);
+
+  // Parent /status surfaces the pending jobs even though the Discord thread is already archived, without leaking private name
+  await w.runCmd("status", PARENT_CH);
+  const statusReply = w.ixCalls.at(-1)!;
+  assert.match(statusReply, /Active threads \(1\): 1 private \(2 standing jobs awaiting move\)/);
+  assert.doesNotMatch(statusReply, /secret-job-thread|job-active|job-paused/);
+
+  // Parent t3 session received the #58 handoff prompt listing both job IDs
+  const handoffSend = w.t3.sends().find((s) => s.threadId === parentT3 && s.clientRequestId?.includes("schedule-handoff"));
+  assert.ok(handoffSend, "handoff prompt sent to parent session");
+  assert.match(handoffSend.message!, /job-active/);
+  assert.match(handoffSend.message!, /job-paused/);
+
+  // Moving both jobs to parent but flipping the paused job's enabled state must still hold archive
+  w.t3.standingJobs[0].boundThreadId = parentT3;
+  w.t3.standingJobs[1].boundThreadId = parentT3;
+  w.t3.standingJobs[1].enabled = true; // wrong: paused job was enabled
+  await w.steps(2);
+  assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "holds archive when paused state was not preserved");
+
+  // Restore paused state -> verification passes -> thread archives & exports cleanly
+  w.t3.standingJobs[1].enabled = false;
+  w.finish(parentT3, "NO_REPLY");
+  await w.steps(4);
+  await new Promise((r) => setTimeout(r, 30));
+  await w.steps(2);
+  assert.equal(w.t3.threads.get(thT3)!.archived, true, "archives once jobs are verified moved with enabled state preserved");
+  assert.equal(w.threads.records().length, 0);
+  // Parent handoff completion (NO_REPLY + bridge clientRequestId) was not relayed as a stray post
+  assert.equal(w.discord.botPosts(PARENT_CH).length, 1, "only the single standing-job notice was posted in parent");
 });
 
 test("THREADS: existing per-conversation allowlist policy covers launch, archive and export without any wider grant", async () => {

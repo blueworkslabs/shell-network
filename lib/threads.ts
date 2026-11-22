@@ -7,12 +7,13 @@
 import { errText } from "./log.ts";
 import type { Buffer } from "./buffer.ts";
 import type { CommandBot } from "./commands.ts";
-import type { AcceptResult, StepResult, ThreadContext } from "./bot.ts";
+import type { AcceptResult, ActiveThreadSummary, StepResult, ThreadContext } from "./bot.ts";
 import type { DiscordChannel, DiscordMessage, DiscordPort, Log } from "./types.ts";
 
 export const MAX_ACTIVE_THREADS = 10;
 // Discord channel types for guild threads: 10 = announcement thread, 11 = public thread, 12 = private thread
 export const THREAD_TYPES = new Set([10, 11, 12]);
+export const PRIVATE_THREAD_TYPE = 12;
 const SNOWFLAKE = /^\d{1,25}$/;
 
 export interface ThreadRecord {
@@ -20,6 +21,7 @@ export interface ThreadRecord {
   parentId: string;
   parentName: string;
   name: string;
+  type: number;
   state: "active" | "closing";
   starter?: { author: string; content: string } | null;
   createdAt: number;
@@ -34,7 +36,7 @@ export interface ThreadBot extends CommandBot {
   reopen(): void;
   isClosed(): boolean;
 }
-interface ThreadMeta { parentId: string; name: string; archived: boolean }
+interface ThreadMeta { parentId: string; name: string; type: number; archived: boolean }
 
 export function makeThreadManager({
   botKey, botName, botUserId: initialBotUserId, parentChannels, allowedAuthors, allowedBots = [],
@@ -59,6 +61,7 @@ export function makeThreadManager({
   const crew = new Map(allowedBots.map((b) => [b.id, b]));
   let botUserId: string | null = initialBotUserId;
   const bots = new Map<string, ThreadBot>();
+  const pendingRestore = new Set<string>();
   const metaCache = new Map<string, ThreadMeta | null>();
   const resolving = new Map<string, Promise<ThreadMeta | null>>();
   const activating = new Map<string, Promise<void>>();
@@ -73,13 +76,13 @@ export function makeThreadManager({
   const recordOf = (threadId: string): ThreadRecord | undefined => loadRecords().find((r) => r.threadId === threadId);
   const activeCount = () => loadRecords().filter((r) => r.state === "active").length;
 
-  const isChildThread = (ch: DiscordChannel | null | undefined): ch is DiscordChannel & { id: string; parent_id: string } =>
+  const isChildThread = (ch: DiscordChannel | null | undefined): ch is DiscordChannel & { id: string; parent_id: string; type: number } =>
     Boolean(ch && typeof ch.id === "string" && SNOWFLAKE.test(ch.id) && typeof ch.parent_id === "string" && parentChannels.has(ch.parent_id)
       && typeof ch.type === "number" && THREAD_TYPES.has(ch.type));
 
   const cacheChannel = (ch: DiscordChannel | null | undefined): ThreadMeta | null => {
     if (!isChildThread(ch)) return null;
-    const meta: ThreadMeta = { parentId: ch.parent_id, name: (ch.name ?? "").trim() || ch.id, archived: Boolean(ch.thread_metadata?.archived) };
+    const meta: ThreadMeta = { parentId: ch.parent_id, name: (ch.name ?? "").trim() || ch.id, type: ch.type, archived: Boolean(ch.thread_metadata?.archived) };
     metaCache.set(ch.id, meta);
     return meta;
   };
@@ -177,32 +180,54 @@ export function makeThreadManager({
   }
 
   function markClosing(threadId: string, why: string): void {
+    pendingRestore.delete(threadId);
     const records = loadRecords();
     const idx = records.findIndex((r) => r.threadId === threadId);
     if (idx < 0 || records[idx].state === "closing") return;
     records[idx] = { ...records[idx], state: "closing" };
     saveRecords(records);
-    bots.get(threadId)?.requestClose();
+    const bot = bots.get(threadId) ?? instantiate(records[idx]);
+    bot.requestClose();
     log.emit("bridge.thread_closing", { bot: botName, threadId, why });
     nudge();
   }
 
-  async function checkClosedThreads(): Promise<void> {
+  // Revalidate every restored active thread (and check already-active threads on reconnect): verify Discord thread
+  // type, configured parent, and bot access (403/404 or archived closes the conversation).
+  async function checkThreads(): Promise<void> {
     for (const r of loadRecords()) {
       if (r.state !== "active") continue;
+      if (!parentChannels.has(r.parentId)) { markClosing(r.threadId, "parent-removed"); continue; }
       try {
         const ch = await discord.getChannel(r.threadId);
-        cacheChannel(ch);
-        if (ch.thread_metadata?.archived) markClosing(r.threadId, "archived-offline");
+        const meta = cacheChannel(ch);
+        if (!meta || meta.parentId !== r.parentId) { markClosing(r.threadId, "invalid-thread"); continue; }
+        if (meta.archived) { markClosing(r.threadId, "archived-offline"); continue; }
+        const updated = meta.name !== r.name || meta.type !== r.type;
+        if (updated) {
+          const all = loadRecords();
+          const idx = all.findIndex((x) => x.threadId === r.threadId);
+          if (idx >= 0) { all[idx] = { ...all[idx], name: meta.name, type: meta.type }; saveRecords(all); }
+        }
+        if (pendingRestore.delete(r.threadId) && !bots.has(r.threadId)) {
+          const cur = recordOf(r.threadId) ?? r;
+          const bot = instantiate(cur);
+          bot.initWatermark(cur.createdAt);
+          nudge();
+        }
       } catch (e) {
         const status = (e as { status?: number } | null)?.status;
-        if (status === 404) markClosing(r.threadId, "deleted-offline");
+        if (status === 403) markClosing(r.threadId, "access-denied");
+        else if (status === 404) markClosing(r.threadId, "deleted-offline");
+        else log.emit("bridge.thread_check_error", { bot: botName, threadId: r.threadId, error: errText(e) });
       }
     }
   }
 
   async function handleMessage(msg: DiscordMessage): Promise<void> {
     const threadId = msg.channel_id;
+    // Restored thread still awaiting access/type/parent revalidation: fail closed until checkThreads() enables it.
+    if (pendingRestore.has(threadId)) return;
     const existing = bots.get(threadId);
     if (existing) {
       const r = await existing.accept(msg);
@@ -218,6 +243,7 @@ export function makeThreadManager({
 
     const prev = activating.get(threadId) ?? Promise.resolve();
     const next = prev.then(async () => {
+      if (pendingRestore.has(threadId)) return;
       const nowExisting = bots.get(threadId);
       if (nowExisting) {
         const r = await nowExisting.accept(msg);
@@ -230,17 +256,17 @@ export function makeThreadManager({
       // Re-check cap synchronously after the starter await so concurrent threads cannot exceed maxThreads.
       if (activeCount() >= maxThreads) { await sendCapNotice(threadId); return; }
       const record: ThreadRecord = {
-        threadId, parentId: meta.parentId, parentName: parent.name, name: meta.name,
+        threadId, parentId: meta.parentId, parentName: parent.name, name: meta.name, type: meta.type,
         state: "active", starter, createdAt: now(),
       };
       const records = loadRecords();
       if (!records.some((r) => r.threadId === threadId)) saveRecords([...records, record]);
       const bot = instantiate(record);
-      // Clear any closing markers if this Discord thread was previously archived and later unarchived.
+      // Clear any closing markers and stale state if this Discord thread was previously archived and later unarchived.
       bot.reopen();
       // Start watermark right before the activating message so catch-up starts here without missing it.
       bot.initWatermarkAt(String(BigInt(msg.id) - 1n));
-      log.emit("bridge.thread_started", { bot: botName, threadId, parentId: meta.parentId, name: meta.name, hasStarter: Boolean(starter) });
+      log.emit("bridge.thread_started", { bot: botName, threadId, parentId: meta.parentId, name: meta.name, type: meta.type, hasStarter: Boolean(starter) });
       const r = await bot.accept(msg);
       if (r.accepted || r.wake) nudge();
     }).catch((e) => log.emit("bridge.thread_accept_error", { bot: botName, threadId, error: errText(e) }));
@@ -250,11 +276,27 @@ export function makeThreadManager({
   }
 
   function restore(): void {
-    for (const r of loadRecords()) {
-      metaCache.set(r.threadId, { parentId: r.parentId, name: r.name, archived: r.state === "closing" });
-      const bot = instantiate(r);
-      bot.initWatermark(r.createdAt);
+    const records = loadRecords();
+    let changed = false;
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i];
+      if (r.state === "closing") {
+        instantiate(r);
+        continue;
+      }
+      // If the parent channel is no longer configured or the saved type is not a valid Discord thread type, close immediately.
+      if (!parentChannels.has(r.parentId) || typeof r.type !== "number" || !THREAD_TYPES.has(r.type)) {
+        records[i] = { ...r, state: "closing" };
+        changed = true;
+        const bot = instantiate(records[i]);
+        bot.requestClose();
+        log.emit("bridge.thread_closing", { bot: botName, threadId: r.threadId, why: !parentChannels.has(r.parentId) ? "parent-removed" : "invalid-type" });
+        continue;
+      }
+      // Keep active restored threads disabled until checkThreads() revalidates Discord type, parent, and bot access.
+      pendingRestore.add(r.threadId);
     }
+    if (changed) saveRecords(records);
   }
 
   function onDispatch(type: string, d: any): Promise<void> | undefined {
@@ -265,11 +307,11 @@ export function makeThreadManager({
         for (const b of bots.values()) b.setBotUserId(id);
       }
       nudge();
-      return checkClosedThreads().catch((e) => log.emit("bridge.thread_check_error", { bot: botName, error: errText(e) }));
+      return checkThreads().catch((e) => log.emit("bridge.thread_check_error", { bot: botName, error: errText(e) }));
     }
     if (type === "RESUMED") {
       nudge();
-      return checkClosedThreads().catch((e) => log.emit("bridge.thread_check_error", { bot: botName, error: errText(e) }));
+      return checkThreads().catch((e) => log.emit("bridge.thread_check_error", { bot: botName, error: errText(e) }));
     }
     if (type === "THREAD_CREATE" || type === "THREAD_UPDATE") {
       const meta = cacheChannel(d as DiscordChannel);
@@ -278,7 +320,10 @@ export function makeThreadManager({
       else {
         const records = loadRecords();
         const idx = records.findIndex((r) => r.threadId === d.id);
-        if (idx >= 0 && records[idx].name !== meta.name) { records[idx] = { ...records[idx], name: meta.name }; saveRecords(records); }
+        if (idx >= 0 && (records[idx].name !== meta.name || records[idx].type !== meta.type)) {
+          records[idx] = { ...records[idx], name: meta.name, type: meta.type };
+          saveRecords(records);
+        }
       }
       return undefined;
     }
@@ -304,6 +349,7 @@ export function makeThreadManager({
     const records = loadRecords();
     const completed: string[] = [];
     for (const r of records) {
+      if (pendingRestore.has(r.threadId)) continue;
       const bot = bots.get(r.threadId);
       if (!bot) continue;
       try {
@@ -325,25 +371,31 @@ export function makeThreadManager({
 
   return {
     restore,
+    checkThreads,
     onDispatch,
     step,
     botFor: (channelId: string): CommandBot | undefined => {
+      if (pendingRestore.has(channelId)) return undefined;
       const r = recordOf(channelId);
       return r?.state === "active" ? bots.get(channelId) : undefined;
     },
-    // Only admitted thread conversations (and a verified child thread receiving its single cap notice) are writable.
-    isAllowedThread: (channelId: string): boolean => bots.has(channelId) || capNoticeTarget === channelId,
-    activeThreadsFor: (parentId: string): { name: string; state: "active" | "closing" }[] =>
-      loadRecords().filter((r) => r.parentId === parentId).map((r) => ({ name: r.name, state: r.state })),
+    // Only admitted (and revalidated) active thread conversations (plus the single cap-notice send) are writable.
+    isAllowedThread: (channelId: string): boolean => (!pendingRestore.has(channelId) && bots.has(channelId) && recordOf(channelId)?.state === "active") || capNoticeTarget === channelId,
+    activeThreadsFor: (parentId: string): ActiveThreadSummary[] =>
+      loadRecords().filter((r) => r.parentId === parentId).map((r) => {
+        const jobs = (() => { try { return (JSON.parse(buffer.kvGet(`${botKey}.${r.threadId}:closeJobs`) ?? "null") as { count?: number } | null)?.count ?? 0; } catch { return 0; } })();
+        return { name: r.name, state: r.state, isPrivate: r.type === PRIVATE_THREAD_TYPE, ...(jobs > 0 ? { pendingJobs: jobs } : {}) };
+      }),
     activeT3ThreadIds: (): Set<string> => {
       const ids = new Set<string>();
       for (const r of loadRecords()) {
+        if (pendingRestore.has(r.threadId)) continue;
         const tid = buffer.kvGet(`${botKey}.${r.threadId}:threadId`);
         if (tid) ids.add(tid);
       }
       return ids;
     },
-    threadContextFor: (r: ThreadRecord): ThreadContext => ({ parentId: r.parentId, parentName: r.parentName, threadName: r.name, starter: r.starter ?? null }),
+    threadContextFor: (r: ThreadRecord): ThreadContext => ({ parentId: r.parentId, parentName: r.parentName, threadName: r.name, isPrivate: r.type === PRIVATE_THREAD_TYPE, starter: r.starter ?? null }),
     records: loadRecords,
     bots,
   };

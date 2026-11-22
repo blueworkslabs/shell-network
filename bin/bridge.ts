@@ -170,19 +170,23 @@ const stepTarget = { step: async () => (threads ? threads.step() : { phase: "idl
 const loop = stepLoop({ step: stepAll([...bots, stepTarget], log, [...conversations, "threads"]), tickMs, log });
 const nudge = loop.nudge;
 
+const channelBots = new Map(bots.map((b, i) => [conversations[i], b] as const).filter(([ch]) => !dmChannels.has(ch)));
+
 // Dynamic Discord thread conversations under this bot's configured guild channels (#77).
 threads = makeThreadManager({
   botKey: cfg.key, botName: cfg.name, botUserId: cfg.id, parentChannels, allowedAuthors, allowedBots: crew.allowedBots,
   buffer, discord, nudge, log,
   createBot: (record, botRoleId) => {
     const conversationKey = conversationKeyFor(cfg.key, record.threadId);
+    const parentBot = channelBots.get(record.parentId);
     const shortName = record.name.length > 40 ? `${record.name.slice(0, 40)}…` : record.name;
     return makeBot({
       name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
       threadLabel: `${cfg.name} #${record.parentName} / ${shortName}`,
       botUserId: cfg.id, botRoleId, projectId, modelSelection,
       allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, inboxDir, dm: false, notesRoot,
-      threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, starter: record.starter ?? null },
+      threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
+      ...(parentBot ? { parentSession: { conversationKey: conversationKeyFor(cfg.key, record.parentId), sendHandoff: parentBot.sendHandoff } } : {}),
       buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
     });
   },
@@ -191,7 +195,6 @@ threads.restore();
 
 // Slash commands (`/new`, `/status`, `/stop`): answered per interaction, by the bot of the interaction's channel or active thread (lib/commands.ts).
 // guild channels and their active threads only: the slash commands are guild-only, and a DM conversation is never a command target
-const channelBots = new Map(bots.map((b, i) => [conversations[i], b] as const).filter(([ch]) => !dmChannels.has(ch)));
 const interact = interactionDispatch({ port: discord.interactions, bots: { get: (ch) => channelBots.get(ch) ?? threads?.botFor(ch) }, allowedAuthors, nudge, log });
 const dmIgnored = dmIgnoredDispatch({ known: new Set(conversations), log });
 // Catch-up runs inside the step loop (single flight); every new live session (READY/RESUMED) closes the dispatch

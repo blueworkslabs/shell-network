@@ -53,10 +53,13 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
 - **Direct messages.** Only DMs of `BRIDGE_DM_USERS`, a subset of the people allowlist, are read, each in its own
   conversation; other people's DMs are dropped and logged without their text. A DM belongs to the same agent as its
   channels (shared tool, notes and memory), by design; see ARCHITECTURE.md.
-- **Discord threads.** Only threads whose `parent_id` is one of `BRIDGE_CHANNEL_IDS` are admitted, lazily on the first
-  mention from an allowlisted person or allowed crew bot, up to 10 active threads per bot. Starter-message lookup
-  (`getMessage`) is restricted to configured parent channels and skips messages from unlisted authors. Each thread
-  conversation uses the exact same per-conversation MCP allowlist policy (no wider grant).
+- **Discord threads.** Only threads whose `parent_id` is one of `BRIDGE_CHANNEL_IDS` and whose Discord type is a guild
+  thread (`10`/`11`/`12`) are admitted, lazily on the first mention from an allowlisted person or allowed crew bot, up
+  to 10 active threads per bot. Restored threads stay disabled after a restart until type, parent allowlist and bot
+  access are revalidated (closing on `403`/`404` or removed parent). Parent `/status` and notices never expose private
+  thread names. Starter-message lookup (`getMessage`) is restricted to configured parent channels and skips messages
+  from unlisted authors. Each thread conversation uses the exact same per-conversation MCP allowlist policy (no wider
+  grant).
 - **Files.** An agent can attach only files inside its workspace (`DISCORD_TOOL_WORKSPACE`; the path is resolved
   through symlinks and the target opened without following one). The Discord tool copies them into a staging directory
   and has no credential; the bridge validates the staged copies again before uploading them, so a tampered outbox

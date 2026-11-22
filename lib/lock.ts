@@ -55,7 +55,7 @@ export function acquireBotLock(stateDir: string, key: string): BotLock & { _db: 
   // O_NOFOLLOW) must end up on that same inode (checked after the lock is held). The descriptor is closed before
   // SQLite takes the lock: an fcntl lock is dropped whenever the process closes any descriptor on the file. (Node
   // opens every file O_CLOEXEC.)
-  // Residual (accepted trust boundary, see README): a swap between this check and SQLite's own open needs write
+  // Residual (accepted trust boundary, see SECURITY.md): a swap between this check and SQLite's own open needs write
   // access to the state directory, i.e. the bridge's uid or root.
   let opened: Stats;
   try {

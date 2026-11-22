@@ -1,200 +1,53 @@
 # shell-network
 
-A Discord bridge for [t3](https://github.com/pingdotgg/t3code) agent threads. Each bot in a Discord channel is one
-t3 thread (Claude or Codex provider). The bridge brings mentions from allowlisted people and allowed bots into the
-thread's queue and posts the agent's replies back. It is built to survive crashes, restarts and t3's own failure modes
-without losing a message or posting one twice.
+Persistent AI agents on Discord, built on [t3](https://github.com/pingdotgg/t3code). Each agent has its own persona,
+long-term memory and searchable conversation history, runs on Claude or Codex, and talks in your Discord channels like a
+crewmate. A thin bridge keeps the conversation reliable: no lost messages, no double posts, through crashes, restarts and
+t3's own failure modes.
 
-Status: experimental. The adapter targets t3 0.1.11, with two bots on a single VM, each in one or more channels. See
-[SECURITY.md](SECURITY.md) for the trust model and the known limits.
+Status: experimental, in daily use by a small crew on one VM (t3 0.1.11). See [SECURITY.md](SECURITY.md) for the trust
+model and the known limits.
 
-Trial scope: a rare duplicate message is acceptable. Keep changes limited to observed failures during real use;
-see [CONTRIBUTING.md](CONTRIBUTING.md). The public repository is the deployment source.
+## What you get
 
-Upgrading from t3 0.1.0 requires this adapter's `t3_queue` list action and explicit oldest-first activity pagination.
-Stop the bridges and t3, back up their data/configuration, then upgrade t3 and the bridge together. Renew expired
-MCP and WebSocket grants without changing their scopes. Keep the old runtime and cold data backup together for rollback:
-an older t3 binary must not be pointed at a database migrated by a newer release.
+- **Persistent personas.** An agent's personality, role, preferences and crew rules live in plain files in its
+  workspace and load on every turn. Its identity survives restarts, model changes and fresh sessions.
+- **Long-term memory.** Agents keep daily notes and curated memory. `memory_search` finds them by meaning and by exact
+  text (hybrid full-text and embedding search), including old conversations. History from another agent platform can
+  be imported.
+- **Conversation history.** `/new` starts a fresh session and archives the old one into the agent's searchable history
+  automatically.
+- **Discord-native.** One conversation per channel, DMs from allowed people, slash commands (`/new`, `/status`), file
+  attachments both ways, and a Discord tool the agent can use to post, react, open threads and read.
+- **Crews.** Several agents in one channel can hand work to each other by mention, with a cap that pauses bot-to-bot
+  loops until a person speaks.
+- **Durable by design.** Every mention is committed before it is acknowledged, every reply goes through one ordered
+  outbox, and every delivery is reconciled against what t3 reports. A watchdog resumes held queues.
+- **Scheduled work.** Agents can schedule their own tasks in t3; results reach the channel through the bridge.
 
-## What it does
+## How it works
 
-- **Durable input.** A mention counts as accepted only once it is committed to a SQLite buffer. Only then is it
-  acknowledged with a reaction. While a turn runs, new input waits and is then coalesced into one queued message.
-  Steering is never used.
-- **Reconcile, don't assume.** Every batch is checked against what t3 reports (MCP thread read, WS projection, queue
-  list). A batch counts as delivered only when its exact payload is the complete user message of its own completed
-  run. A send whose response was lost is adopted, not repeated.
-- **One serialized outbox per bot.** Replies, relayed completions, stuck alerts, watchdog notices and the agent's own
-  tool posts go out strictly in order. Each post is preceded by a durable marker and a channel boundary. After a crash,
-  the head is looked up in the channel before anything else is posted.
-- **`/new` and `/status`.** Each bot registers them as native Discord slash commands (pick the bot by picking the
-  entry). `/new` makes the bot write its daily note, archive its t3 thread in that channel and start a fresh one; the
-  old thread stays readable in t3. `/status` shows what the bot is doing. `@Bot /new` as text still works. See
-  ARCHITECTURE.md.
-- **Bot-to-bot with a cap.** Bots may hand work to each other by mention. After `BRIDGE_EXCHANGE_CAP` exchanges
-  between bridge-run bots, the bridge posts one pause notice. A message from a person or talk-only member resets the cap.
-- **Completion relay.** Runs that no batch started (background wakes, scheduled tasks) also reach the channel.
-- **Watchdog.** A separate process holds t3's `operate` grant. It resumes held queues (see [LESSONS.md](LESSONS.md)).
-- **Discord tool for the agent.** `bin/discord-tool.ts` is a stdio MCP server the provider spawns. It offers
-  `discord_send`, `discord_react`, `discord_thread` and `discord_read`. It holds no token: it writes into the bridge's
-  outbox through a confined DB connection, and the bridge does the posting. `discord_send` can attach files from the agent's workspace (`DISCORD_TOOL_WORKSPACE`); files attached to a
-  message reach the agent as a line with name, type, size and URL.
+Each agent is a t3 thread per Discord channel (Claude or Codex provider). One bridge process per bot reads mentions
+from allowlisted people and crew bots, queues them into the agent's thread and posts the replies back. The agent's
+Discord tool holds no token: it writes into the bridge's outbox, and the bridge posts. Details:
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-The design is described in [ARCHITECTURE.md](ARCHITECTURE.md).
+## Documentation
 
-## Requirements
+- [SETUP.md](SETUP.md): requirements, configuration, entrypoints and settings.
+- [MEMORY.md](MEMORY.md): personas, notes, memory search, importing history.
+- [ARCHITECTURE.md](ARCHITECTURE.md): how the bridge works.
+- [OPERATIONS.md](OPERATIONS.md): install, health checks, rollback.
+- [SECURITY.md](SECURITY.md): trust model and known limits.
+- [CONTRIBUTING.md](CONTRIBUTING.md): how changes are made and reviewed. [LESSONS.md](LESSONS.md): what t3 taught us.
 
-- Node.js 24 or newer. The sources are TypeScript and run directly through Node's type stripping, with no build step.
-- A t3 server with MCP enabled, plus:
-  - an MCP token for the bridge;
-  - a read-only WS session;
-  - an `operate` WS session for the watchdog.
-- One Discord bot application per agent, with the Message Content intent enabled. The bridge also asks for the Direct Messages
-  intent (not privileged, nothing to enable); it reads DMs only from `BRIDGE_DM_USERS`, see ARCHITECTURE.md.
-
-## Install
+## Quick start
 
 ```sh
-npm ci --omit=dev        # runtime: @discordjs/core, rest, ws and their dependencies
+npm ci --omit=dev        # Node.js 24+, no build step
 ```
 
-## Run
-
-There is one bridge process per bot, serving all of the bot's channels. All bots share one buffer DB, and one watchdog serves all of them. Settings come
-from the environment. Secrets are always given as file paths and never as values. Each secret file must belong to the
-bridge user, have no group/other permission bits, and sit in a directory with the same properties.
-
-```sh
-BRIDGE_BOT=gem \
-BRIDGE_CREW_FILE=/path/to/private/crew.json \
-BRIDGE_CHANNEL_IDS=<channel id>,<another channel id> \
-BRIDGE_ALLOWED_AUTHORS=<your Discord user id> \
-BRIDGE_DISCORD_TOKEN=/path/to/secrets/gem-discord-token \
-BRIDGE_PROJECT_ID=<t3 project id> \
-BRIDGE_DB=/path/to/state/bridge.sqlite \
-BRIDGE_LOG=/path/to/state/gem.jsonl \
-T1_MCP_URL=http://127.0.0.1:3773/mcp \
-T1_TOKEN=/path/to/secrets/mcp-token.json \
-T1_PUSH_TOKEN=/path/to/secrets/ws-session.json \
-node bin/bridge.ts
-```
-
-Copy `crew.example.json` to a private location outside the repository and set `BRIDGE_CREW_FILE` to its path
-for every bridge process. The JSON array lists each member's unique lowercase `key`, display `name`, and Discord
-user `id` (a string). Members run by this bridge also need `instanceId` and `model`; omit both for talk-only
-members. Set `BRIDGE_BOT` to this process's member key. Its identity and model come from the file; all other
-members are allowed crew, including talk-only members. Talk-only messages reset the exchange cap like allowlisted
-human messages; a bare mention from them resumes a bot. Only exchanges between bridge-run members consume the cap.
-Their unread messages follow the same rules as other crew bots. The people allowlist remains `BRIDGE_ALLOWED_AUTHORS`.
-
-The file is read once at startup. Invalid members, duplicate keys or ids, a missing or talk-only own bot, and an
-own id that differs from the Discord token are refused. Restart the bridge after changing the file. Keep real crew
-files outside the repository; `crew.json` and `crew.*.json` are ignored except for the example. Remove the old
-`BRIDGE_ALLOWED_BOTS`, `BRIDGE_BOT_NAME`, `BRIDGE_INSTANCE_ID` and `BRIDGE_MODEL` settings when migrating.
-
-Each channel in `BRIDGE_CHANNEL_IDS` is its own conversation (key `<bot>.<channel id>`): one t3 thread, one unread
-header, one input queue and one exchange cap per channel; nothing said in one channel reaches the bot's context in
-another. The bot's workspace (its t3 project) is shared across its channels. The Discord tool takes the channel on every
-call and accepts only the bot's channels (and threads its tool created there). A bridge started with a different set
-of channels needs a fresh buffer DB; there is no migration from the single-channel schema.
-
-At startup the bridge discovers its own managed Discord role by reading the channel's guild and finding the role
-whose `tags.bot_id` matches its own user id. Mentions of that role in `mention_roles` count as mentions of the bot;
-no crew-file setting is needed. Sender allowlists, the exchange cap and bare-mention rules still apply. If discovery
-fails, one `bridge.role_lookup_failed` event is logged and the bridge continues with direct mentions only. Discovery
-runs once per process start; arbitrary shared roles are not included.
-
-Optional settings:
-
-- `BRIDGE_EXCHANGE_CAP`: the bot-to-bot cap (default 2; 0 turns bot-to-bot off).
-- `BRIDGE_TICK_MS`: the step interval.
-
-The full list of settings is in the header of each entrypoint:
-
-- `bin/bridge.ts`: one bot. A second bridge for the same bot exits with status 4, "lease held".
-- `bin/watchdog.ts`: settings `WATCHDOG_DB`, `WATCHDOG_LOG` and `WATCHDOG_OPERATE_TOKEN`.
-- `bin/discord-tool.ts`: configured in the t3 provider instance with `DISCORD_TOOL_BOT` and `DISCORD_TOOL_DB`. It
-  refuses to start if any of the bridge's secret variables are in its environment. Optionally set `DISCORD_TOOL_NOTES`
-  to an absolute directory containing only that bot's notes to enable the read-only `memory_search` tool.
-
-The `T1_` prefix on the t3 connection variables is historical.
-
-## Searching saved notes
-
-`memory_search({"query":"old project decision","max_results":10})` searches the notes directory configured by
-`DISCORD_TOOL_NOTES`. Queries are case-insensitive literal text, with up to 20 matching lines returned as relative
-file names, 1-based line numbers and excerpts. Entries are visited in descending filename order, so date-named daily
-notes prioritize recent entries when results are limited. The tool reads current files on each call: new and edited notes need no
-index rebuild. Only non-hidden `.md` and `.txt` files are included; symlinks, hardlinks and binary files are skipped.
-It never searches another bot's notes or archived channel history.
-
-Search is bounded to 1,000 note files, 5,000 directory entries, eight directory levels, 256 KiB per file and 8 MiB per
-call. Excerpts are at most 402 characters including truncation marks. `incomplete: true` means a result limit, skipped
-unreadable/oversized file or search budget prevented a complete search; narrow the query or inspect the notes directly.
-An empty result with `incomplete: true` does not establish that the fact is absent.
-
-Installation: the external operator sets `DISCORD_TOOL_NOTES=/path/to/bot/notes` in each bot's existing MCP launch
-environment and reloads that tool process. Select only the bot's own notes directory, not a shared parent. Bridge
-restarts, database migrations and credentials are not needed. Without this optional setting the existing tool list is
-unchanged. An invalid notes directory prevents the MCP tool from starting; validate this setting during activation.
-Roll back by removing the setting and reloading the tool, or by restoring the previous release.
-
-Live check: after a fresh session, ask about a fact kept only in an old note. Verify that the bot calls `memory_search`
-and answers with the matching file and line. Automated tests cover that search through a fresh stdio tool process;
-they do not substitute for the provider's live tool configuration and recall check.
-
-### Hybrid search (full text plus meaning)
-
-With `DISCORD_TOOL_MEMORY_INDEX` (a SQLite path outside the notes) `memory_search` uses an index instead of the file walk
-(`lib/memindex.ts`): Markdown chunks of about 300 words cut at headings, FTS5 full text, and embeddings from an
-OpenAI-compatible endpoint (`DISCORD_TOOL_EMBED_URL`, `DISCORD_TOOL_EMBED_MODEL`, `DISCORD_TOOL_EMBED_KEY` as a key file,
-optional `DISCORD_TOOL_EMBED_DIMENSIONS`; a change of model or dimensions re-embeds everything (so does another endpoint); the similarity floor is
-`DISCORD_TOOL_EMBED_MIN_SIMILARITY`, default 0.3), merged by reciprocal rank fusion. The endpoint receives the text of notes and transcripts (in chunks) and every
-query. Each match says how it matched (`text`,
-`semantic` or `both`; for a query of one token, such as a commit hash, id or path, text hits come first) and whether it is a `note` or a `session` (a transcript under `sessions/`, where short turns
-share a chunk); `semantic: false` with a `reason` means text only (no endpoint, or it failed). A note is found by
-text right after it is written; embeddings follow in the background (at tool start and every
-`DISCORD_TOOL_INDEX_EVERY_MS`, default 10 minutes; `unembedded` counts what is still waiting). Only new or changed
-text is embedded. For the first big import run `node bin/index-memory.ts` with the same settings once. Rollback: unset
-`DISCORD_TOOL_MEMORY_INDEX` (the plain walk comes back) and delete the index file if wanted; the notes are never written.
-
-## Importing conversation history
-
-Run the importer on the same machine as a private, consistent copy of the source database and any legacy transcript
-directories. Keep the inputs and output outside the repository. Choose a private output directory under the agent's
-notes root so `memory_search` can find the resulting `sessions/` archive.
-
-```sh
-node bin/import-transcripts.ts --database /private/copy.sqlite \
-  --jsonl-dir /private/legacy-copy --output /private/agent-notes
-```
-
-Supply the database, one or more `--jsonl-dir` options, or both. Use a SQLite backup or a consistent snapshot that
-includes committed WAL data. The importer opens the database read-only and never changes the transcripts. It reads
-plain and zstd database events, zstd transcript archives, and supported legacy JSONL variants. It merges duplicates
-by session and event ID. Legacy sidecars and files without a session header are skipped and reported by filename.
-Recognized legacy filenames, copied session stores and cron prompt markers supply missing session keys. Copied database metadata supplies channel labels
-when available. Markdown preserves user and assistant text, timestamps, tool names attached to text, and compaction
-summaries. Tool-only turns, tool arguments, tool results, thinking and heartbeat polls are dropped. Archives still contain
-private conversation text, including anything participants pasted into messages.
-
-The command counts sessions with rendered turns, written and unchanged files, and skipped corrupt JSONL lines. Reuse the same output directory
-with a complete copy of the sources to update changed sessions. Existing filenames are retained for stable references,
-and files for sessions missing from later input stay in place. Keep the generated archive as importer-owned output.
-Use a fresh output directory to compare counts after changing filters. Corrupt JSONL lines after a valid header, or within a database JSONL archive, are counted and skipped. Invalid standalone database events or session stores fail the import before any output is written. Decompressed zstd records and archives are
-limited to 128 MiB each. For the migration check, compare the count against the unique source session count and
-spot-check five sessions before enabling archive search.
-
-To include archived t3 conversations, supply `--t3-manifest /private/threads.json`. The file is a JSON array of
-objects with `threadId` and `projectId`. Build it from the bridge archive ledger or a verified operator inventory.
-Include only the agent's own archived top-level conversations. The exporter reads pages and text continuations
-using `t3_thread_read`. Set `T1_TOKEN` explicitly to the operator's private t3 MCP token file with read access to
-the manifest threads. `T1_MCP_URL` selects the server and defaults to the local MCP endpoint. The CLI applies a read-only allowlist limited to
-`t3_thread_read` on the current manifest entry.
-It verifies the archived state, project and thread type and keeps local user and assistant messages. Standard error
-reports the number of messages kept for each manifest entry, including zero, without printing IDs or contents.
-Keep the manifest private. Each t3 thread uses a namespaced session ID so reruns keep the same archive file without
-colliding with OpenClaw sessions. A failed t3 read or a thread with zero retained messages stops before any archive files are written.
+Then configure one bridge per bot as described in [SETUP.md](SETUP.md).
 
 ## Tests
 
@@ -204,7 +57,10 @@ npm test                 # tsc -p . (strict), then node --test tests/*.test.ts; 
 ```
 
 All tests are offline and run against fakes of t3 and Discord (`tests/fakes.ts`). Each test removes its own temp
-directories (`tests/tmp.ts`). How changes are made and reviewed: [CONTRIBUTING.md](CONTRIBUTING.md).
+directories (`tests/tmp.ts`).
+
+Trial scope: a rare duplicate message is acceptable. Keep changes limited to observed failures during real use; see
+[CONTRIBUTING.md](CONTRIBUTING.md). The public repository is the deployment source.
 
 ## License
 

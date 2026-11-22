@@ -74,6 +74,8 @@ test("REFUSED REPLY: a dropped reply counts as answered, so it does not block th
   w.finish(t1, "an answer Discord will not take");
   await w.steps(5);
   assert.equal(w.notices().length, 1);
+  assert.deepEqual((w.buffer.db.prepare("SELECT part, parts FROM reply").all() as { part: number; parts: number }[]).map((r) => [r.part, r.parts]), [[0, 1]], "the single part is settled as skipped");
+  assert.equal(w.buffer.kvGet(`${KEY}:outboxRefused:1`), null, "the refusal counter is gone with the drop");
   await w.bot.accept(w.discord.userSays("/new", { mention: false }));
   await w.steps(2);
   w.finish(t1, "NO_REPLY");
@@ -169,6 +171,11 @@ test("REFUSED PART: one part of a long reply is refused; the other parts still g
   await w.steps(8);
   assert.deepEqual(w.posts().filter((c) => !c.startsWith("⚠️")), [part1, part3]);
   assert.equal(w.notices().length, 1);
+  // stored state: only the refused part is settled as skipped; parts 1 and 3 are recorded with their messages
+  const rows = w.buffer.db.prepare("SELECT part, parts, channel_message_id id FROM reply ORDER BY part").all() as { part: number; parts: number; id: string }[];
+  assert.deepEqual(rows.map((r) => [r.part, r.parts, r.id.startsWith("refused:") ? "skipped" : "posted"]), [[0, 3, "posted"], [1, 3, "skipped"], [2, 3, "posted"]]);
+  assert.equal((w.buffer.db.prepare("SELECT count(*) n FROM reply_none").get() as { n: number }).n, 0, "the reply is not marked as having nothing posted");
+  assert.deepEqual(w.buffer.unpostedDelivered(KEY), [], "the reply is complete once all its parts are");
   await w.bot.accept(w.discord.userSays("next"));
   await w.steps(2);
   assert.match(w.t3.sends().at(-1)!.message!, /next/, "the conversation goes on");

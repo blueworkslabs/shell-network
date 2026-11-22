@@ -594,14 +594,20 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       } catch (e) {
         const status = errStatus(e)?.status;
         if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: a post may exist; recovery decides
-        // Discord refused the request: nothing was created. Back to pending; after REFUSE_LIMIT refusals it is dropped.
-        buffer.outboxPending(h.id);
-        buffer.kvDelete(K(`outboxEnd:${h.id}`));
-        const n = Number(buffer.kvGet(K(`outboxRefused:${h.id}`)) ?? 0) + 1;
-        buffer.kvSet(K(`outboxRefused:${h.id}`), String(n));
+        // Discord refused the request: nothing was created. Back to pending with the refusal counted, and after
+        // REFUSE_LIMIT refusals dropped, all in one transaction: a restart can neither lose a refusal nor post again.
+        const n = buffer.atomically(() => {
+          buffer.outboxPending(h.id);
+          buffer.kvDelete(K(`outboxEnd:${h.id}`));
+          const count = Number(buffer.kvGet(K(`outboxRefused:${h.id}`)) ?? 0) + 1;
+          buffer.kvSet(K(`outboxRefused:${h.id}`), String(count));
+          if (count >= REFUSE_LIMIT) dropRefused(h);
+          return count;
+        });
         log.emit("bridge.outbox_refused", { bot: name, key: h.key, status, attempts: n });
         if (n < REFUSE_LIMIT) return false; // the next step tries again; nothing behind it goes out meanwhile
-        dropRefused(h);
+        unstage(h);
+        log.emit("bridge.outbox_dropped", { bot: name, key: h.key });
         continue;
       }
       buffer.outboxPosted(h.id, m.id, () => onPosted(h, m.id));
@@ -614,12 +620,15 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // rejects) is dropped so the queue moves on. What waited for it is closed (a reply counts as answered with nothing
   // posted, a relay as empty), and one notice says so in the channel, without ids or the error. A refused notice or alert
   // gets no notice of its own, so a channel that refuses everything cannot loop.
+  // Runs inside the caller's transaction; the staged copies are removed after it (a file system step).
   function dropRefused(h: OutboxRow): void {
-    const [kind, a] = h.key.split(":");
+    const [kind, a, b] = h.key.split(":");
+    const parts = (JSON.parse(h.meta) as { parts?: number }).parts ?? 1;
     buffer.atomically(() => {
       buffer.outboxDrop(h.id);
-      if (kind === "reply") buffer.markReplyNone(Number(a));
-      else if (kind === "relay") buffer.markRelayEmpty(Number(a));
+      // only this part is settled, as skipped: the reply or relay is done once all its parts are (the others still post)
+      if (kind === "reply") buffer.recordReplyPart(Number(a), Number(b), parts, `refused:${h.id}`);
+      else if (kind === "relay") buffer.recordRelayPart(Number(a), Number(b), parts, `refused:${h.id}`);
       if (!["notice", "alert", "clear", "talert", "tclear", "refused", "ralert", "rclear"].includes(kind)) {
         buffer.enqueue(conversationKey, { key: `refused:${h.id}`, nonce: `f${h.id}`,
           content: `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
@@ -628,8 +637,6 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       // counted for /status too, so a skip stays visible when the channel refuses the notice as well
       buffer.kvSet(K("skippedPosts"), String(Number(buffer.kvGet(K("skippedPosts")) ?? 0) + 1));
     });
-    unstage(h);
-    log.emit("bridge.outbox_dropped", { bot: name, key: h.key });
   }
 
   // The newest message id in the channel, read forward from `from` (or the watermark), resumable in `progressKey`;

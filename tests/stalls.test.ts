@@ -101,6 +101,7 @@ test("REFUSED EVERYTHING: the notice about a dropped post is refused too and is 
   assert.deepEqual(w.posts(), []);
   assert.equal(w.buffer.outboxHead(KEY), undefined, "nothing left to post: no loop");
   assert.deepEqual(w.log.events.filter((e) => e.event === "bridge.outbox_dropped").map((e) => String(e.key).split(":")[0]), ["tool", "refused"]);
+  assert.match(await w.bot.status(), /Skipped posts \(Discord refused them\): 2/, "visible in /status although no notice got through");
 });
 
 test("STUCK /new: an archive that keeps failing shows in /status, raises one stuck alert after the limit, and a follow-up once it works", async () => {
@@ -156,4 +157,19 @@ test("STUCK /new in confirm: a fresh thread that cannot be launched raises the a
   await w.steps(4);
   assert.ok(w.discord.botPosts().some((m) => m.content.startsWith("✅ The stuck /new")));
   assert.ok(w.discord.botPosts().some((m) => m.content.startsWith("🆕")));
+});
+
+test("REFUSED PART: one part of a long reply is refused; the other parts still go out in order", async () => {
+  const w = world();
+  const part1 = "a".repeat(1900), part2 = "b".repeat(1900), part3 = "c".repeat(100);
+  w.discord.refuse = (_ch, p) => (p.content === part2 ? { status: 400, code: 50035 } : null);
+  await w.bot.accept(w.discord.userSays("long answer please"));
+  await w.steps(1);
+  w.finish(w.thread(), part1 + part2 + part3);
+  await w.steps(8);
+  assert.deepEqual(w.posts().filter((c) => !c.startsWith("⚠️")), [part1, part3]);
+  assert.equal(w.notices().length, 1);
+  await w.bot.accept(w.discord.userSays("next"));
+  await w.steps(2);
+  assert.match(w.t3.sends().at(-1)!.message!, /next/, "the conversation goes on");
 });

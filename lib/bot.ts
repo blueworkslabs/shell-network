@@ -188,6 +188,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,
+      ...(Number(buffer.kvGet(K("skippedPosts")) ?? 0) ? [`Skipped posts (Discord refused them): ${buffer.kvGet(K("skippedPosts"))}`] : []),
       ...(notesRoot ? [`Archive export: ${pendingExports().length} pending${exportState.lastError ? `; last error: ${exportState.lastError}` : ""}`] : []),
       `Bot-to-bot messages since the last message from a person or talk-only member: ${exchangeCap > 0 ? `${n} of ${exchangeCap}` : `${n} (no cap)`}`].join("\n");
   }
@@ -624,6 +625,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
           content: `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
       }
       buffer.kvDelete(K(`outboxRefused:${h.id}`));
+      // counted for /status too, so a skip stays visible when the channel refuses the notice as well
+      buffer.kvSet(K("skippedPosts"), String(Number(buffer.kvGet(K("skippedPosts")) ?? 0) + 1));
     });
     unstage(h);
     log.emit("bridge.outbox_dropped", { bot: name, key: h.key });

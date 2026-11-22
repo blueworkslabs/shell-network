@@ -241,7 +241,8 @@ a timing SLA. No bridge code change was required.
 - **Refused posts** (#55): a post Discord answers with 400, 403, 404 or 413 was not created; it goes back to pending
   and is tried again on the next step, and after 3 refusals it is dropped so the queue moves on. What waited for it is
   closed (a reply counts as answered with nothing posted, a relay as empty), and one notice in the channel says a message
-  was skipped, without ids or the error. A refused notice or alert is dropped without another notice. 401 stops the
+  was skipped, without ids or the error; `/status` counts skipped posts. A refused notice or alert is dropped without
+  another notice. 401 stops the
   bridge as before; 5xx, network errors and timeouts keep the recovery path (the post may exist).
 - **Stuck `/new`** (#55): a reset whose archive or confirm stage has not finished after 10 minutes (t3 refuses the
   archive, the fresh thread cannot be launched) raises one stuck alert, and a follow-up as a reply once it went through.

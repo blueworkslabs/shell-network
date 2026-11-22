@@ -91,27 +91,20 @@ export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() =
 // Markdown images of local paths (`![x](/abs/path.png)`, `![x](<...>)` around such a path, `![x](file:...)`, with an
 // optional title) are removed from a final before the checks: Discord cannot show them, and a final that is NO_REPLY
 // plus such an image (an agent pointing at a file it made) counts as NO_REPLY (#79). Images on the web (`https://`)
-// stay, and so does everything in code (fenced blocks, inline code). A final without such an image is returned as it
-// is; with one, only the image goes, plus its line when nothing else was on it (and one of the blank lines around it).
+// stay, and so does anything in code (fenced blocks, inline code of any backtick run) or escaped (`\![...]`). A final
+// without such an image is returned as it is; with one, only the image goes, plus its line when nothing else was on it.
 const LOCAL_PATH = String.raw`(?:[^\s()<>]|\([^\s()]*\))+`; // one level of parentheses, as in chart(1).png
-const LOCAL_IMAGE = new RegExp(String.raw`!\[[^\]\n]*\]\(\s*(?:<(?:\/|file:)[^>\n]*>|(?:\/|file:)${LOCAL_PATH})(?:\s+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?\s*\)`, "gi");
-const CODE = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/;
+const LOCAL_IMAGE = String.raw`!\[[^\]\n]*\]\(\s*(?:<(?:\/|file:)[^>\n]*>|(?:\/|file:)${LOCAL_PATH})(?:\s+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?\s*\)`;
+// left to right: code and escapes are consumed as they are, so an image inside them is never seen
+const SKIP = String.raw`\`{3,}[\s\S]*?(?:\`{3,}|$)|~{3,}[\s\S]*?(?:~{3,}|$)|(\`+)[^\n]*?(?<!\`)\1(?!\`)|\\.`;
+const SCAN = new RegExp(`(?:${SKIP})|(${LOCAL_IMAGE})`, "gi");
 const GONE = "\u0000";
 export function withoutLocalImages(text: unknown): string {
   const t = String(text ?? "");
   let hit = false;
-  const marked = t.split(CODE).map((seg, i) => (i % 2 ? seg : seg.replace(LOCAL_IMAGE, () => { hit = true; return GONE; }))).join("");
+  const marked = t.replace(SCAN, (m: string, _ticks: string | undefined, image: string | undefined) => (image ? ((hit = true), GONE) : m));
   if (!hit) return t;
-  const out: string[] = [];
-  let dropped = false;
-  for (const line of marked.split("\n")) {
-    if (line.includes(GONE) && !line.split(GONE).join("").trim()) { dropped = true; continue; }
-    const kept = line.split(GONE).join("");
-    if (dropped && !kept.trim() && out.length && !out.at(-1)!.trim()) continue; // the blank line on both sides of a removed one: keep one
-    dropped = false;
-    out.push(kept);
-  }
-  return out.join("\n");
+  return marked.split("\n").filter((line) => !(line.includes(GONE) && !line.split(GONE).join("").trim())).join("\n").split(GONE).join("");
 }
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
 export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(?:^|\r?\n)[ \t]*NO_REPLY\s*$/, "");

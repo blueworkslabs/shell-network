@@ -252,7 +252,7 @@ test("LOCAL IMAGES (#79): NO_REPLY plus a local image posts nothing; text plus l
   await turn("NO_REPLY\n\n![golden wing](/home/agent/work/golden-wing.png)");
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), [], "NO_REPLY plus a local image: nothing posted");
   await turn("Here it is:\n\n![a](/tmp/a.png)\n![b](<file:///tmp/my pic.png>)\n![c](</home/agent/c d.png> \"title\")\n\nEnjoy.");
-  assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["Here it is:\n\nEnjoy."], "text only, the local images removed");
+  assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["Here it is:\n\n\nEnjoy."], "text only: the image lines removed, the blank lines around them kept");
   await turn("From the web: ![logo](https://example.com/logo.png)");
   assert.equal(w.discord.botPosts().at(-1)!.content, "From the web: ![logo](https://example.com/logo.png)", "a web image stays");
   w.t3.complete(w.thread(), w.t3.wake(w.thread()).runId, "![done](/tmp/done.png)\nNO_REPLY");
@@ -266,6 +266,9 @@ test("LOCAL IMAGES (#79) filter: a final without a local image is untouched (har
   assert.equal(withoutLocalImages("NO_REPLY\n![chart](/tmp/chart(1).png)"), "NO_REPLY", "a path with parentheses");
   for (const img of [`![a](/tmp/a.png 'single')`, `![a](/tmp/a.png "double")`, `![a](/tmp/a.png (parens))`, `![a](<file:///tmp/a b.png> 'single')`])
     assert.equal(withoutLocalImages(`NO_REPLY\n\n${img}`), "NO_REPLY\n", img);
+  assert.equal(withoutLocalImages("Before\n\n![a](/tmp/a.png)\n\n\nAfter"), "Before\n\n\n\nAfter", "only the image line goes; every blank line around it stays");
+  const literal = "Write ``![x](/tmp/x.png)`` or ` `` ![y](/tmp/y.png) `` ` or \\![z](/tmp/z.png) to show the syntax.";
+  assert.equal(withoutLocalImages(`${literal}\n![real](/tmp/real.png)`), `${literal}`, "double-backtick code and an escaped image stay; the real image goes");
   assert.equal(withoutLocalImages("See ![a](/tmp/a.png) here.  \nNext line  \n```\n![b](/tmp/b.png)\n```"), "See  here.  \nNext line  \n```\n![b](/tmp/b.png)\n```",
     "only the image goes: the rest of the text, its hard breaks and the code example stay");
 });

@@ -2,7 +2,7 @@
 
 Persistent AI agents on Discord, built on [t3](https://github.com/pingdotgg/t3code). Each agent has its own persona,
 long-term memory and searchable conversation history, runs on Claude or Codex, and talks in your Discord channels like a
-crewmate. A thin bridge keeps the conversation reliable: no lost messages, no double posts, through crashes, restarts and
+crewmate. A thin bridge is designed to preserve messages and avoid duplicate posts through crashes, restarts and
 t3's own failure modes.
 
 Status: experimental, in daily use by a small crew on one VM (t3 0.1.11). See [SECURITY.md](SECURITY.md) for the trust
@@ -11,12 +11,13 @@ model and the known limits.
 ## What you get
 
 - **Persistent personas.** An agent's personality, role, preferences and crew rules live in plain files in its
-  workspace and load on every turn. Its identity survives restarts, model changes and fresh sessions.
+  workspace, loaded through the provider's instruction files (see [MEMORY.md](MEMORY.md)). Its identity survives
+  restarts, model changes and fresh sessions.
 - **Long-term memory.** Agents keep daily notes and curated memory. `memory_search` finds them by meaning and by exact
   text (hybrid full-text and embedding search), including old conversations. History from another agent platform can
   be imported.
 - **Conversation history.** `/new` starts a fresh session and archives the old one into the agent's searchable history
-  automatically.
+  automatically when archive export and memory search are configured.
 - **Discord-native.** One conversation per channel, DMs from allowed people, slash commands (`/new`, `/status`), file
   attachments both ways, and a Discord tool the agent can use to post, react, open threads and read.
 - **Crews.** Several agents in one channel can hand work to each other by mention, with a cap that pauses bot-to-bot

@@ -13,9 +13,10 @@ layout:
 - `MEMORY.md`: curated long-term facts and decisions.
 - `memory/YYYY-MM-DD.md`: daily notes, written by the agent at the end of each task.
 
-The provider loads them on every turn: a Claude-backed agent through `CLAUDE.md` imports, a Codex-backed agent through
-an `AGENTS.md` generated from the same files. The agent edits its own notes; the persona files change only on
-purpose.
+Configure the provider to load these instructions: for example, use `CLAUDE.md` imports for Claude, or prepare an
+`AGENTS.md` from the same files for Codex. This is workspace setup, not automatic generation by the bridge; refresh
+a generated file when its sources change. Daily notes and other changing memory should be read by the agent as
+needed. The agent edits its own notes; the persona files change only on purpose.
 
 Sessions are finite. `/new` (see [ARCHITECTURE.md](ARCHITECTURE.md)) has the agent write its daily note, archives the
 channel's t3 thread and starts a fresh one whose first batch tells it to read its recent daily notes. With
@@ -29,7 +30,8 @@ searchable. Each channel is its own conversation; workspace, persona and notes a
 file names, 1-based line numbers and excerpts. Entries are visited in descending filename order, so date-named daily
 notes prioritize recent entries when results are limited. The tool reads current files on each call: new and edited notes need no
 index rebuild. Only non-hidden `.md` and `.txt` files are included; symlinks, hardlinks and binary files are skipped.
-It never searches another bot's notes or archived channel history.
+It searches only this notes directory, including any imported or automatically exported transcripts under `sessions/`;
+it does not fetch live Discord or t3 history.
 
 Search is bounded to 1,000 note files, 5,000 directory entries, eight directory levels, 256 KiB per file and 8 MiB per
 call. Excerpts are at most 402 characters including truncation marks. `incomplete: true` means a result limit, skipped

@@ -50,7 +50,10 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
 - **Files.** An agent can attach only files inside its workspace (`DISCORD_TOOL_WORKSPACE`; the path is resolved
   through symlinks and the target opened without following one). The Discord tool copies them into a staging directory
   and has no credential; the bridge validates the staged copies again before uploading them, so a tampered outbox
-  entry cannot make it read a file elsewhere. Inbound attachments are described, never fetched by the bridge.
+  entry cannot make it read a file elsewhere. Inbound attachments are described. With `BRIDGE_WORKSPACE` the bridge
+  fetches images from Discord's CDN hosts only (no redirects), keeps a file only if its first bytes are an image, caps
+  size while downloading, and writes into `.inbox/` (a plain directory, not a symlink) under a name it builds itself;
+  the 7-day sweep refuses a symlinked inbox the same way.
 - **One writer per bot token.** The bridge holds an exclusive lock for its bot (`lib/lock.ts`). The Discord tool can
   only insert outbox entries, through a SQLite authorizer (`lib/tooldb.ts`); the bridge validates each entry again
   before posting it.
@@ -75,3 +78,5 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   They are capped on the receiving side, where the other bot's bridge counts and refuses them.
 - **Not an isolation boundary for agents.** As stated above, an agent with shell access as the bridge user can read
   the bridge's secret files and the buffer DB.
+- **No filesystem boundary between agents.** All crew agents run as one Unix user, so there is no filesystem boundary
+  between agents, for DM text and images alike. Separate users would be the fix.

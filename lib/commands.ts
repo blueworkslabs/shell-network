@@ -105,7 +105,7 @@ const kind = (e: unknown) => { const c = (e as { code?: number } | null)?.code; 
 const redact = (s: string, token: string) => s.split(token).join("[token]").replace(/(\/(?:interactions|webhooks)\/\d+\/)[\w.-]+/g, "$1[token]");
 
 export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, now = () => Date.now() }: {
-  port: InteractionPort; bots: Map<string, CommandBot>; allowedAuthors: string[]; nudge: () => void; log: Log; now?: () => number;
+  port: InteractionPort; bots: Pick<Map<string, CommandBot>, "get">; allowedAuthors: string[]; nudge: () => void; log: Log; now?: () => number;
 }): (type: string, d: unknown) => Promise<void> | undefined {
   const allowed = new Set(allowedAuthors);
   const safe = async (token: string, what: string, fn: () => Promise<unknown>) => {

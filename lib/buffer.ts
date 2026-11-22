@@ -552,8 +552,17 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       AND state = 'posted' AND channel_message_id IS NOT NULL
       AND (CASE WHEN ?2 IS NULL THEN json_extract(meta, '$.thread') IS NULL ELSE json_extract(meta, '$.thread') = 1 AND json_extract(meta, '$.channel') = ?2 END)
       ORDER BY length(channel_message_id) DESC, channel_message_id DESC LIMIT 1`, conversationKey, threadId)?.id ?? null,
-    // A thread this bot's tool created (thread id = its starter message id), posted: writable for the bot.
-    isToolThread: (conversationKey: string, threadId: string): boolean => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?", conversationKey, threadId)!.n > 0,
+    // A thread this bot's tool created (thread id = its starter message id), posted and not closed/denied: writable for the bot.
+    isToolThread: (conversationKey: string, threadId: string): boolean => one<{ n: number }>(
+      "SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ? AND COALESCE(json_extract(meta, '$.closed'), 0) = 0",
+      conversationKey, threadId,
+    )!.n > 0,
+    // Mark or clear `$.closed` on any legacy discord_thread outbox record for this bot + thread so both lib/tools.ts
+    // and the parent's outbox drain reject/settle writes to closed, deleted, or unrevalidated threads.
+    setToolThreadClosed(botKey: string, threadId: string, closed: boolean): void {
+      const expr = closed ? "json_set(meta, '$.closed', 1)" : "json_remove(meta, '$.closed')";
+      db.prepare(`UPDATE outbox SET meta = ${expr} WHERE substr(conversation_key, 1, length(?1) + 1) = ?1 || '.' AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?2`).run(botKey, threadId);
+    },
     // The posted entry of a conversation that made this message (a reply part, a tool send, an alert, ...).
     outboxByMessage: (conversationKey: string, messageId: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND channel_message_id = ? AND state = 'posted'", conversationKey, messageId),
     // Edits queued after entry `afterId` that have not been attempted: a newer one for the same message supersedes it.
@@ -585,10 +594,30 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         ON CONFLICT (conversation_key) DO UPDATE SET channel_id = excluded.channel_id, bot_user_id = excluded.bot_user_id, crew = excluded.crew,
         exchange_cap = excluded.exchange_cap, updated_at = excluded.updated_at`).run(conversationKey, c.channelId, c.botUserId, JSON.stringify(c.crew), c.exchangeCap, now());
     },
+    deleteToolConfig(conversationKey: string): void {
+      db.prepare("DELETE FROM tool_config WHERE conversation_key = ?").run(conversationKey);
+    },
+    // Clear any leftover input, pending/posting outbox rows (including edits), unposted replies and alerts when a
+    // Discord thread conversation closes, so reopening the same thread later can never replay stale work.
+    purgeClosedConversation(conversationKey: string): OutboxRow[] {
+      return tx(() => {
+        const dropped = all<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND state IN ('pending','posting') ORDER BY id", conversationKey);
+        db.prepare("UPDATE outbox SET state = 'dropped', boundary = NULL WHERE conversation_key = ? AND state IN ('pending','posting')").run(conversationKey);
+        db.prepare("DELETE FROM inbound WHERE conversation_key = ? AND state = 'buffered'").run(conversationKey);
+        db.prepare("UPDATE inbound SET acked_at = ? WHERE conversation_key = ? AND acked_at IS NULL").run(now(), conversationKey);
+        const unposted = all<BatchRow>(`SELECT b.* FROM batch b WHERE b.conversation_key = ? AND b.status = 'delivered'
+          AND NOT EXISTS (SELECT 1 FROM reply r WHERE r.batch_id = b.id AND r.part = r.parts - 1)
+          AND NOT EXISTS (SELECT 1 FROM reply_none n WHERE n.batch_id = b.id)`, conversationKey);
+        for (const b of unposted) db.prepare("INSERT OR IGNORE INTO reply_none (batch_id, at) VALUES (?, ?)").run(b.id, now());
+        db.prepare("UPDATE alert SET cleared_at = ? WHERE cleared_at IS NULL AND batch_id IN (SELECT id FROM batch WHERE conversation_key = ?)").run(now(), conversationKey);
+        db.prepare("UPDATE notice SET posted_at = ? WHERE conversation_key = ? AND posted_at IS NULL").run(now(), conversationKey);
+        return dropped;
+      });
+    },
     // A message of the channel log (allowlisted people, allowed crew bots, this bot): tool targets must be one.
     // An edit of the bot's own post (discord_edit), applied: the channel log shows the new text.
     editChannelMessage: (id: string, authorId: string, content: string): void => { db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND author_id = ?").run(content, id, authorId); },
-    channelMessage: (id: string): { id: string; author_id: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
+    channelMessage: (id: string): { id: string; author_id: string; author_name: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_name, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).
     relayOf: (conversationKey: string, runId: string): RelayRow | undefined => one<RelayRow>("SELECT * FROM relay WHERE conversation_key = ? AND run_id = ?", conversationKey, runId),

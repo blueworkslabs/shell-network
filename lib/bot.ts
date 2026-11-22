@@ -45,7 +45,20 @@ export const HEADER_LINE_MAX = 300;
 export const HEADER_ADDRESSED_LINE_MAX = 2000;
 const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars cut]` : s);
 // phase "open" carries the reconcile verdict of the oldest open batch.
-export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new" | "stop"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
+export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new" | "stop" | "closing"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
+export interface ThreadContext {
+  parentId: string;
+  parentName: string;
+  threadName: string;
+  isPrivate?: boolean;
+  starter?: { author: string; content: string } | null;
+}
+export interface ActiveThreadSummary {
+  name: string;
+  state: "active" | "closing";
+  isPrivate: boolean;
+  pendingJobs?: number;
+}
 type Found = { status: "found"; message: DiscordMessage } | { status: "absent" } | { status: "unknown" };
 export interface BotOptions {
   name: string; conversationKey: string; channelId: string; channelName?: string; threadLabel?: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
@@ -55,6 +68,10 @@ export interface BotOptions {
   allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
   // the bot's DM with the user: every message of an allowlisted person is addressed to the bot (no mention needed)
   dm?: boolean;
+  // Discord thread conversation (#77): parent channel context and optional starter message
+  threadContext?: ThreadContext;
+  // parent channels: active Discord thread conversations for `/status`
+  activeThreads?: () => ActiveThreadSummary[];
   // the bot's notes root (the tool's DISCORD_TOOL_NOTES): archived sessions are exported into its sessions/ (#50); none = no export
   notesRoot?: string;
   // where the Discord tool stages the files of a tool post for this bridge to upload (lib/attachments.ts); none = tool posts with files are dropped
@@ -86,7 +103,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, notesRoot }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, activeThreads, notesRoot }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -105,7 +122,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   const state: { botUserId: string | null } = { botUserId };
   // What this bot's Discord tool (bin/discord-tool.ts) works with: the one channel, this bot, the crew it may name,
   // the cap. Published whenever the bot's own user id is known.
-  const publishToolConfig = () => { if (state.botUserId) buffer.setToolConfig(conversationKey, { channelId, botUserId: state.botUserId, crew: allowedBots, exchangeCap }); };
+  const publishToolConfig = () => { if (state.botUserId && !buffer.kvGet(K("threadClosing"))) buffer.setToolConfig(conversationKey, { channelId, botUserId: state.botUserId, crew: allowedBots, exchangeCap }); };
   publishToolConfig();
   // catch-up gate: caughtUp = the session token in which the last complete catch-up ran (null = not caught up)
   const catchUp: { caughtUp: unknown; inFlight: Promise<number> | null; lastAt: number } = { caughtUp: null, inFlight: null, lastAt: 0 };
@@ -155,6 +172,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // `/new` as a message (source "discord", id = the message) or as a slash command (source "interaction", id = the
   // interaction): the same reset either way. An interaction id is not a message, so nothing replies to it or reacts on it.
   function requestNew(cmd: { id: string; author: string; receivedAt: number; source: "discord" | "interaction" }): AcceptResult {
+    if (buffer.kvGet(K("threadClosing"))) return { accepted: false, reason: "thread closing" };
     const seen = buffer.kvGet(K("resetSeen"));
     const cur = resetState();
     if (cur?.id !== cmd.id) {
@@ -293,11 +311,22 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const open = buffer.openBatches(conversationKey)[0], rs = resetState(), st = stopState(), lastStop = lastStopState(), n = buffer.exchangeCount(channelId);
     const stopLine = st ? ["/stop: stopping running turn"]
       : lastStop ? [`Last /stop: stopped at ${new Date(lastStop.at).toISOString().slice(0, 16).replace("T", " ")} UTC`] : [];
-    return [`**${name}** in #${channelName ?? channelId}`,
+    const threads = activeThreads?.() ?? [];
+    const publicThreads = threads.filter((t) => !t.isPrivate).map((t) => `"${t.name}"${t.state === "closing" ? " (closing)" : ""}`);
+    const privateThreads = threads.filter((t) => t.isPrivate);
+    const threadParts = [...publicThreads, ...(privateThreads.length ? [`${privateThreads.length} private`] : [])];
+    const threadsWithJobs = threads.filter((t) => (t.pendingJobs ?? 0) > 0);
+    const pendingJobCount = threadsWithJobs.reduce((sum, t) => sum + (t.pendingJobs ?? 0), 0);
+    const header = threadContext
+      ? `**${name}** in thread "${threadContext.threadName}" (#${threadContext.parentName})`
+      : `**${name}** in #${channelName ?? channelId}`;
+    return [header,
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,
       ...stopLine,
+      ...(threads.length ? [`Active threads (${threads.length}): ${threadParts.join(", ")}`] : []),
+      ...(pendingJobCount > 0 ? [`Warning: ${threadsWithJobs.length} closed thread${threadsWithJobs.length === 1 ? "" : "s"} still ${threadsWithJobs.length === 1 ? "has" : "have"} ${pendingJobCount} scheduled job${pendingJobCount === 1 ? "" : "s"} (archive held until moved or deleted)`] : []),
       ...(rs?.stage === "handoff" ? [`Standing jobs: ${rs.jobsPending ?? rs.handoff?.jobs.length ?? 0} awaiting verification`] : []),
       ...(Number(buffer.kvGet(K("skippedPosts")) ?? 0) ? [`Skipped posts (Discord refused them): ${buffer.kvGet(K("skippedPosts"))}`] : []),
       ...(notesRoot ? [`Archive export: ${pendingExports().length} pending${exportState.lastError ? `; last error: ${exportState.lastError}` : ""}`] : []),
@@ -454,6 +483,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // Accept one Discord MESSAGE_CREATE. Returns { accepted, inserted?, reason? }.
   async function accept(msg: DiscordMessage): Promise<AcceptResult> {
     if (msg?.channel_id !== channelId) return { accepted: false, reason: "other channel" };
+    if (buffer.kvGet(K("threadClosing"))) return { accepted: false, reason: "thread closing" };
     const authorId = msg.author?.id;
     const fromBot = Boolean(msg.author?.bot);
     const self = fromBot && authorId === state.botUserId;
@@ -525,6 +555,35 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     log.emit("bridge.watermark_init", { bot: name, watermark: wm, startMs, marginMs });
     return wm;
   }
+  function initWatermarkAt(watermarkId: string): string {
+    const known = buffer.kvGet(K("watermark"));
+    if (known !== null) return known;
+    buffer.atomically(() => {
+      buffer.kvSet(K("watermark"), watermarkId);
+      if (buffer.kvGet(K("headerSince")) === null) buffer.kvSet(K("headerSince"), watermarkId);
+    });
+    log.emit("bridge.watermark_init", { bot: name, watermark: watermarkId });
+    return watermarkId;
+  }
+  // Discord archived or deleted this thread: stop accepting input, wait for any running t3 turn, archive and export.
+  function requestClose(): void {
+    buffer.atomically(() => {
+      buffer.kvSet(K("threadClosing"), "1");
+      buffer.deleteToolConfig(conversationKey);
+    });
+  }
+  // If a previously closed Discord thread is later unarchived and mentioned again, start a fresh session cleanly.
+  function reopen(): void {
+    const dropped = buffer.atomically(() => {
+      for (const k of ["threadClosing", "threadClosed", "threadIntro", "threadTitle", "watermark", "headerSince", "reset", "stop", "closeJobs", "resetAlert", "threadAlert"]) {
+        buffer.kvDelete(K(k));
+      }
+      return buffer.purgeClosedConversation(conversationKey);
+    });
+    for (const row of dropped) unstage(row);
+    publishToolConfig();
+  }
+  const isClosed = (): boolean => buffer.kvGet(K("threadClosed")) === "1" && pendingExports().length === 0 && !exportState.running;
 
   function backfill(): Promise<number> {
     if (catchUp.inFlight) return catchUp.inFlight;
@@ -655,6 +714,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   const targetOf = (h: OutboxRow): string => { const m = toolMeta(h); return h.key.startsWith("tool:") && m.thread === 1 && m.channel ? m.channel : channelId; };
   function toolRejected(h: OutboxRow): string | null {
     const meta = toolMeta(h);
+    if (threadContext && h.key.startsWith("thread:")) return "cannot start a thread inside a thread";
     const inThread = h.key.startsWith("tool:") && meta.thread === 1;
     if (inThread ? !meta.channel || !buffer.isToolThread(conversationKey, meta.channel) : meta.channel !== channelId) return "channel not allowed";
     if (inThread && h.reply_to !== null) return "no reply targets in a thread";
@@ -744,6 +804,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const c = editCheck(h);
       if ("why" in c) { rejectTool(h, c.why); return true; }
       messageId = c.messageId;
+    } else if (place !== channelId && !buffer.isToolThread(conversationKey, place)) {
+      buffer.outboxPending(h.id);
+      rejectTool(h, "channel not allowed");
+      return true;
     }
     // also for an attempted one (`posting`, e.g. throttled): the newer text replaces it anyway, so it is not repeated
     const newer = buffer.pendingEditsAfter(conversationKey, h.id).find((n) => { const d = editCheck(n); return "messageId" in d && d.messageId === messageId && editPlace(n) === place; });
@@ -789,6 +853,16 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const replyTo = resolveReplyTo(h);
       const target = targetOf(h);
       if (h.state === "posting") {
+        // Never stall the parent outbox in channel-history recovery for a revoked/closed thread target.
+        if (target !== channelId && !buffer.isToolThread(conversationKey, target)) {
+          buffer.atomically(() => {
+            buffer.outboxPending(h.id);
+            buffer.kvDelete(K(`outboxSearch:${h.id}`));
+            buffer.kvDelete(K(`outboxEnd:${h.id}`));
+          });
+          rejectTool(h, "channel not allowed");
+          continue;
+        }
         const r = await searchOwnPost(K(`outboxSearch:${h.id}`), h.boundary!, h.content, replyTo, target, toolFiles(h).map((f) => f.name));
         if (r.status === "unknown") { log.emit("bridge.outbox_search_incomplete", { bot: name, key: h.key }); return false; }
         if (r.status === "found") {
@@ -802,13 +876,15 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         buffer.kvDelete(K(`outboxEnd:${h.id}`));
         continue;
       }
+      const tool = h.key.startsWith("tool:");
+      // Reject disallowed tool targets (e.g. a closed/denied thread) before touching Discord or stalling the parent outbox.
+      if (tool) { const why = toolRejected(h); if (why) { rejectTool(h, why); continue; } }
       const boundary = await channelEnd(K(`outboxEnd:${h.id}`), target === channelId ? lastPostedId() : buffer.lastOutboxPost(conversationKey, target) ?? target, target);
       if (boundary === null) return false;
       // A pending alert is checked again right before its POST, after the boundary read: if its
       // episode or escalation ended while it waited behind an older head, it is withdrawn (with its alert record, in
       // one transaction), never posted.
       if (staleAlert(h)) continue;
-      const tool = h.key.startsWith("tool:");
       if (tool) { const why = toolRejected(h); if (why) { rejectTool(h, why); continue; } }
       // the files of a tool post, validated again against the staging directory right before they go out
       let upload: { name: string; data: Uint8Array }[] = [];
@@ -1109,7 +1185,18 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     // which channel this conversation is (the Discord tool needs it on every call), then how to address the crew
     const fresh = buffer.kvGet(K("fresh")) ? `${FRESH_SESSION_TEXT}\n` : "";
     if (fresh) buffer.kvDelete(K("fresh")); // inside createBatch's transaction: the first batch of the fresh thread carries it
-    const hint = [`[Discord channel: #${channelName ?? channelId} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`,
+    let threadIntro = "";
+    if (threadContext && !buffer.kvGet(K("threadIntro"))) {
+      buffer.kvSet(K("threadIntro"), "1");
+      const introLines = [`[Discord thread "${threadContext.threadName}" in #${threadContext.parentName}.]`];
+      if (threadContext.starter?.content) {
+        introLines.push(`[Starter message from ${threadContext.starter.author}: ${cutLine(named(threadContext.starter.content).replace(/\s+/g, " ").trim(), HEADER_ADDRESSED_LINE_MAX)}]`);
+      }
+      threadIntro = introLines.join("\n") + "\n";
+    }
+    const hint = [threadContext
+      ? `[Discord thread: "${threadContext.threadName}" in #${threadContext.parentName} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`
+      : `[Discord channel: #${channelName ?? channelId} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`,
       ...[...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`)];
     const toEntry = (addressed: boolean) => (m: { author_name: string; content: string }) =>
       ({ addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
@@ -1123,14 +1210,112 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       entries.splice(i >= 0 ? i : 0, 1);
     }
     const lines = entries.map((e) => e.line);
-    if (!lines.length) return fresh + hint.join("\n") + "\n";
+    if (!lines.length) return fresh + threadIntro + hint.join("\n") + "\n";
     const left = total - lines.length;
-    return fresh + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
+    return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
+  }
+
+  async function closeStep(): Promise<StepResult> {
+    if (buffer.kvGet(K("threadClosed")) === "1") {
+      exportArchived();
+      return { phase: pendingExports().length || exportState.running ? "closing" : "idle" };
+    }
+    const bound = buffer.kvGet(K("threadId"));
+    if (!bound) {
+      const dropped = buffer.atomically(() => {
+        for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "resetAlert", "threadAlert"]) buffer.kvDelete(K(k));
+        buffer.kvSet(K("threadClosed"), "1");
+        return buffer.purgeClosedConversation(conversationKey);
+      });
+      for (const row of dropped) unstage(row);
+      log.emit("bridge.thread_closed", { bot: name, discordThreadId: channelId, threadId: null });
+      return { phase: "idle" };
+    }
+    let read = await t3.read(bound);
+    const stop = await stopStep(bound, read);
+    if (stop.read) read = stop.read;
+    if (stop.done) return { phase: "closing" };
+    const open = buffer.openBatches(conversationKey);
+    if (open.length) {
+      const b = open[0];
+      let projection: Projection | null = null, queue: QueueList | null = null;
+      try { projection = await t3.projection(bound); } catch (e) { log.emit("bridge.projection_unavailable", { bot: name, error: errText(e) }); }
+      try { queue = await t3.queue(bound); } catch (e) { log.emit("bridge.queue_unavailable", { bot: name, error: errText(e) }); }
+      if (b.status === "resolved" || b.status === "cancelled") {
+        const st = settlement(b, { projection, queue });
+        if (st.settled) buffer.markSettled(b.id);
+        return { phase: "closing" };
+      }
+      const v = reconcileBatch(b, { read, projection, queue });
+      if (v.action === "send") {
+        // Never send a new turn into a thread Discord already archived/deleted.
+        buffer.atomically(() => {
+          buffer.cancelStopped(b.id, { by: "bridge", note: "Discord thread closed before send" });
+          buffer.markSettled(b.id);
+        });
+      } else if (v.action === "adopt") {
+        buffer.recordSend(b.id, { ok: true, messageId: v.adopt!.messageId, runId: v.adopt!.runId, delivery: "adopted" });
+        return { phase: "closing" };
+      } else if (v.action === "done" && v.state === "delivered" && b.status !== "delivered") {
+        buffer.setStatus(b.id, "delivered");
+      } else if (v.action === "escalate") {
+        buffer.atomically(() => {
+          buffer.cancelStopped(b.id, { by: "bridge", note: `Discord thread closed (${v.state})` });
+          buffer.markSettled(b.id);
+        });
+      } else {
+        return { phase: "closing" };
+      }
+    }
+    if (isBusy(read)) return { phase: "closing" };
+    // Standing scheduled jobs (enabled and paused) bound to this thread's t3 session must not be lost or silently
+    // redirected when the thread closes: fail closed if inventory fails, hold archive, persist a redacted warning for
+    // parent `/status`, and post one redacted notice in the parent channel until a person moves or deletes them.
+    const boundJobs = (await t3.listStandingJobs()).filter((j) => j.boundThreadId === bound);
+    if (boundJobs.length > 0) {
+      const activeJobs = boundJobs.filter((j) => j.enabled).length;
+      const pausedJobs = boundJobs.length - activeJobs;
+      const parentKey = threadContext ? `${conversationKey.slice(0, conversationKey.indexOf("."))}.${threadContext.parentId}` : null;
+      const label = threadContext?.isPrivate ? "a private thread" : `thread "${threadContext?.threadName ?? channelId}"`;
+      const prev = buffer.kvGet(K("closeJobs"));
+      buffer.atomically(() => {
+        buffer.kvSet(K("closeJobs"), JSON.stringify({ count: boundJobs.length, active: activeJobs, paused: pausedJobs }));
+        if (parentKey && threadContext) {
+          buffer.addNotice(`thread-jobs:${channelId}:${bound}`,
+            `⚠️ ${name}: ${label} closed with ${boundJobs.length} scheduled job${boundJobs.length === 1 ? "" : "s"} (${activeJobs} active, ${pausedJobs} paused). Holding session archive until a person moves or deletes ${boundJobs.length === 1 ? "it" : "them"}.`,
+            parentKey);
+        }
+      });
+      if (!prev) log.emit("bridge.thread_close_held_jobs", { bot: name, discordThreadId: channelId, threadId: bound, count: boundJobs.length, active: activeJobs, paused: pausedJobs });
+      return { phase: "closing" };
+    }
+    try {
+      await t3.archive(bound);
+    } catch (e) {
+      const archived = await t3.read(bound).then((r) => r.thread?.archived === true, () => false);
+      if (!archived) throw e;
+      log.emit("bridge.archive_already", { bot: name, threadId: bound });
+    }
+    const title = buffer.kvGet(K("threadTitle"));
+    const dropped = buffer.atomically(() => {
+      const list = JSON.parse(buffer.kvGet(K("archived")) ?? "[]") as { threadId: string; title: string | null; resetMessageId: string }[];
+      if (!list.some((a) => a.threadId === bound)) list.push({ threadId: bound, title: title ?? null, resetMessageId: "thread-close" });
+      buffer.kvSet(K("archived"), JSON.stringify(list));
+      buffer.kvDelete(K("threadId"));
+      for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "resetAlert", "threadAlert"]) buffer.kvDelete(K(k));
+      buffer.kvSet(K("threadClosed"), "1");
+      return buffer.purgeClosedConversation(conversationKey);
+    });
+    for (const row of dropped) unstage(row);
+    log.emit("bridge.thread_closed", { bot: name, discordThreadId: channelId, threadId: bound, title: title ?? null });
+    exportArchived();
+    return { phase: pendingExports().length || exportState.running ? "closing" : "idle" };
   }
 
   // One pass: catch up if needed, post finished replies, settle the oldest open batch, then (only if nothing is open,
   // the thread is idle and the catch-up gate is open) send the next coalesced batch. Returns a summary for log/tests.
   async function step(): Promise<StepResult> {
+    if (buffer.kvGet(K("threadClosing")) === "1") return closeStep();
     // The outbox head first: whatever an earlier step left unsettled is settled before this bot writes anything else.
     // While the head stays unsettled no message goes out, but everything else goes on.
     let draining = await drainOutbox();
@@ -1188,5 +1373,5 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { phase: "sent", batchId: b.id };
   }
 
-  return { accept, backfill, initWatermark, step, ensureThread, requestNew, requestStop, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
+  return { accept, backfill, initWatermark, initWatermarkAt, step, ensureThread, requestNew, requestStop, requestClose, reopen, isClosed, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
 }

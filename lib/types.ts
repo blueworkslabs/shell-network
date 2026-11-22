@@ -198,6 +198,14 @@ export interface CreateMessagePayload {
   message_reference?: { message_id: string; channel_id: string; fail_if_not_exists: boolean };
   files?: { name: string; data: Uint8Array }[]; // uploads (multipart); `content` may be empty then
 }
+export interface DiscordChannel {
+  id: string;
+  type?: number;
+  name?: string;
+  parent_id?: string | null;
+  guild_id?: string;
+  thread_metadata?: { archived?: boolean; locked?: boolean };
+}
 export interface DiscordPort {
   createMessage(channelId: string, payload: CreateMessagePayload): Promise<DiscordMessage>;
   typing(channelId: string): Promise<unknown>;
@@ -205,7 +213,8 @@ export interface DiscordPort {
   editMessage(channelId: string, messageId: string, payload: { content: string; allowed_mentions: { parse: string[] } }): Promise<unknown>;
   messagesAfter(channelId: string, afterId: string, limit?: number): Promise<DiscordMessage[]>;
   startThread(channelId: string, messageId: string, name: string): Promise<{ id: string }>;
-  getChannel(channelId: string): Promise<{ id: string; name?: string; parent_id?: string | null; guild_id?: string }>;
+  getChannel(channelId: string): Promise<DiscordChannel>;
+  getMessage?(channelId: string, messageId: string): Promise<DiscordMessage>;
 }
 
 // ---- t3 port used by the bot core (lib/t3.ts implements it) ----

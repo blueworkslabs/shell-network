@@ -18,9 +18,10 @@ export interface ShellWatchDeps {
 }
 interface WsLike { addEventListener(type: string, fn: (e: any) => void): void; send(data: string): void; close(): void }
 
-export function shellWatch({ origin, tokenPath, threadId, onChange, log, deps = {}, backoffMs = (n: number) => Math.min(60_000, 1000 * 2 ** n) }: {
-  origin: string; tokenPath: string; threadId: () => string | null; onChange: () => void; log: Log; deps?: ShellWatchDeps; backoffMs?: (failures: number) => number;
+export function shellWatch({ origin, tokenPath, threadId, hasThread, onChange, log, deps = {}, backoffMs = (n: number) => Math.min(60_000, 1000 * 2 ** n) }: {
+  origin: string; tokenPath: string; threadId?: () => string | null; hasThread?: (id: string) => boolean; onChange: () => void; log: Log; deps?: ShellWatchDeps; backoffMs?: (failures: number) => number;
 }) {
+  const matches = hasThread ?? ((id: string) => id === threadId?.());
   const fetch = deps.fetch ?? globalThis.fetch;
   const WebSocketImpl = deps.WebSocket ?? (globalThis.WebSocket as unknown as new (url: string) => WsLike);
   const setTimer = deps.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
@@ -74,7 +75,7 @@ export function shellWatch({ origin, tokenPath, threadId, onChange, log, deps = 
             state.connects++;
             log.emit("bridge.shell_watch_live", { connects: state.connects });
             onChange();
-          } else if (item?.kind === "thread.updated" && state.synchronized && item.thread?.id !== undefined && item.thread.id === threadId()) {
+          } else if (item?.kind === "thread.updated" && state.synchronized && typeof item.thread?.id === "string" && matches(item.thread.id)) {
             onChange();
           }
         }

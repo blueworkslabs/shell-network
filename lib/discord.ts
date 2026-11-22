@@ -13,7 +13,7 @@ import { REST, type RESTOptions } from "@discordjs/rest";
 import { WebSocketManager, WebSocketShardEvents } from "@discordjs/ws";
 import { errText } from "./log.ts";
 import type { CommandBody, CommandsPort, ExistingCommand, InteractionPort } from "./commands.ts";
-import type { CreateMessagePayload, DiscordMessage, DiscordPort, Log } from "./types.ts";
+import type { CreateMessagePayload, DiscordChannel, DiscordMessage, DiscordPort, Log } from "./types.ts";
 
 export const INTENTS = GatewayIntentBits.Guilds | GatewayIntentBits.GuildMessages | GatewayIntentBits.MessageContent | GatewayIntentBits.DirectMessages;
 // Close codes after which reconnecting cannot help (bad token, bad intents, ...).
@@ -94,7 +94,12 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
       api.channels.getMessages(channelId, { after: afterId, limit }) as unknown as Promise<DiscordMessage[]>,
     // a thread from a message (its id is the message id), only under an allowed channel itself (not under a thread)
     startThread: (channelId: string, messageId: string, name: string) => { parentGuard(channelId); return api.channels.createThread(channelId, { name }, messageId) as unknown as Promise<{ id: string }>; },
-    getChannel: (channelId: string) => api.channels.get(channelId) as unknown as Promise<{ id: string; name?: string; parent_id?: string | null; guild_id?: string }>,
+    getChannel: (channelId: string) => api.channels.get(channelId) as unknown as Promise<DiscordChannel>,
+    getMessage: (channelId: string, messageId: string): Promise<DiscordMessage> => {
+      parentGuard(channelId);
+      if (!SNOWFLAKE.test(messageId)) throw new Error("message id malformed");
+      return api.channels.getMessage(channelId, messageId) as unknown as Promise<DiscordMessage>;
+    },
   });
 }
 

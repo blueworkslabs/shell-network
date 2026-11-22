@@ -88,11 +88,31 @@ const REFUSED = new Set([400, 403, 404, 413]), REFUSE_LIMIT = 3;
 export const RESET_STUCK_MS = 10 * 60_000;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
-// Markdown images of local paths (`![x](/abs/path.png)`, `![x](<...>)` around such a path, `![x](file:...)`) are removed
-// from a final before the checks: Discord cannot show them, and a final that is NO_REPLY plus such an image (an agent
-// pointing at a file it made) counts as NO_REPLY (#79). Images on the web (`https://`) stay.
-const LOCAL_IMAGE = /!\[[^\]\n]*\]\(\s*(?:<(?:\/|file:)[^>\n]*>|(?:\/|file:)[^\s)]*)(?:\s+"[^"\n]*")?\s*\)/gi;
-export const withoutLocalImages = (text: unknown): string => String(text ?? "").replace(LOCAL_IMAGE, "").replace(/[ \t]+$/gm, "").replace(/\n{3,}/g, "\n\n");
+// Markdown images of local paths (`![x](/abs/path.png)`, `![x](<...>)` around such a path, `![x](file:...)`, with an
+// optional title) are removed from a final before the checks: Discord cannot show them, and a final that is NO_REPLY
+// plus such an image (an agent pointing at a file it made) counts as NO_REPLY (#79). Images on the web (`https://`)
+// stay, and so does everything in code (fenced blocks, inline code). A final without such an image is returned as it
+// is; with one, only the image goes, plus its line when nothing else was on it (and one of the blank lines around it).
+const LOCAL_PATH = String.raw`(?:[^\s()<>]|\([^\s()]*\))+`; // one level of parentheses, as in chart(1).png
+const LOCAL_IMAGE = new RegExp(String.raw`!\[[^\]\n]*\]\(\s*(?:<(?:\/|file:)[^>\n]*>|(?:\/|file:)${LOCAL_PATH})(?:\s+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?\s*\)`, "gi");
+const CODE = /(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/;
+const GONE = "\u0000";
+export function withoutLocalImages(text: unknown): string {
+  const t = String(text ?? "");
+  let hit = false;
+  const marked = t.split(CODE).map((seg, i) => (i % 2 ? seg : seg.replace(LOCAL_IMAGE, () => { hit = true; return GONE; }))).join("");
+  if (!hit) return t;
+  const out: string[] = [];
+  let dropped = false;
+  for (const line of marked.split("\n")) {
+    if (line.includes(GONE) && !line.split(GONE).join("").trim()) { dropped = true; continue; }
+    const kept = line.split(GONE).join("");
+    if (dropped && !kept.trim() && out.length && !out.at(-1)!.trim()) continue; // the blank line on both sides of a removed one: keep one
+    dropped = false;
+    out.push(kept);
+  }
+  return out.join("\n");
+}
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
 export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(?:^|\r?\n)[ \t]*NO_REPLY\s*$/, "");
 const splitReply = (text: unknown): string[] => {

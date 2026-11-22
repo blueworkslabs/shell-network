@@ -1,7 +1,7 @@
 // Offline stand-ins for t3 and Discord, with the behaviour the bridge relies on (as observed in the t3 stress test / documented by
 // Discord) and crash hooks. A "crash" closes the bridge's buffer first, so nothing the bridge does after the crash
 // point can reach durable state (like a killed process); the test then restarts on the same database file.
-import type { CreateMessagePayload, DiscordMessage, ModelSelection, Projection, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead } from "../lib/types.ts";
+import type { CreateMessagePayload, DiscordMessage, ModelSelection, Projection, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead, T3Port } from "../lib/types.ts";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "rolled_back"]);
 
@@ -11,6 +11,8 @@ export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; 
 export interface FakeCall { tool: string; title?: string; threadId?: string; mode?: string; clientRequestId?: string; message?: string }
 type SendArgs = { threadId: string; message: string; mode: string; clientRequestId: string };
 export interface FakeT3 {
+  standingJobs: Awaited<ReturnType<T3Port["listStandingJobs"]>>;
+  listStandingJobs: T3Port["listStandingJobs"];
   threads: Map<string, FakeThread>; calls: FakeCall[]; crash: Crash;
   listShape?: ((item: { threadId: string; title: string }) => ThreadListItem) | null;
   launch(args: { projectId: string; title: string; modelSelection?: ModelSelection }): Promise<{ threadId?: unknown; [k: string]: unknown }>;
@@ -52,7 +54,8 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
     ? { type: "notification", messageId: null as unknown as undefined, runId: r.runId, text: r.text, textTruncated: false, nextTextOffset: null }
     : { type: "user_message", messageId: r.userMessageId, runId: r.runId, text: r.text, textTruncated: false, nextTextOffset: null };
   const api: FakeT3 = {
-    threads, calls, crash,
+    threads, calls, crash, standingJobs: [],
+    async listStandingJobs() { return api.standingJobs.map((job) => ({ ...job })); },
     async launch({ projectId, title, modelSelection }) {
       calls.push({ tool: "launch", title });
       const id = `thread-${++n}`;

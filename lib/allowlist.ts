@@ -12,6 +12,7 @@
 //   - organize: only action "archive", only on the bound thread (/new; no unarchive, pin, settle or other action).
 // It constrains the bridge's code, not the token: the token's own authority is checked on the t3 host, and the token file
 // must stay out of reach of the provider processes (both outside this module).
+import { handoffInput, type ScheduleHandoff } from "./schedule-handoff.ts";
 import type { Log } from "./types.ts";
 
 export class ToolDenied extends Error {
@@ -26,7 +27,8 @@ type Check = (v: unknown) => boolean;
 interface Rule { args: Record<string, Check>; required: string[]; when?: (args: Record<string, unknown>) => string | null }
 export type Rules = Record<string, Rule>;
 // archivedThreads: the conversation's own archived threads (its `archived` ledger), readable for the export after /new
-export interface AllowlistPolicy { projectId: string; instanceId: string; boundThread: () => string | null; archivedThreads?: () => string[] }
+export interface AllowlistPolicy { projectId: string; instanceId: string; boundThread: () => string | null; archivedThreads?: () => string[];
+  handoff?: () => (ScheduleHandoff & { conversationKey: string; sent?: boolean }) | null }
 // The part of the MCP client the allowlist wraps.
 export interface McpLike {
   sessionId: string | null;
@@ -43,7 +45,12 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
   if (!isStr(projectId) || !isStr(instanceId) || typeof boundThread !== "function") throw new Error("allowlist: projectId, instanceId and boundThread required");
   const ownThread: Check = (v) => isStr(v) && v === boundThread();
   const archived = (v: unknown) => isStr(v) && v !== boundThread() && (policy.archivedThreads?.() ?? []).includes(v);
+  const handoff = () => {
+    const pending = policy.handoff?.();
+    return pending && pending.oldThread === boundThread() ? pending : null;
+  };
   return {
+    list_scheduled_tasks: { args: { projectId: (v) => v === projectId }, required: ["projectId"] },
     t3_thread_launch: {
       args: {
         projectId: (v) => v === projectId,
@@ -52,7 +59,11 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
           Object.keys(v).every((k) => k === "instanceId" || k === "model"),
       },
       required: ["projectId", "title", "modelSelection"],
-      when: () => (boundThread() === null ? null : "a thread is already bound; the bridge launches one thread only"),
+      when: (a) => {
+        const pending = handoff();
+        return boundThread() === null || (pending && !pending.replacement && a.title === pending.newTitle)
+          ? null : "a thread is already bound; only the pending reset replacement can launch";
+      },
     },
     t3_thread_list: {
       args: { projectId: (v) => v === projectId, titleContains: isStr, includeSubagents: (v) => v === false, limit: isInt(1, 100), cursor: isInt(0, Number.MAX_SAFE_INTEGER) },
@@ -78,8 +89,15 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
       required: ["action", "threadId"],
     },
     t3_thread_send: {
-      args: { threadId: ownThread, message: (v) => typeof v === "string" && v.length > 0, mode: (v) => v === "queue", clientRequestId: isStr },
+      args: { threadId: (v) => ownThread(v) || (isStr(v) && v === handoff()?.replacement), message: (v) => typeof v === "string" && v.length > 0, mode: (v) => v === "queue", clientRequestId: isStr },
       required: ["threadId", "message", "mode", "clientRequestId"],
+      when: (a) => {
+        if (ownThread(a.threadId)) return null;
+        const pending = handoff();
+        if (!pending || pending.sent || !pending.jobs.length) return "no schedule handoff is pending";
+        const expected = handoffInput(pending.conversationKey, pending);
+        return a.message === expected.message && a.clientRequestId === expected.clientRequestId ? null : "only the fixed schedule handoff is allowed";
+      },
     },
   };
 }

@@ -215,10 +215,13 @@ the bridge completion relay delivers it. Do not also send the same text through
 `discord_send`. Exact `NO_REPLY` suppresses a no-change result.
 
 Binding matters: an unbound task may create a different t3 thread that the bridge
-is not watching. A Discord `/new` archives/replaces the bound thread; automatic
-schedule rebinding is not implemented or verified. Pause/recreate the schedule in
-the replacement thread before relying on recurring delivery. `freshSession:false`
-was tested; fresh-session schedules and server/provider restarts were not.
+is not watching. During `/new`, the bridge records standing job IDs and starts the
+replacement thread while the old one is open. The replacement agent rebinds each job
+using its existing ID and `bindToCurrentThread:true`, preserving the schedule and
+enabled state. The bridge queues a deduplicated follow-up for jobs discovered on the
+old thread during the handoff and drains its outstanding work before archiving it. If a job remains unverified, `/status`
+shows the pending handoff and the bridge raises a stuck alert. The same task can
+be rebound from the replacement thread to recover a skipped job.
 
 Live check on 2026-11-21, t3 0.1.11 and bridge `e54b8f0`: Hermes invoked the native
 schedule tool, binding a one-shot task to his second channel. Only his bridge was

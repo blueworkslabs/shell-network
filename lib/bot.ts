@@ -24,6 +24,7 @@ import { reconcileBatch, messageIdMatchesRequest, settlement } from "./reconcile
 import { readArchivedTranscript } from "./t3-transcript.ts";
 import { importTranscripts } from "./transcript-import.ts";
 import { attachmentLines, attachmentNames, readStaged, removeStaged, type StagedFile } from "./attachments.ts";
+import { handoffInput, type ScheduleHandoff } from "./schedule-handoff.ts";
 import { errText } from "./log.ts";
 import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./stuck.ts";
 import type { BatchLimit, Buffer } from "./buffer.ts";
@@ -127,14 +128,15 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // kept in kv `reset` = { id (the message), stage, oldThread?, oldTitle?, newTitle? }:
   //   drain    messages before the /new go to the old thread as usual; later ones wait (buffer, limit)
   //   wrapup   the /new itself is sent as one batch (NEW_WRAPUP_TEXT: write the daily note)
-  //   archive  once that batch is finished, its reply posted and the thread idle: archive the old thread, then in ONE
-  //            transaction record it (kv `archived`), set the replacement title, mark the session fresh and clear the
-  //            binding; the next ensureThread() launches the new thread by that title (crash-safe like any launch)
+  //   handoff  after the wrap-up, if the old thread owns jobs: launch the replacement, ask it to rebind,
+  //            verify all bindings, and drain outstanding old-thread work before archiving
+  //   archive  archive the old thread, then persist the archive record and promote the replacement (or let
+  //            ensureThread launch one for a conversation without standing jobs)
   //   confirm  the fresh thread is bound: one confirmation (outbox `new:<id>`), reset done (kv `resetSeen`)
   // A `/new` ignored while one is pending is recorded in kv `resetSeen` (the newest `/new` id handled or ignored).
   // A crash between the t3 call and the transaction repeats the archive call; t3 refuses it, and a thread that reads as archived counts as done.
-  type Reset = { id: string; source?: "discord" | "interaction"; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string;
-    stageSince?: number; lastError?: string };
+  type Reset = { id: string; source?: "discord" | "interaction"; stage: "drain" | "wrapup" | "handoff" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string;
+    stageSince?: number; lastError?: string; handoff?: ScheduleHandoff; handoffSent?: boolean; handoffArchiveReady?: boolean; jobsPending?: number };
   const maxId = (a: string | null, b: string): string => (a !== null && BigInt(a) > BigInt(b) ? a : b);
   const resetState = (): Reset | null => { const v = buffer.kvGet(K("reset")); return v ? (JSON.parse(v) as Reset) : null; };
   // stageSince: when the current stage began (kept while the stage stays the same), for the stuck alert and /status
@@ -173,7 +175,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     requestNew({ id: msg.id, author: msg.author?.username ?? "user", receivedAt: Date.parse(msg.timestamp as string) || now(), source: "discord" });
   // for /status: how long a reset has hung in archive/confirm, and why (a fixed text)
   const resetTrouble = (rs: Reset): string => {
-    if (rs.stage !== "archive" && rs.stage !== "confirm") return "";
+    if (rs.stage !== "archive" && rs.stage !== "confirm" && rs.stage !== "handoff") return "";
     const min = Math.floor((now() - (rs.stageSince ?? now())) / 60_000);
     const why = rs.lastError ?? (rs.stage === "confirm" ? "the fresh session is not started yet" : "");
     return min >= 1 || why ? `, for ${min} min${why ? `: ${why}` : ""}` : "";
@@ -188,6 +190,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,
+      ...(rs?.stage === "handoff" ? [`Standing jobs: ${rs.jobsPending ?? rs.handoff?.jobs.length ?? 0} awaiting verification`] : []),
       ...(Number(buffer.kvGet(K("skippedPosts")) ?? 0) ? [`Skipped posts (Discord refused them): ${buffer.kvGet(K("skippedPosts"))}`] : []),
       ...(notesRoot ? [`Archive export: ${pendingExports().length} pending${exportState.lastError ? `; last error: ${exportState.lastError}` : ""}`] : []),
       `Bot-to-bot messages since the last message from a person or talk-only member: ${exchangeCap > 0 ? `${n} of ${exchangeCap}` : `${n} (no cap)`}`].join("\n");
@@ -242,11 +245,67 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       saveReset(rs);
     }
     if (rs.stage === "wrapup" && buffer.batchOfMessage(conversationKey, rs.id) && quiet()) {
-      rs = { ...rs, stage: "archive", oldThread: threadId, oldTitle: buffer.kvGet(K("threadTitle")), newTitle: newThreadTitle() };
+      const jobs = (await t3.listStandingJobs()).filter((job) => job.boundThreadId === threadId)
+        .map(({ scheduledTaskId, enabled }) => ({ scheduledTaskId, enabled }));
+      const newTitle = newThreadTitle();
+      rs = { ...rs, stage: jobs.length ? "handoff" : "archive", oldThread: threadId, oldTitle: buffer.kvGet(K("threadTitle")), newTitle,
+        ...(jobs.length ? { handoff: { resetId: rs.id, oldThread: threadId, newTitle, jobs } } : {}) };
       saveReset(rs);
     }
-    if (rs.stage === "archive") {
-      try { await t3.archive(rs.oldThread!); } catch (e) {
+    const archivedHandoff = rs.stage === "handoff" && rs.handoffArchiveReady && read.thread?.archived === true;
+    if (rs.stage === "handoff" && !archivedHandoff) {
+      const handoff = rs.handoff!;
+      if (!handoff.replacement) {
+        handoff.replacement = await findOrLaunchThread(handoff.newTitle);
+        buffer.atomically(() => {
+          saveReset(rs!);
+          // Scheduled work may reach the replacement before it becomes the primary thread.
+          buffer.kvSet(K(`relayFrom:${handoff.replacement}`), "0");
+        });
+      }
+      if (!rs.handoffSent) {
+        await t3.send({ threadId: handoff.replacement, mode: "queue", ...handoffInput(conversationKey, handoff) });
+        saveReset({ ...rs, handoffSent: true });
+        return { done: { phase: "new" } };
+      }
+      let oldDrained = false;
+      if (quiet() && !(await t3.queue(threadId)).items.length) {
+        const latest = await t3.read(threadId);
+        queuePending(threadId, latest);
+        oldDrained = !isBusy(latest) && !buffer.outboxHead(conversationKey) && !relayCandidates(threadId, latest).length;
+      }
+      const jobs = await t3.listStandingJobs();
+      const byId = new Map(jobs.map((job) => [job.scheduledTaskId, job]));
+      const unverified = new Set(handoff.jobs.filter((job) => {
+        const current = byId.get(job.scheduledTaskId);
+        return current?.boundThreadId !== handoff.replacement || current?.enabled !== job.enabled;
+      }).map((job) => job.scheduledTaskId));
+      // Persist the next input and its sequence together, so a crash retries exactly the same follow-up.
+      const known = new Set(handoff.jobs.map((job) => job.scheduledTaskId));
+      const late = jobs.filter((job) => job.boundThreadId === threadId && !known.has(job.scheduledTaskId))
+        .map(({ scheduledTaskId, enabled }) => ({ scheduledTaskId, enabled }));
+      if (late.length) {
+        const followup = { number: (handoff.followup?.number ?? 0) + 1, jobs: late };
+        saveReset({ ...rs, handoff: { ...handoff, jobs: [...handoff.jobs, ...late], followup },
+          handoffSent: false, jobsPending: unverified.size + late.length });
+        return { done: { phase: "new" } };
+      }
+      if (rs.jobsPending !== unverified.size) {
+        rs = { ...rs, jobsPending: unverified.size };
+        saveReset(rs);
+      }
+      if (unverified.size || !oldDrained) return { done: { phase: "new" } };
+      // If archive succeeds and the process dies before promotion, recover from the confirmed archive
+      // without requiring the schedules to still have the same state they had before it.
+      if (!rs.handoffArchiveReady) {
+        rs = { ...rs, handoffArchiveReady: true };
+        saveReset(rs);
+      }
+    }
+    if (rs.stage === "archive" || rs.stage === "handoff") {
+      try {
+        if (!archivedHandoff) await t3.archive(rs.oldThread!);
+      } catch (e) {
         // t3 refuses a second archive of the same thread: after a crash between the call and the transaction below the
         // error is fine if the thread itself reads as archived (its error text is not relied on). Otherwise, or if the
         // read fails, the error stands: the binding stays and the next step retries.
@@ -260,8 +319,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         if (!list.some((a) => a.threadId === r.oldThread)) list.push({ threadId: r.oldThread!, title: r.oldTitle ?? null, resetMessageId: r.id });
         buffer.kvSet(K("archived"), JSON.stringify(list));
         buffer.kvSet(K("threadTitle"), r.newTitle!);
-        buffer.kvSet(K("fresh"), "1");
-        buffer.kvDelete(K("threadId"));
+        if (r.handoff?.replacement) buffer.kvSet(K("threadId"), r.handoff.replacement);
+        else {
+          buffer.kvSet(K("fresh"), "1");
+          buffer.kvDelete(K("threadId"));
+        }
         saveReset({ ...r, stage: "confirm" });
       });
       log.emit("bridge.session_archived", { bot: name, threadId: rs.oldThread, title: rs.oldTitle ?? null, resetMessageId: rs.id });
@@ -382,6 +444,14 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   async function ensureThread(): Promise<string> {
     const known = buffer.kvGet(K("threadId"));
     if (known) return known;
+    let title = buffer.kvGet(K("threadTitle"));
+    if (!title) { title = newThreadTitle(); buffer.kvSet(K("threadTitle"), title); }
+    const threadId = await findOrLaunchThread(title);
+    buffer.kvSet(K("threadId"), threadId);
+    return threadId;
+  }
+
+  async function findOrLaunchThread(title: string): Promise<string> {
     const blocked = buffer.kvGet(K("threadEscalated"));
     if (blocked) throw new Error(`thread escalated: ${blocked}`);
     const escalate = (why: string) => {
@@ -389,8 +459,6 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       log.emit("bridge.thread_escalated", { bot: name, why });
       return new Error(`thread escalated: ${why}`);
     };
-    let title = buffer.kvGet(K("threadTitle"));
-    if (!title) { title = newThreadTitle(); buffer.kvSet(K("threadTitle"), title); }
     const listed = await t3.findThreads({ projectId, title });
     if (listed.some((t) => typeof t?.title !== "string" || typeof t?.threadId !== "string" || !t.threadId)) throw escalate("thread list item without a string title/threadId; lookup cannot rule out an earlier launch");
     const found = listed.filter((t) => t.title === title);
@@ -400,7 +468,6 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       threadId = (await t3.launch({ projectId, title, modelSelection }))?.threadId;
       if (typeof threadId !== "string" || !threadId) throw escalate("launch answered without a threadId");
     }
-    buffer.kvSet(K("threadId"), threadId);
     log.emit("bridge.thread", { bot: name, threadId, adopted: Boolean(found[0]) });
     return threadId as string;
   }
@@ -701,14 +768,16 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return true;
   }
 
-  // A /new that is stuck in its archive or confirm stage (t3 refuses the archive, the fresh thread cannot be launched)
+  // A /new that is stuck in its handoff, archive or confirm stage
   // raises one stuck alert after RESET_STUCK_MS (kv `resetAlert` = the reset's id) and a follow-up, as a reply to it, once
   // that reset is gone. drain and wrapup wait for the agent's own turn, which the batch alerts already watch.
   function resetAlertPass(): void {
     const rs = resetState(), alerted = buffer.kvGet(K("resetAlert"));
-    if (rs && (rs.stage === "archive" || rs.stage === "confirm") && alerted !== rs.id && now() - (rs.stageSince ?? now()) >= RESET_STUCK_MS) {
+    if (rs && (rs.stage === "archive" || rs.stage === "confirm" || rs.stage === "handoff") && alerted !== rs.id && now() - (rs.stageSince ?? now()) >= RESET_STUCK_MS) {
+      const reason = rs.stage === "handoff" ? "waiting for the standing-job handoff and old session to settle"
+        : rs.stage === "archive" ? "the old session could not be archived" : "the fresh session could not be started";
       buffer.atomically(() => {
-        buffer.enqueue(conversationKey, { key: `ralert:${rs.id}`, nonce: `w${rs.id}`, content: `⚠️ Stuck, needs help: ${name}'s /new could not finish (${rs.stage === "archive" ? "the old session could not be archived" : "the fresh session could not be started"}). It keeps trying.` });
+        buffer.enqueue(conversationKey, { key: `ralert:${rs.id}`, nonce: `w${rs.id}`, content: `⚠️ Stuck, needs help: ${name}'s /new could not finish (${reason}). It keeps trying.` });
         buffer.kvSet(K("resetAlert"), rs.id);
       });
       log.emit("bridge.reset_stuck", { bot: name, stage: rs.stage });

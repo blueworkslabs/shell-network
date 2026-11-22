@@ -24,7 +24,7 @@ function world() {
   const discord = fakeDiscord({ channelId: CH, botUserId: BOT, now });
   const log = memoryLog();
   const w = {
-    path, t3, discord, log, buffer: null as unknown as Buffer, bot: null as unknown as ReturnType<typeof makeBot>,
+    path, t3, discord, log, advance: (ms: number) => { clock += ms; }, buffer: null as unknown as Buffer, bot: null as unknown as ReturnType<typeof makeBot>,
     start() {
       w.buffer = openTempBuffer(path, { now });
       t3.crash.buffer = w.buffer;
@@ -270,4 +270,92 @@ test("NEW PER CHANNEL: /new in one channel leaves the other channel's session al
   assert.notEqual(thread(A), ta);
   assert.equal(t3.sends().filter((s) => s.threadId === tb).length, 1, "B got nothing from A's /new");
   assert.equal(buffer.kvGet(`${conversationKeyFor("gem", B)}:reset`), null);
+});
+
+test("standing jobs survive /new across a crash during replacement launch and handoff", async () => {
+  const w = world();
+  const { t1 } = await toWrapup(w);
+  const recurring = { scheduledTaskId: "recurring-job", boundThreadId: t1, enabled: true, nextRunAt: "2030-01-01T09:00:00Z" };
+  const paused = { scheduledTaskId: "paused-job", boundThreadId: t1, enabled: false, nextRunAt: null };
+  w.t3.standingJobs.push(recurring, paused, { scheduledTaskId: "other-job", boundThreadId: "other", enabled: true });
+  w.finish(t1, "NO_REPLY");
+  w.t3.crash.launch = "after";
+  await assert.rejects(w.steps(5), /CRASH at launch/);
+  w.restart();
+  w.t3.crash.send = "after";
+  await assert.rejects(w.steps(5), /CRASH at send/);
+  w.restart();
+  const t2 = [...w.t3.threads.keys()].find((id) => id !== t1)!;
+  await w.steps(3);
+  assert.equal(w.t3.threads.size, 2);
+  const handoffs = w.t3.sends().filter((s) => s.threadId === t2);
+  assert.equal(new Set(handoffs.map((s) => s.clientRequestId)).size, 1);
+  assert.equal(w.t3.threads.get(t2)!.runs.length, 1);
+  assert.match(handoffs[0].message!, /recurring-job.*paused-job/);
+  assert.doesNotMatch(handoffs[0].message!, /other-job/);
+  assert.deepEqual(w.archives(), []);
+
+  // Verification checks enabled state and catches jobs added to the old thread after the snapshot.
+  recurring.boundThreadId = t2;
+  paused.boundThreadId = t2;
+  paused.enabled = true;
+  const late = { scheduledTaskId: "late-job", boundThreadId: t1, enabled: true };
+  w.t3.standingJobs.push(late);
+  w.finish(t2, "NO_REPLY");
+  await w.steps(1); // discover and persist the next handoff
+  w.t3.crash.send = "after";
+  await assert.rejects(w.steps(1), /CRASH at send/);
+  w.restart();
+  await w.steps(2);
+  const followups = w.t3.sends().filter((s) => s.threadId === t2 && s.clientRequestId !== handoffs[0].clientRequestId);
+  assert.equal(followups.length, 2);
+  assert.equal(followups[0].clientRequestId, followups[1].clientRequestId);
+  assert.equal(followups[0].message, followups[1].message);
+  assert.match(followups[0].message!, /late-job/);
+  assert.doesNotMatch(followups[0].message!, /recurring-job|paused-job|other-job/);
+  assert.equal(w.t3.threads.get(t2)!.runs.length, 2);
+  assert.match(await w.bot.status(), /2 awaiting verification/);
+  assert.deepEqual(w.archives(), []);
+  paused.enabled = false;
+  late.boundThreadId = t2;
+  w.finish(t2, "NO_REPLY");
+
+  // Work dispatched before rebind still completes and posts from the old thread.
+  const due = w.t3.wake(t1, { type: "user_message", text: "standing work already dispatched" });
+  await w.steps(2);
+  assert.deepEqual(w.archives(), []);
+  w.t3.complete(t1, due.runId, "old scheduled reply");
+  const next = w.t3.wake(t2, { type: "user_message", text: "scheduled work in replacement" });
+  w.t3.complete(t2, next.runId, "fresh scheduled reply");
+  w.t3.crash.archive = "after";
+  await assert.rejects(w.steps(5), /CRASH at archive|database is not open/);
+  w.restart();
+  await w.steps(5);
+  assert.deepEqual(w.archives(), [t1]);
+  assert.equal(w.thread(), t2);
+  assert.equal(w.confirmations().length, 1);
+  assert.equal(recurring.nextRunAt, "2030-01-01T09:00:00Z");
+  assert.equal(paused.enabled, false);
+  const posts = w.discord.botPosts().map((post) => post.content);
+  assert.equal(posts.filter((content) => content === "old scheduled reply").length, 1);
+  assert.equal(posts.filter((content) => content === "fresh scheduled reply").length, 1);
+});
+
+test("a skipped rebind keeps the reset pending and alerts once", async () => {
+  const w = world();
+  const { t1 } = await toWrapup(w);
+  w.t3.standingJobs.push({ scheduledTaskId: "private-id", boundThreadId: t1, enabled: true });
+  w.finish(t1, "NO_REPLY");
+  await w.steps(3);
+  const t2 = [...w.t3.threads.keys()].find((id) => id !== t1)!;
+  w.finish(t2, "NO_REPLY");
+  w.advance(10 * 60_000);
+  await w.steps(5);
+  const status = await w.bot.status();
+  assert.match(status, /pending.*handoff/);
+  assert.match(status, /1 awaiting verification/);
+  assert.doesNotMatch(status, /private-id/);
+  assert.deepEqual(w.archives(), []);
+  assert.equal(w.confirmations().length, 0);
+  assert.equal(w.discord.botPosts().filter((m) => m.content.includes("Stuck, needs help") && m.content.includes("standing-job")).length, 1);
 });

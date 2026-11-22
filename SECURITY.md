@@ -23,7 +23,10 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
     environment.
   - Bridge code reaches MCP only through a strict tool and argument allowlist (`lib/allowlist.ts`). The allowlist
     limits the code, not the token: the token itself can do more. The one write beyond send is `t3_thread_organize`
-    with action `archive` on the bot's own bound thread (`/new`); no other action, no other thread.
+    with action `archive` on the bot's own bound thread (`/new`). A pending schedule handoff allows launch
+    of the persisted replacement title in the configured project/provider and the current fixed, deduplicated
+    handoff input to its persisted thread ID. Schedule listing is read-only and scoped to the configured project. The
+    bridge uses only IDs, bindings and enabled states, and discards prompts and other schedule metadata.
   - Slash commands: the Discord client can manage only its own application's global commands (the id is read from
     Discord) and answer an interaction by its id and token (checked for format); an interaction is answered only if it
     comes from an allowlisted person in one of the bot's channels, otherwise with an ephemeral refusal. Interaction

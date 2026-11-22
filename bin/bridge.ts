@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import type { ScheduleHandoff } from "../lib/schedule-handoff.ts";
 // Bridge process for one bot (any crew bot, one process each, all on one buffer DB) in one or more Discord
 // channels, with one t3 thread per channel (conversation key `<bot>.<channel id>`, lib/bots.ts). Config from the
 // environment (all required unless noted); secrets are read from files, never from the environment or the command line.
@@ -126,6 +127,10 @@ for (const [i, channelId] of conversations.entries()) {
   const channelName = dm ? "dm" : await discord.getChannel(channelId).then((c) => c.name ?? channelId, () => channelId);
   // MCP allowlist: this project, this instance, this conversation's one thread (kv, set once launched/adopted)
   const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`),
+    handoff: () => {
+      const reset = JSON.parse(buffer.kvGet(`${conversationKey}:reset`) ?? "null") as { stage: string; handoff?: ScheduleHandoff; handoffSent?: boolean } | null;
+      return reset?.stage === "handoff" && reset.handoff ? { ...reset.handoff, conversationKey, sent: reset.handoffSent } : null;
+    },
     // the conversation's own archived threads (its /new ledger), readable for the export only
     // only with the export on (BRIDGE_NOTES_DIR): otherwise no archived thread is readable at all
     archivedThreads: () => (notesRoot ? (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) : []) };

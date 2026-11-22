@@ -23,14 +23,28 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
     } catch (e) {
       if (isTransportError(e)) {
         // an archive read's error may quote the conversation (an HTTP answer body): a fixed text for those
-        const quiet = label === "bridge-archive-read";
-        log.emit("bridge.mcp_reconnect", { tool: name, error: quiet ? "[archive read failed]" : errText(e) });
+        const quiet = label === "bridge-archive-read" || label === "bridge-schedule-list";
+        log.emit("bridge.mcp_reconnect", { tool: name, error: quiet ? (label === "bridge-archive-read" ? "[archive read failed]" : "[schedule list failed]") : errText(e) });
         await mcp.reconnect(sid).catch((r) => log.emit("mcp.reconnect_failed", { tool: name, error: quiet ? "[reconnect failed]" : errText(r) }));
       }
       throw e;
     }
   };
   return {
+    async listStandingJobs() {
+      const result = await call("list_scheduled_tasks", { projectId: policy.projectId }, "bridge-schedule-list")
+        .catch(() => { throw new Error("schedule list failed"); });
+      const tasks: unknown = result?.tasks;
+      if (!Array.isArray(tasks)) throw new Error("invalid schedule list");
+      const seen = new Set<string>();
+      return tasks.map((task) => {
+        if (task?.projectId !== policy.projectId || typeof task.scheduledTaskId !== "string" || !task.scheduledTaskId ||
+          (task.boundThreadId !== null && typeof task.boundThreadId !== "string") || typeof task.enabled !== "boolean" ||
+          seen.has(task.scheduledTaskId)) throw new Error("invalid schedule list");
+        seen.add(task.scheduledTaskId);
+        return { scheduledTaskId: task.scheduledTaskId, boundThreadId: task.boundThreadId, enabled: task.enabled };
+      });
+    },
     // No message: the thread is created idle and every input goes through the buffer as a queued send.
     launch: ({ projectId, title, modelSelection }: { projectId: string; title: string; modelSelection: ModelSelection }) => call("t3_thread_launch", { projectId, title, modelSelection }, "bridge-launch"),
     // Candidate threads for `title` as t3 lists them (titleContains is a case-insensitive substring filter), active
@@ -93,6 +107,9 @@ export function mcpCallLog(log: Log, keep: Set<string>): Log {
     if (d.label === "bridge-read") {
       if (e === "call.start") return;
       if (e === "call.end") return typeof d.ms === "number" && d.ms >= SLOW_POLL_MS ? log.emit(e, { ...d, result: size(d.result) }) : undefined;
+    }
+    if (d.label === "bridge-schedule-list" && (e === "call.end" || e === "call.error")) {
+      return log.emit(e, { tool: d.tool, label: d.label, ms: d.ms, ...(e === "call.error" ? { error: "[schedule list failed]" } : {}) });
     }
     if (d.label === "bridge-archive-read" && (e === "call.end" || e === "call.error")) return log.emit(e, { ...d, result: size(d.result), ...(d.error !== undefined ? { error: "[archive read failed]" } : {}) });
     return log.emit(e, e === "call.end" && !keep.has(d.tool as string) ? { ...d, result: size(d.result) } : d);

@@ -277,6 +277,12 @@ a timing SLA. No bridge code change was required.
   staged directories that no unsettled entry names and that are older than an hour. Without `DISCORD_TOOL_WORKSPACE`
   `files` is refused.
 
+## Log volume
+
+The bridge polls its thread every step. Those reads (`bridge-read`) are logged only when they fail (`call.error`) or are
+slow (`call.end` at or over 2 seconds, with its duration); a fast, successful poll writes nothing (#62). Every other MCP
+call is logged as before.
+
 ## Code layout
 
 - `bin/`: the processes.

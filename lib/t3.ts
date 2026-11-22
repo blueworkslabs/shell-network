@@ -84,9 +84,16 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
 // The MCP client logs every call. Read-type results are reduced to their size (the bridge reads the whole thread every
 // tick); `keep` names tools whose results stay in full as evidence (sends, launches). Archive reads (the export after
 // /new) carry conversation text in results and failures alike: sizes only, and a fixed text for a failure.
+// Polling reads (`bridge-read`, every step and page) are logged only when they fail or are slow (at or over
+// SLOW_POLL_MS): a fast, successful poll says nothing, and its start and end were nearly all of the log (#62).
+export const SLOW_POLL_MS = 2_000;
 export function mcpCallLog(log: Log, keep: Set<string>): Log {
   const size = (v: unknown) => `[${JSON.stringify(v ?? null).length} bytes]`;
   return { emit: (e, d = {}) => {
+    if (d.label === "bridge-read") {
+      if (e === "call.start") return;
+      if (e === "call.end") return typeof d.ms === "number" && d.ms >= SLOW_POLL_MS ? log.emit(e, { ...d, result: size(d.result) }) : undefined;
+    }
     if (d.label === "bridge-archive-read" && (e === "call.end" || e === "call.error")) return log.emit(e, { ...d, result: size(d.result), ...(d.error !== undefined ? { error: "[archive read failed]" } : {}) });
     return log.emit(e, e === "call.end" && !keep.has(d.tool as string) ? { ...d, result: size(d.result) } : d);
   } };

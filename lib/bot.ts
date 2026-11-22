@@ -23,7 +23,7 @@
 import { reconcileBatch, messageIdMatchesRequest, settlement } from "./reconcile.ts";
 import { readArchivedTranscript } from "./t3-transcript.ts";
 import { importTranscripts } from "./transcript-import.ts";
-import { attachmentLines, attachmentNames, readStaged, removeStaged, type StagedFile } from "./attachments.ts";
+import { attachmentLines, attachmentNames, readStaged, removeSaved, removeStaged, saveInbound, type FetchFile, type StagedFile } from "./attachments.ts";
 import { handoffInput, type ScheduleHandoff } from "./schedule-handoff.ts";
 import { errText } from "./log.ts";
 import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./stuck.ts";
@@ -58,6 +58,8 @@ export interface BotOptions {
   notesRoot?: string;
   // where the Discord tool stages the files of a tool post for this bridge to upload (lib/attachments.ts); none = tool posts with files are dropped
   attachmentsDir?: string;
+  // where images of accepted messages are saved for the agent to open (BRIDGE_WORKSPACE/.inbox, #59); none = links only
+  inboxDir?: string; fetchFile?: FetchFile;
 }
 
 const PART = 1900;
@@ -83,7 +85,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, dm = false, notesRoot }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, notesRoot }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -368,8 +370,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const withoutUser = String(msg.content ?? "").replace(mentionRe(), "");
     const stripped = (botRoleId ? withoutUser.replace(roleRe(), "") : withoutUser).trim();
     // files under the text, one line each (a mention with only files is not a bare mention)
-    const files = attachmentLines(msg.attachments);
-    if (!stripped && !files.length && fromBot && !talkOnly) return { accepted: false, reason: "empty after mention" };
+    if (!stripped && !attachmentLines(msg.attachments).length && fromBot && !talkOnly) return { accepted: false, reason: "empty after mention" };
+    const saved = inboxDir && msg.id ? await saveInbound({ atts: msg.attachments, messageId: msg.id, inboxDir, fetchFile }) : [];
+    for (const [i, s] of saved.entries()) if (s && "error" in s) log.emit("bridge.inbox_not_saved", { bot: name, sourceMessageId: msg.id, index: i, reason: s.error });
+    const files = attachmentLines(msg.attachments, saved);
     const text = [stripped || (files.length ? "" : BARE_MENTION_TEXT), ...files].filter(Boolean).join("\n");
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
@@ -380,6 +384,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         const bridgeBots = [name, ...allowedBots.filter((b) => !b.talkOnly).map((b) => b.name)].join(" and ");
         buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${b.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
         log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: b.count, cap: exchangeCap });
+        removeSaved(saved);
         return { accepted: false, reason: "exchange cap", wake: true };
       }
       r = b;

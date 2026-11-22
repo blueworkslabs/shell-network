@@ -18,6 +18,8 @@ import type { ScheduleHandoff } from "../lib/schedule-handoff.ts";
 //   BRIDGE_EXCHANGE_CAP      optional, bot-to-bot messages without a human message between (default 2, 0 = off)
 //   BRIDGE_NOTES_DIR         optional, absolute path of the bot's notes root (the Discord tool's DISCORD_TOOL_NOTES):
 //                            threads archived by /new are exported into its sessions/ (#50)
+//   BRIDGE_WORKSPACE         optional, absolute path of the agent's workspace (the Discord tool's DISCORD_TOOL_WORKSPACE):
+//                            images of accepted messages are saved into its .inbox/ for the agent to open (#59)
 //   BRIDGE_DM_USERS          optional, comma-separated user ids (each also in BRIDGE_ALLOWED_AUTHORS) whose DMs this bot
 //                            serves, each DM as its own conversation; other people's DMs are ignored and logged
 // Secret files must be the bridge user's own, without group/other bits, in such a directory (lib/preflight.ts).
@@ -30,7 +32,7 @@ import { acquireBotLock, LockHeldError, type BotLock } from "../lib/lock.ts";
 import { makeBot } from "../lib/bot.ts";
 import { discordRest, discordGateway } from "../lib/discord.ts";
 import { commandsHashKey, interactionDispatch, reconcileCommands } from "../lib/commands.ts";
-import { sweepStaging } from "../lib/attachments.ts";
+import { INBOX_KEEP_MS, sweepInbox, sweepStaging } from "../lib/attachments.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch } from "../lib/startup.ts";
@@ -99,6 +101,9 @@ await mcp.connect();
 const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
 const notesRoot = process.env.BRIDGE_NOTES_DIR || undefined;
 if (notesRoot !== undefined && (!notesRoot.startsWith("/") || !(() => { try { return lstatSync(notesRoot).isDirectory(); } catch { return false; } })())) { console.error("BRIDGE_NOTES_DIR: an absolute path of an existing directory (not a symlink)"); process.exit(2); }
+const workspace = process.env.BRIDGE_WORKSPACE || undefined;
+if (workspace !== undefined && (!workspace.startsWith("/") || !(() => { try { return lstatSync(workspace).isDirectory(); } catch { return false; } })())) { console.error("BRIDGE_WORKSPACE: an absolute path of an existing directory (not a symlink)"); process.exit(2); }
+const inboxDir = workspace ? join(workspace, ".inbox") : undefined;
 let dmUserIds: string[];
 try { dmUserIds = dmUsers(process.env.BRIDGE_DM_USERS, allowedAuthors); } catch (e) { console.error((e as Error).message); process.exit(2); }
 // writes: the bot's channels, its DM channels (opened below), and threads its tool created in a channel
@@ -119,6 +124,10 @@ const session = () => (gateway?.state.connected ? gateway.state.gen : null);
 const attachmentsDir = join(dirname(dbPath), "attachments");
 const swept = sweepStaging({ stagingDir: attachmentsDir, inUse: (id) => buffer.stagedInUse(id) });
 if (swept) log.emit("bridge.staging_swept", { removed: swept });
+// Saved images are kept INBOX_KEEP_MS (7 days), checked at start and hourly.
+const sweepImages = () => { if (inboxDir) { const removed = sweepInbox({ inboxDir }); if (removed) log.emit("bridge.inbox_swept", { removed, keepMs: INBOX_KEEP_MS }); } };
+sweepImages();
+setInterval(sweepImages, 3_600_000).unref();
 const bots: ReturnType<typeof makeBot>[] = [];
 for (const [i, channelId] of conversations.entries()) {
   const conversationKey = keys[i];
@@ -136,7 +145,7 @@ for (const [i, channelId] of conversations.entries()) {
     archivedThreads: () => (notesRoot ? (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) : []) };
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, dm, notesRoot,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, inboxDir, dm, notesRoot,
     buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
 }

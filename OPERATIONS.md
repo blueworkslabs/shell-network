@@ -165,6 +165,9 @@ other operators' changes; revert only this release's fields if any were changed.
 - For an attachment-capable release, add `DISCORD_TOOL_WORKSPACE` to each server's
   env using that bot's own workspace (`~/work/crew/gem` or `~/work/crew/hermes`,
   expanded to an absolute path). Do not share a parent workspace between bots.
+- For inbound images (#59), set `BRIDGE_WORKSPACE` in each bridge's environment to the same path as that bot's
+  `DISCORD_TOOL_WORKSPACE`. Images land in `<workspace>/.inbox/` and are removed after 7 days. Remove the variable and
+  restart the bridge to roll back (lines go back to links only); `.inbox/` can then be deleted.
 - Back up each changed file, repin only those fields, and record old/new values.
   A bridge restart does **not** reload an already-running provider's MCP server.
   Let active work finish; use an agreed fresh provider session and verify MCP startup

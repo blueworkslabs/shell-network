@@ -478,7 +478,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const stripped = (botRoleId ? withoutUser.replace(roleRe(), "") : withoutUser).trim();
     // The agent reads its own mention (user or role) as its name: a message naming it together with others is
     // visibly addressed to it too (#75). Only the emptiness checks use the text without it.
-    const named = (botRoleId ? content.replace(roleRe(), `@${name}`) : content).replace(mentionRe(), `@${name}`).trim();
+    const named = (botRoleId ? content.replace(roleRe(), () => `@${name}`) : content).replace(mentionRe(), () => `@${name}`).trim();
     // files under the text, one line each (a mention with only files is not a bare mention)
     if (!stripped && !attachmentLines(msg.attachments).length && fromBot && !talkOnly) return { accepted: false, reason: "empty after mention" };
     const saved = inboxDir && msg.id ? await saveInbound({ atts: msg.attachments, messageId: msg.id, inboxDir, fetchFile }) : [];

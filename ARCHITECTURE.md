@@ -33,7 +33,8 @@ schema change before the trial verdict means a fresh DB.
    allowlisted person or an allowed bot. The bridge commits it to `inbound`, and only then acknowledges it with a
    reaction. Lost acknowledgements are redone. Everything else is dropped before the buffer. A person's bare mention
    (no text) counts as "go on": the batch carries an explicit bridge note instead of invented text. A bot's bare
-   mention is still dropped.
+   mention is still dropped. In the text the agent reads, its own mention (user or managed role) appears as its
+   name (`@Gem`), so a message that names several bots is visibly addressed to each of them (#75).
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before

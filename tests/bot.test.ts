@@ -82,6 +82,15 @@ test("NEG accept: other channels, bot authors and messages without a mention are
   assert.equal(w.discord.reactions.length, 0);
 });
 
+test("OWN MENTION (#75): named together with others, the bot reads its own mention as its name, wherever it stands; the others stay as they are", async () => {
+  const w = world();
+  const together = w.discord.userSays(`<@111> <@${BOT}> <@!${BOT}> <@222> which of you can check the logs?`, { mention: false });
+  together.mentions = [{ id: "111" }, { id: BOT }, { id: "222" }];
+  await w.bot.accept(together);
+  await w.say("only me");
+  assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["<@111> @Gem @Gem <@222> which of you can check the logs?", "@Gem only me"]);
+});
+
 test("BARE MENTION: a person's mention without text is accepted as the explicit bridge note (no invented user text) and sent", async () => {
   const w = world();
   assert.deepEqual(await w.say(""), { accepted: true, inserted: true });
@@ -90,9 +99,9 @@ test("BARE MENTION: a person's mention without text is accepted as the explicit 
   assert.equal(w.discord.reactions.length, 2, "acked like any accepted input");
   await w.bot.step();
   assert.ok(w.runs().at(-1)!.text.includes(`user1: ${BARE_MENTION_TEXT}`), w.runs().at(-1)!.text);
-  // control: a mention with text keeps exactly its text
+  // control: a mention with text keeps its text, the bot's own mention read as its name (#75)
   await w.say("real words");
-  assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["real words"]);
+  assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["@Gem real words"]);
 });
 
 test("ACCEPT burst: 10 messages during a running turn -> exactly one follow-up turn, all 10 covered, no steer", async () => {
@@ -551,7 +560,7 @@ test("SENDER: only allowlisted senders get in; another human's mention is droppe
   assert.deepEqual(await w.say("from the user"), { accepted: true, inserted: true }); // control
   const r = await w.say("from someone else", { author: "stranger" });
   assert.deepEqual(r, { accepted: false, reason: "sender not allowed" });
-  assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["from the user"]);
+  assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["@Gem from the user"]);
   assert.equal(w.discord.reactions.length, 1, "no reaction for the dropped message");
 });
 
@@ -974,7 +983,7 @@ test("MANAGED ROLE: startup discovers its role by bot_id; own role reaches the b
   assert.equal((await w.say(`<@&${OWN_ROLE}> unknown bot`, { mention: false, mentionRoles: [OWN_ROLE], bot: true })).reason, "bot author");
   assert.deepEqual(await w.say(`<@&${OWN_ROLE}> role job`, { mention: false, mentionRoles: [OWN_ROLE] }), { accepted: true, inserted: true });
   await w.bot.step();
-  assert.match(w.runs().at(-1)!.text, /user1: role job/);
+  assert.match(w.runs().at(-1)!.text, /user1: @Gem role job/);
   assert.ok(!w.runs().at(-1)!.text.includes(`<@&${OWN_ROLE}>`));
 });
 
@@ -1003,5 +1012,5 @@ test("MANAGED ROLE: history catch-up accepts a missed role-only mention", async 
   const { w } = await roleWorld();
   w.discord.userSays(`<@&${OWN_ROLE}> missed role job`, { mention: false, mentionRoles: [OWN_ROLE] });
   await w.bot.step();
-  assert.match(w.runs().at(-1)!.text, /user1: missed role job/);
+  assert.match(w.runs().at(-1)!.text, /user1: @Gem missed role job/);
 });

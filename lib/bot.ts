@@ -473,14 +473,18 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const mentioned = (dm && !fromBot) || Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
     if (!mentioned) return { accepted: false, reason: "no mention" };
     // A person or talk-only member can resume with a bare mention; bridge-run bots cannot.
-    const withoutUser = String(msg.content ?? "").replace(mentionRe(), "");
+    const content = String(msg.content ?? "");
+    const withoutUser = content.replace(mentionRe(), "");
     const stripped = (botRoleId ? withoutUser.replace(roleRe(), "") : withoutUser).trim();
+    // The agent reads its own mention (user or role) as its name: a message naming it together with others is
+    // visibly addressed to it too (#75). Only the emptiness checks use the text without it.
+    const named = (botRoleId ? content.replace(roleRe(), () => `@${name}`) : content).replace(mentionRe(), () => `@${name}`).trim();
     // files under the text, one line each (a mention with only files is not a bare mention)
     if (!stripped && !attachmentLines(msg.attachments).length && fromBot && !talkOnly) return { accepted: false, reason: "empty after mention" };
     const saved = inboxDir && msg.id ? await saveInbound({ atts: msg.attachments, messageId: msg.id, inboxDir, fetchFile }) : [];
     for (const [i, s] of saved.entries()) if (s && "error" in s) log.emit("bridge.inbox_not_saved", { bot: name, sourceMessageId: msg.id, index: i, reason: s.error });
     const files = attachmentLines(msg.attachments, saved);
-    const text = [stripped || (files.length ? "" : BARE_MENTION_TEXT), ...files].filter(Boolean).join("\n");
+    const text = [stripped ? named : files.length ? "" : BARE_MENTION_TEXT, ...files].filter(Boolean).join("\n");
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
     if (crewBot && !talkOnly) {

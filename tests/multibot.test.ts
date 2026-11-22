@@ -43,8 +43,8 @@ test("TWO BOTS, ONE DB: each bridge takes only mentions of its own bot, into its
   const toGem = w.say("hi gem", "gem-user");
   const toHermes = w.say("hi hermes", "hermes-user");
   for (const m of [toGem, toHermes]) { await w.gem.bot.accept(m); await w.hermes.bot.accept(m); }
-  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => r.text), ["hi gem"]);
-  assert.deepEqual(w.gem.buffer.buffered("hermes").map((r) => r.text), ["hi hermes"]);
+  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => r.text), ["@Gem hi gem"]);
+  assert.deepEqual(w.gem.buffer.buffered("hermes").map((r) => r.text), ["@Hermes hi hermes"]);
   await w.gem.bot.step();
   await w.hermes.bot.step();
   const gemThread = w.gem.buffer.kvGet("gem:threadId")!, hermesThread = w.gem.buffer.kvGet("hermes:threadId")!;

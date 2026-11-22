@@ -593,7 +593,7 @@ test("THREADS: close -> restart -> reopen purges stale buffered input, pending e
   assert.deepEqual(contents, ["first post", "fresh reopened answer"]);
 });
 
-test("THREADS: closing a thread with enabled and paused standing jobs holds archive and surfaces redacted parent /status warning only (no parent notice, no automatic move)", async () => {
+test("THREADS: closing a thread with enabled and paused standing jobs holds archive and surfaces redacted parent /status + one redacted parent notice (no automatic move)", async () => {
   const notesRoot = tempDir("thread-jobs-notes-");
   const w = world({ notesRoot });
   const thId = "200000000000000071";
@@ -618,12 +618,16 @@ test("THREADS: closing a thread with enabled and paused standing jobs holds arch
   assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "fails closed when listStandingJobs errors");
   w.t3.listStandingJobs = origList;
 
-  // Step again: discovers both jobs, holds archive, posts NO parent-channel notice, surfaces redacted parent /status warning,
+  // Step again: discovers both jobs, holds archive, posts one redacted parent notice, surfaces redacted parent /status warning,
   // and does NOT automatically move jobs or send any handoff to the parent session
   await w.steps(3);
   assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "holds archive while enabled + paused jobs remain bound");
   assert.equal(w.t3.sends().some((s) => s.clientRequestId?.includes("schedule-handoff")), false, "no automatic job handoff to parent");
-  assert.equal(w.discord.botPosts(PARENT_CH).length, 0, "no parent-channel notice posted (/status only)");
+
+  const notices = w.discord.botPosts(PARENT_CH).filter((m) => m.content.includes("scheduled job"));
+  assert.equal(notices.length, 1, "one redacted notice posted in parent channel");
+  assert.match(notices[0].content, /a private thread closed with 2 scheduled jobs \(1 active, 1 paused\)/);
+  assert.doesNotMatch(notices[0].content, /secret-job-thread|job-active|job-paused/);
 
   // Parent /status surfaces the redacted warning even though the Discord thread is already archived
   await w.runCmd("status", PARENT_CH);
@@ -632,8 +636,10 @@ test("THREADS: closing a thread with enabled and paused standing jobs holds arch
   assert.match(statusReply, /Warning: 1 closed thread still has 2 scheduled jobs/);
   assert.doesNotMatch(statusReply, /secret-job-thread|job-active|job-paused/);
 
-  // Even after restart, the redacted /status warning persists while jobs remain bound
+  // Even after restart, the redacted /status warning persists while jobs remain bound (and notice is not repeated)
   w.restart();
+  await w.steps(2);
+  assert.equal(w.discord.botPosts(PARENT_CH).filter((m) => m.content.includes("scheduled job")).length, 1, "notice is not repeated after restart");
   await w.runCmd("status", PARENT_CH);
   assert.match(w.ixCalls.at(-1)!, /Warning: 1 closed thread still has 2 scheduled jobs/);
 
@@ -649,7 +655,7 @@ test("THREADS: closing a thread with enabled and paused standing jobs holds arch
   assert.doesNotMatch(w.ixCalls.at(-1)!, /Warning: .*scheduled job/);
 });
 
-test("THREADS: closing a legacy discord_thread rejects new tool writes and settles queued parent outbox entries so the next parent post goes through", async () => {
+test("THREADS: closing a legacy discord_thread rejects new tool writes and settles queued parent outbox entries (including posting rows before history recovery) so the next parent post goes through", async () => {
   const w = world();
   const parentKey = conversationKeyFor("gem", PARENT_CH);
   const tools = w.tools();
@@ -657,6 +663,7 @@ test("THREADS: closing a legacy discord_thread rejects new tool writes and settl
   // Enforce the same strict REST write guard as bin/bridge.ts (throws without HTTP status if denied)
   const origCreate = w.discord.createMessage.bind(w.discord);
   const origEdit = w.discord.editMessage.bind(w.discord);
+  const origMessagesAfter = w.discord.messagesAfter.bind(w.discord);
   const checkWrite = (ch: string) => {
     if (ch !== PARENT_CH && !w.threads.isAllowedWrite(ch, w.buffer.isToolThread(parentKey, ch))) {
       throw new Error(`channel ${ch} is not allowed`);
@@ -687,14 +694,19 @@ test("THREADS: closing a legacy discord_thread rejects new tool writes and settl
   w.buffer.enqueue(parentKey, { key: "tool:posting-stale", content: "posting send to closed thread", nonce: "ps1", state: "posting", boundary: postedInThread[0].id, meta: { channel: toolTh, thread: 1 } });
   tools.send({ channel: PARENT_CH, content: "next parent post goes through", idempotency_key: "parent-after-1" });
 
-  // Archive the legacy thread before draining
+  // Archive the legacy thread before draining; also make messagesAfter on the closed thread fail with 500
+  // to prove `posting` rows settle before channel-history recovery can stall.
   await w.dispatch("THREAD_UPDATE", { id: toolTh, parent_id: PARENT_CH, name: "legacy-tool-thread", type: 11, thread_metadata: { archived: true } });
+  w.discord.messagesAfter = async (ch, afterId, limit) => {
+    if (ch === toolTh) throw Object.assign(new Error("should not scan history of revoked thread"), { status: 500 });
+    return origMessagesAfter(ch, afterId, limit);
+  };
 
   // New tool calls targeting the closed thread are rejected immediately at tool admission
   assert.throws(() => tools.send({ channel: toolTh, content: "new send after close", idempotency_key: "lt-send-2" }), /not allowed/);
   assert.throws(() => tools.edit({ channel: toolTh, ref: firstRef, content: "new edit after close", idempotency_key: "lt-edit-2" }), /not allowed/);
 
-  // Draining the parent outbox settles/drops every queued write to the closed thread without stalling,
+  // Draining the parent outbox settles/drops every queued write to the closed thread without touching its history or stalling,
   // and delivers the subsequent parent post cleanly
   await w.steps(3);
   assert.equal(w.discord.botPosts(toolTh).length, 1, "no queued posts reached the closed thread");

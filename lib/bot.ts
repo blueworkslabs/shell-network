@@ -853,14 +853,17 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const replyTo = resolveReplyTo(h);
       const target = targetOf(h);
       if (h.state === "posting") {
-        let r: Found;
-        try {
-          r = await searchOwnPost(K(`outboxSearch:${h.id}`), h.boundary!, h.content, replyTo, target, toolFiles(h).map((f) => f.name));
-        } catch (e) {
-          const st = errStatus(e)?.status;
-          if (target !== channelId && !buffer.isToolThread(conversationKey, target) && (st === 403 || st === 404)) r = { status: "absent" };
-          else throw e;
+        // Never stall the parent outbox in channel-history recovery for a revoked/closed thread target.
+        if (target !== channelId && !buffer.isToolThread(conversationKey, target)) {
+          buffer.atomically(() => {
+            buffer.outboxPending(h.id);
+            buffer.kvDelete(K(`outboxSearch:${h.id}`));
+            buffer.kvDelete(K(`outboxEnd:${h.id}`));
+          });
+          rejectTool(h, "channel not allowed");
+          continue;
         }
+        const r = await searchOwnPost(K(`outboxSearch:${h.id}`), h.boundary!, h.content, replyTo, target, toolFiles(h).map((f) => f.name));
         if (r.status === "unknown") { log.emit("bridge.outbox_search_incomplete", { bot: name, key: h.key }); return false; }
         if (r.status === "found") {
           buffer.outboxPosted(h.id, r.message.id, () => onPosted(h, r.message.id));
@@ -1266,14 +1269,23 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     }
     if (isBusy(read)) return { phase: "closing" };
     // Standing scheduled jobs (enabled and paused) bound to this thread's t3 session must not be lost or silently
-    // redirected when the thread closes: fail closed if inventory fails, hold archive, and persist a redacted warning
-    // for parent `/status` until a person moves or deletes them.
+    // redirected when the thread closes: fail closed if inventory fails, hold archive, persist a redacted warning for
+    // parent `/status`, and post one redacted notice in the parent channel until a person moves or deletes them.
     const boundJobs = (await t3.listStandingJobs()).filter((j) => j.boundThreadId === bound);
     if (boundJobs.length > 0) {
       const activeJobs = boundJobs.filter((j) => j.enabled).length;
       const pausedJobs = boundJobs.length - activeJobs;
+      const parentKey = threadContext ? `${conversationKey.slice(0, conversationKey.indexOf("."))}.${threadContext.parentId}` : null;
+      const label = threadContext?.isPrivate ? "a private thread" : `thread "${threadContext?.threadName ?? channelId}"`;
       const prev = buffer.kvGet(K("closeJobs"));
-      buffer.kvSet(K("closeJobs"), JSON.stringify({ count: boundJobs.length, active: activeJobs, paused: pausedJobs }));
+      buffer.atomically(() => {
+        buffer.kvSet(K("closeJobs"), JSON.stringify({ count: boundJobs.length, active: activeJobs, paused: pausedJobs }));
+        if (parentKey && threadContext) {
+          buffer.addNotice(`thread-jobs:${channelId}:${bound}`,
+            `⚠️ ${name}: ${label} closed with ${boundJobs.length} scheduled job${boundJobs.length === 1 ? "" : "s"} (${activeJobs} active, ${pausedJobs} paused). Holding session archive until a person moves or deletes ${boundJobs.length === 1 ? "it" : "them"}.`,
+            parentKey);
+        }
+      });
       if (!prev) log.emit("bridge.thread_close_held_jobs", { bot: name, discordThreadId: channelId, threadId: bound, count: boundJobs.length, active: activeJobs, paused: pausedJobs });
       return { phase: "closing" };
     }

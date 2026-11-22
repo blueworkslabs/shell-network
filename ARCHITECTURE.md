@@ -193,7 +193,7 @@ channels are ignored.
   new tool requests and settling any queued parent-outbox writes to the closed thread so later parent posts proceed),
   stops accepting new input, waits for any running t3 turn to settle, checks for bound standing scheduled jobs (enabled
   and paused, failing closed on error; if any remain, holds archiving and surfaces a redacted warning in parent
-  `/status` until a person moves or deletes them), archives the t3 session, purges leftover buffered input and
+  `/status` plus one redacted notice in the parent channel until a person moves or deletes them), archives the t3 session, purges leftover buffered input and
   pending/posting outbox rows so reopening cannot replay stale work, exports to `sessions/` (same as `/new`), and frees
   the slot. The existing per-conversation MCP allowlist needs no wider grant.
 

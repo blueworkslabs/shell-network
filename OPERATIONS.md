@@ -256,3 +256,12 @@ A dry run on synthetic logs verified recent-line retention, inode preservation,
 private rotation permissions, generation retention and the aggregate budget.
 Disabling the timer stops future pruning; already-expired log content cannot be
 restored. Roll back service overrides independently of the bridge code.
+
+## PR lookup warning
+
+On t3 0.1.11, Git status polling can log `PR lookup failed.` with
+`provider: unknown` and `No unknown source control provider is registered.`
+That combination means t3 could not find a supported hosting provider for the
+checkout's remote. The lookup falls back to cached PR information or no PR
+information, and Git status and Discord bridge delivery continue. No operator
+action is needed for this warning alone.

@@ -153,6 +153,47 @@ test("TOOL EDIT collapse: edits of one message queued faster than they go out se
   assert.equal(w.buffer.outboxEntry(key, tampered)!.state, "dropped");
 });
 
+test("TOOL EDIT refused: an edit Discord refuses (403) is retried a bounded number of times, then dropped with a notice, and the next post goes out", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const sent = ref(w.tools().send({ channel: CH, content: "progress", idempotency_key: "p1" }));
+  await w.steps(1);
+  const e = ref(w.tools().edit({ channel: CH, ref: sent, content: "progress 2", idempotency_key: "e1" }));
+  const next = ref(w.tools().send({ channel: CH, content: "next post", idempotency_key: "p2" }));
+  const real = w.discord.editMessage;
+  let tries = 0;
+  w.discord.editMessage = async () => { tries++; throw Object.assign(new Error("Missing Permissions"), { status: 403, code: 50013 }); };
+  await w.steps(5);
+  w.discord.editMessage = real;
+  assert.equal(tries, 3, "bounded: REFUSE_LIMIT tries");
+  assert.equal(w.buffer.outboxEntry(key, e)!.state, "dropped");
+  assert.equal(w.buffer.outboxEntry(key, next)!.state, "posted", "the queue moves on");
+  assert.ok(w.discord.botPosts().some((m) => /could not update one of its messages/.test(m.content)), "one notice says so");
+});
+
+test("TOOL EDIT collapse across ref and message id, and after a throttled attempt: only the latest text goes out; replaying an older request does not bring its text back", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const t = w.tools();
+  const sent = ref(t.send({ channel: CH, content: "build: start", idempotency_key: "p1" }));
+  await w.steps(1);
+  const msgId = w.buffer.outboxEntry(key, sent)!.channel_message_id!;
+  const first = ref(t.edit({ channel: CH, ref: sent, content: "build: 1/3", idempotency_key: "e1" }));
+  const real = w.discord.editMessage;
+  w.discord.editMessage = async () => { throw Object.assign(new Error("You are being rate limited."), { status: 429 }); };
+  await assert.rejects(w.bot.step(), /rate limited/);
+  w.discord.editMessage = real;
+  assert.equal(w.buffer.outboxEntry(key, first)!.state, "posting", "throttled: attempted, not settled");
+  ref(t.edit({ channel: CH, message_id: msgId, content: "build: 2/3", idempotency_key: "e2" }));
+  ref(t.edit({ channel: CH, ref: sent, content: "build: 3/3", idempotency_key: "e3" }));
+  await w.steps(1);
+  assert.deepEqual(w.discord.writes.filter((x) => x.kind === "edit").map((x) => x.payload!.content), ["build: 3/3"], "the throttled text is not repeated; only the latest goes out");
+  const replay = t.edit({ channel: CH, ref: sent, content: "build: 1/3", idempotency_key: "e1" }).structuredContent as { status: string; replay?: boolean };
+  assert.deepEqual([replay.status, replay.replay], ["done", true]);
+  await w.steps(1);
+  assert.equal(w.discord.messages.find((m) => m.id === msgId)!.content, "build: 3/3", "a replay queues nothing");
+});
+
 test("TOOL EDIT re-check: an entry tampered with after the tool queued it (another author's message, an added mention) is dropped, nothing is edited", async () => {
   const w = world();
   const key = conversationKeyFor("gem", CH);

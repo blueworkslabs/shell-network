@@ -626,29 +626,34 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       : mentionsIn(h.content).some((u) => !mentionsIn(post.content).includes(u)) ? "an edit cannot add mentions" : null;
     return why ? { why } : { messageId: id! };
   }
-  async function applyEdit(h: OutboxRow): Promise<void> {
+  // Returns false when the drain should stop for this step (a refusal under REFUSE_LIMIT).
+  async function applyEdit(h: OutboxRow): Promise<boolean> {
     const place = editPlace(h);
     let messageId = h.boundary ?? "";
     if (h.state === "pending") {
       const c = editCheck(h);
-      if ("why" in c) return rejectTool(h, c.why);
+      if ("why" in c) { rejectTool(h, c.why); return true; }
       messageId = c.messageId;
-      const newer = buffer.pendingEditsAfter(conversationKey, h.id).find((n) => { const d = editCheck(n); return "messageId" in d && d.messageId === messageId && editPlace(n) === place; });
-      if (newer) {
-        buffer.outboxApplied(h.id);
-        log.emit("bridge.tool_edit_superseded", { bot: name, key: h.key, by: newer.key, messageId });
-        return;
-      }
-      buffer.outboxPosting(h.id, messageId);
     }
+    // also for an attempted one (`posting`, e.g. throttled): the newer text replaces it anyway, so it is not repeated
+    const newer = buffer.pendingEditsAfter(conversationKey, h.id).find((n) => { const d = editCheck(n); return "messageId" in d && d.messageId === messageId && editPlace(n) === place; });
+    if (newer) {
+      buffer.outboxApplied(h.id);
+      log.emit("bridge.tool_edit_superseded", { bot: name, key: h.key, by: newer.key, messageId });
+      return true;
+    }
+    if (h.state === "pending") buffer.outboxPosting(h.id, messageId);
     try {
       await discord.editMessage(place, messageId, { content: h.content, allowed_mentions: { parse: [] } });
     } catch (e) {
-      if (errStatus(e)?.status === 404) { buffer.outboxPending(h.id); return rejectTool(h, "target deleted"); }
-      throw e;
+      const status = errStatus(e)?.status;
+      if (status === 404) { buffer.outboxPending(h.id); rejectTool(h, "target deleted"); return true; }
+      if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: repeated (or superseded) next step
+      return countRefusal(h, status) >= REFUSE_LIMIT; // Discord refused it: counted, and dropped at the limit so the queue moves on
     }
     buffer.atomically(() => { buffer.outboxApplied(h.id); if (state.botUserId) buffer.editChannelMessage(messageId, state.botUserId, h.content); });
     log.emit("bridge.tool_edited", { bot: name, key: h.key, messageId, ...(h.state === "posting" ? { recovered: true } : {}) });
+    return true;
   }
   function staleAlert(h: OutboxRow): boolean {
     const [kind, a, b] = h.key.split(":");
@@ -670,7 +675,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (!h) return true;
       if (h.key.startsWith("react:")) { await applyReaction(h); continue; }
       if (h.key.startsWith("thread:")) { await applyThread(h); continue; }
-      if (h.key.startsWith("edit:")) { await applyEdit(h); continue; }
+      if (h.key.startsWith("edit:")) { if (await applyEdit(h)) continue; return false; }
       const replyTo = resolveReplyTo(h);
       const target = targetOf(h);
       if (h.state === "posting") {
@@ -709,20 +714,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       } catch (e) {
         const status = errStatus(e)?.status;
         if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: a post may exist; recovery decides
-        // Discord refused the request: nothing was created. Back to pending with the refusal counted, and after
-        // REFUSE_LIMIT refusals dropped, all in one transaction: a restart can neither lose a refusal nor post again.
-        const n = buffer.atomically(() => {
-          buffer.outboxPending(h.id);
-          buffer.kvDelete(K(`outboxEnd:${h.id}`));
-          const count = Number(buffer.kvGet(K(`outboxRefused:${h.id}`)) ?? 0) + 1;
-          buffer.kvSet(K(`outboxRefused:${h.id}`), String(count));
-          if (count >= REFUSE_LIMIT) dropRefused(h);
-          return count;
-        });
-        log.emit("bridge.outbox_refused", { bot: name, key: h.key, status, attempts: n });
-        if (n < REFUSE_LIMIT) return false; // the next step tries again; nothing behind it goes out meanwhile
+        if (countRefusal(h, status) < REFUSE_LIMIT) return false; // the next step tries again; nothing behind it goes out meanwhile
         unstage(h);
-        log.emit("bridge.outbox_dropped", { bot: name, key: h.key });
         continue;
       }
       buffer.outboxPosted(h.id, m.id, () => onPosted(h, m.id));
@@ -731,6 +724,21 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     }
   }
 
+  // Discord refused the request: nothing was created (or changed). Back to pending with the refusal counted, and after
+  // REFUSE_LIMIT refusals dropped, all in one transaction: a restart can neither lose a refusal nor post again.
+  function countRefusal(h: OutboxRow, status: number): number {
+    const n = buffer.atomically(() => {
+      buffer.outboxPending(h.id);
+      buffer.kvDelete(K(`outboxEnd:${h.id}`));
+      const count = Number(buffer.kvGet(K(`outboxRefused:${h.id}`)) ?? 0) + 1;
+      buffer.kvSet(K(`outboxRefused:${h.id}`), String(count));
+      if (count >= REFUSE_LIMIT) dropRefused(h);
+      return count;
+    });
+    log.emit("bridge.outbox_refused", { bot: name, key: h.key, status, attempts: n });
+    if (n >= REFUSE_LIMIT) log.emit("bridge.outbox_dropped", { bot: name, key: h.key });
+    return n;
+  }
   // A post Discord refused REFUSE_LIMIT times (a missing permission, a file the channel does not allow, a message it
   // rejects) is dropped so the queue moves on. What waited for it is closed (a reply counts as answered with nothing
   // posted, a relay as empty), and one notice says so in the channel, without ids or the error. A refused notice or alert
@@ -746,7 +754,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       else if (kind === "relay") buffer.recordRelayPart(Number(a), Number(b), parts, `refused:${h.id}`);
       if (!["notice", "alert", "clear", "talert", "tclear", "refused", "ralert", "rclear"].includes(kind)) {
         buffer.enqueue(conversationKey, { key: `refused:${h.id}`, nonce: `f${h.id}`,
-          content: `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
+          content: kind === "edit" ? `⚠️ ${name} could not update one of its messages here: Discord refused the edit. It was skipped so later messages can go out.`
+            : `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
       }
       buffer.kvDelete(K(`outboxRefused:${h.id}`));
       // counted for /status too, so a skip stays visible when the channel refuses the notice as well

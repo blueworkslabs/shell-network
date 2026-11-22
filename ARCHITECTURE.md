@@ -269,9 +269,11 @@ a timing SLA. No bridge code change was required.
   thread): a tool send by its `ref`, also while it is still queued (the edit waits behind it in the outbox), or any of
   its posts by message id. An edit pings nobody (`allowed_mentions` empty) and may name only crew bots the post already
   named, so it never hands work over or uses the cap. The bridge checks again before the PATCH; the PATCH is
-  idempotent, so a crash repeats it. A deleted target drops the edit. The channel log gets the new text. Edits of
-  one message queued faster than they go out collapse: a pending edit followed by a newer valid edit of the same
-  message is marked done without a PATCH, so only the latest text is sent (fewer edits, less 429 throttling).
+  idempotent, so a crash repeats it. A deleted target drops the edit; an edit Discord refuses (400, 403, 413) is
+  counted and dropped after three refusals with one notice, like a refused post, so the queue moves on. The channel
+  log gets the new text. Edits of one message queued faster than they go out collapse, whether they name it by `ref`
+  or by message id: an edit (pending, or attempted and not settled, e.g. throttled) followed by a newer valid edit of
+  the same message is marked done without a PATCH, so only the latest text is sent.
 - `discord_read` reads only the named channel's log, with no network access.
 - **Files** (`lib/attachments.ts`). *Inbound:* each attachment of an accepted message is described under its text, one
   line each: `[attachment: name (type, size) url]`. The name and type are made harmless, the URL is kept only on Discord's

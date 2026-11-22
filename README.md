@@ -18,7 +18,7 @@ model and the known limits.
   be imported.
 - **Conversation history.** `/new` starts a fresh session and archives the old one into the agent's searchable history
   automatically when archive export and memory search are configured.
-- **Discord-native.** One conversation per channel, DMs from allowed people, slash commands (`/new`, `/status`), file
+- **Discord-native.** One conversation per channel, DMs from allowed people, slash commands (`/new`, `/status`, `/stop`), file
   attachments both ways, and a Discord tool the agent can use to post, react, open threads and read.
 - **Crews.** Several agents in one channel can hand work to each other by mention, with a cap that pauses bot-to-bot
   loops until a person speaks.

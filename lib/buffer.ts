@@ -437,6 +437,17 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     cancel(batchId: number, { by, note }: { by: string; note: string }) {
       return endEscalated("cancel", "cancelled", batchId, by, note);
     },
+    // Explicit end of an open batch whose running turn was interrupted by a person's `/stop` command.
+    cancelStopped(batchId: number, { by, note }: { by: string; note: string }) {
+      if (typeof by !== "string" || !by || typeof note !== "string" || !note) throw new Error("cancelStopped: by and note required");
+      return tx(() => {
+        const b = getBatch.get(batchId);
+        if (!b) throw new Error(`cancelStopped: no batch ${batchId}`);
+        if (b.status === "delivered" || b.status === "resolved" || b.status === "cancelled") throw new Error(`cancelStopped: batch ${batchId} is ${b.status}`);
+        transition(batchId, "cancelled", now(), ", resolved_by=?, resolution_note=?", [by, note]);
+        return getBatch.get(batchId);
+      });
+    },
 
     // A stuck alert, recorded BEFORE it is posted (channel_message_id NULL) so a crash right after the post can never
     // lose its follow-up; the batch is marked alerted for that episode in the same commit.

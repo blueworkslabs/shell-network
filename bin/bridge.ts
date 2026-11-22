@@ -93,8 +93,8 @@ need("T1_MCP_URL"); need("T1_TOKEN"); need("T1_PUSH_TOKEN");
 const tickMs = Number(process.env.BRIDGE_TICK_MS ?? 3000);
 
 // The vendored client logs every tool result; the bridge reads the whole thread every tick, so read-type results
-// are reduced to their size (sends and launches stay in full: they are the evidence of what the bridge did).
-const KEEP = new Set(["t3_thread_send", "t3_thread_launch"]);
+// are reduced to their size (sends, launches and interrupts stay in full: they are the evidence of what the bridge did).
+const KEEP = new Set(["t3_thread_send", "t3_thread_launch", "t3_thread_interrupt"]);
 const mcpLog = mcpCallLog(log, KEEP);
 const mcp = new McpClient({ log: mcpLog, token: loadToken(), clientName: "t3-crew-bridge" });
 await mcp.connect();
@@ -139,6 +139,10 @@ for (const [i, channelId] of conversations.entries()) {
     handoff: () => {
       const reset = JSON.parse(buffer.kvGet(`${conversationKey}:reset`) ?? "null") as { stage: string; handoff?: ScheduleHandoff; handoffSent?: boolean } | null;
       return reset?.stage === "handoff" && reset.handoff ? { ...reset.handoff, conversationKey, sent: reset.handoffSent } : null;
+    },
+    stop: () => {
+      const pending = JSON.parse(buffer.kvGet(`${conversationKey}:stop`) ?? "null") as { id?: string; threadId?: string; stage?: string } | null;
+      return pending?.stage === "interrupt" && pending.id && pending.threadId ? { id: pending.id, conversationKey, threadId: pending.threadId } : null;
     },
     // the conversation's own archived threads (its /new ledger), readable for the export only
     // only with the export on (BRIDGE_NOTES_DIR): otherwise no archived thread is readable at all

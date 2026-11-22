@@ -21,6 +21,7 @@
 //     (marker set before the post; the search resumes across steps and only a search that reached the end of the
 //     channel counts as "absent"), and never repeated after it was recorded. Replies post in batch order.
 import { reconcileBatch, messageIdMatchesRequest, settlement } from "./reconcile.ts";
+import { stopClientRequestId } from "./allowlist.ts";
 import { readArchivedTranscript } from "./t3-transcript.ts";
 import { importTranscripts } from "./transcript-import.ts";
 import { attachmentLines, attachmentNames, readStaged, removeSaved, removeStaged, saveInbound, type FetchFile, type StagedFile } from "./attachments.ts";
@@ -44,7 +45,7 @@ export const HEADER_LINE_MAX = 300;
 export const HEADER_ADDRESSED_LINE_MAX = 2000;
 const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars cut]` : s);
 // phase "open" carries the reconcile verdict of the oldest open batch.
-export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
+export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new" | "stop"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
 type Found = { status: "found"; message: DiscordMessage } | { status: "absent" } | { status: "unknown" };
 export interface BotOptions {
   name: string; conversationKey: string; channelId: string; channelName?: string; threadLabel?: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
@@ -182,16 +183,115 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const why = rs.lastError ?? (rs.stage === "confirm" ? "the fresh session is not started yet" : "");
     return min >= 1 || why ? `, for ${min} min${why ? `: ${why}` : ""}` : "";
   };
+  // ---- /stop: interrupt the bound thread's running turn ----
+  // Persisted in kv `stop` while in flight so a crash cannot lose the stop or re-escalate an interrupted batch, and so
+  // the MCP allowlist admits `t3_thread_interrupt` only while stage === "interrupt" for this stop's clientRequestId.
+  type Stop = { id: string; threadId: string; author: string; requestedAt: number; stage: "interrupt" | "wait"; targetRunId?: string | null; runId?: string };
+  type LastStop = { at: number; by: string };
+  const stopState = (): Stop | null => { const v = buffer.kvGet(K("stop")); return v ? (JSON.parse(v) as Stop) : null; };
+  const saveStop = (s: Stop) => buffer.kvSet(K("stop"), JSON.stringify(s));
+  const lastStopState = (): LastStop | null => { const v = buffer.kvGet(K("lastStop")); return v ? (JSON.parse(v) as LastStop) : null; };
+  const activeRunId = (read: ThreadRead): string | null =>
+    (typeof read.thread?.activeRunId === "string" && read.thread.activeRunId)
+    || (read.recentRuns ?? []).findLast((r) => !TERMINAL.has(r.status) && r.status !== "queued")?.runId
+    || null;
+  async function requestStop(cmd: { id: string; author: string; receivedAt: number }): Promise<AcceptResult> {
+    const seen = buffer.kvGet(K("stopSeen"));
+    const cur = stopState();
+    if (cur?.id === cmd.id) return { accepted: true, inserted: false };
+    if (seen && BigInt(cmd.id) <= BigInt(seen)) return { accepted: false, reason: "stop already handled" };
+    if (cur) {
+      buffer.kvSet(K("stopSeen"), maxId(seen, cmd.id));
+      return { accepted: false, reason: "stop pending" };
+    }
+    const threadId = buffer.kvGet(K("threadId"));
+    if (!threadId) return { accepted: false, reason: "not started" };
+    const read = await t3.read(threadId);
+    const targetRunId = activeRunId(read);
+    const after = stopState();
+    if (after?.id === cmd.id) return { accepted: true, inserted: false };
+    if (after) return { accepted: false, reason: "stop pending" };
+    if (!targetRunId) {
+      buffer.kvSet(K("stopSeen"), maxId(buffer.kvGet(K("stopSeen")), cmd.id));
+      return { accepted: false, reason: "idle" };
+    }
+    buffer.atomically(() => {
+      buffer.recordResetBoundary(cmd.id, channelId);
+      saveStop({ id: cmd.id, threadId, author: cmd.author, requestedAt: cmd.receivedAt, stage: "interrupt", targetRunId });
+    });
+    log.emit("bridge.stop_command", { bot: name, sourceMessageId: cmd.id, threadId, targetRunId });
+    return { accepted: true, inserted: true };
+  }
+  async function stopStep(threadId: string, read: ThreadRead): Promise<{ read?: ThreadRead; done?: StepResult }> {
+    let st = stopState();
+    if (!st) return {};
+    if (st.threadId !== threadId) {
+      buffer.atomically(() => {
+        buffer.kvSet(K("stopSeen"), maxId(buffer.kvGet(K("stopSeen")), st!.id));
+        buffer.kvDelete(K("stop"));
+      });
+      return {};
+    }
+    const finish = (outcome: "stopped" | "finished" | "idle", runId: string | null, latest: ThreadRead) => {
+      const cur = st!;
+      const open = buffer.openBatches(conversationKey)[0];
+      const cancelBatch = outcome === "stopped" && open && runId && batchRunId(open, latest) === runId
+        && !["delivered", "resolved", "cancelled"].includes(open.status);
+      buffer.atomically(() => {
+        if (cancelBatch) buffer.cancelStopped(open.id, { by: cur.author, note: `stopped by /stop (${cur.id})` });
+        if (outcome === "stopped") {
+          buffer.kvSet(K("lastStop"), JSON.stringify({ at: now(), by: cur.author }));
+          buffer.enqueue(conversationKey, { key: `stop:${cur.id}`, nonce: `p${cur.id}`, content: "⏹ Stopped the running turn." });
+        } else if (outcome === "finished") {
+          buffer.enqueue(conversationKey, { key: `stop:${cur.id}`, nonce: `p${cur.id}`, content: "⏹ The running turn finished before /stop took effect." });
+        } else {
+          buffer.enqueue(conversationKey, { key: `stop:${cur.id}`, nonce: `p${cur.id}`, content: "⏹ Nothing was running." });
+        }
+        buffer.kvSet(K("stopSeen"), maxId(buffer.kvGet(K("stopSeen")), cur.id));
+        buffer.kvDelete(K("stop"));
+      });
+      log.emit("bridge.stop_done", { bot: name, stopId: cur.id, threadId, runId, outcome, cancelledBatchId: cancelBatch ? open.id : null });
+    };
+    let latest = read;
+    if (st.stage === "interrupt") {
+      const target = st.targetRunId ?? activeRunId(latest);
+      if (target && target !== st.targetRunId) { st = { ...st, targetRunId: target }; saveStop(st); }
+      const r = await t3.interrupt({ threadId, clientRequestId: stopClientRequestId(conversationKey, st.id) });
+      log.emit("bridge.stop_interrupt", { bot: name, stopId: st.id, threadId, status: r?.status ?? null, runId: r?.runId ?? null });
+      if (r?.status === "no_active_run") {
+        latest = await t3.read(threadId);
+        const prev = target ? (latest.recentRuns ?? []).find((x) => x.runId === target) : undefined;
+        if (prev && (prev.status === "interrupted" || prev.status === "cancelled")) finish("stopped", target, latest);
+        else if (prev && prev.status === "completed") finish("finished", target, latest);
+        else finish("idle", null, latest);
+        return { read: latest };
+      }
+      const runId = typeof r?.runId === "string" && r.runId ? r.runId : target;
+      if (!runId) { finish("idle", null, latest); return { read: latest }; }
+      st = { ...st, stage: "wait", runId };
+      saveStop(st);
+      latest = await t3.read(threadId);
+    }
+    const run = (latest.recentRuns ?? []).find((r) => r.runId === st!.runId);
+    if (!run || !TERMINAL.has(run.status)) return { read: latest, done: { phase: "stop" } };
+    if (run.status === "completed") finish("finished", st.runId!, latest);
+    else finish("stopped", st.runId!, latest);
+    return { read: latest };
+  }
+
   // `/status`: what this bot is doing in this channel, for the person who asked (an ephemeral reply). No ids or paths.
   async function status(): Promise<string> {
     const threadId = buffer.kvGet(K("threadId")), title = buffer.kvGet(K("threadTitle"));
     let state = "not started";
     if (threadId) state = await t3.read(threadId).then((r) => (isBusy(r) ? "busy" : "idle"), () => "unknown (t3 not reachable)");
-    const open = buffer.openBatches(conversationKey)[0], rs = resetState(), n = buffer.exchangeCount(channelId);
+    const open = buffer.openBatches(conversationKey)[0], rs = resetState(), st = stopState(), lastStop = lastStopState(), n = buffer.exchangeCount(channelId);
+    const stopLine = st ? ["/stop: stopping running turn"]
+      : lastStop ? [`Last /stop: stopped at ${new Date(lastStop.at).toISOString().slice(0, 16).replace("T", " ")} UTC`] : [];
     return [`**${name}** in #${channelName ?? channelId}`,
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,
+      ...stopLine,
       ...(rs?.stage === "handoff" ? [`Standing jobs: ${rs.jobsPending ?? rs.handoff?.jobs.length ?? 0} awaiting verification`] : []),
       ...(Number(buffer.kvGet(K("skippedPosts")) ?? 0) ? [`Skipped posts (Discord refused them): ${buffer.kvGet(K("skippedPosts"))}`] : []),
       ...(notesRoot ? [`Archive export: ${pendingExports().length} pending${exportState.lastError ? `; last error: ${exportState.lastError}` : ""}`] : []),
@@ -980,7 +1080,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       try { await backfill(); } catch (e) { log.emit("bridge.backfill_error", { bot: name, error: errText(e) }); }
     }
     const threadId = await ensureThread();
-    const read = await t3.read(threadId);
+    let read = await t3.read(threadId);
+    const stop = await stopStep(threadId, read);
+    if (stop.read) read = stop.read;
+    if (stop.done) { await drain(); return stop.done; }
     queuePending(threadId, read);
     await drain();
     const reset = await resetStep(threadId, read);
@@ -1023,5 +1126,5 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { phase: "sent", batchId: b.id };
   }
 
-  return { accept, backfill, initWatermark, step, ensureThread, requestNew, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
+  return { accept, backfill, initWatermark, step, ensureThread, requestNew, requestStop, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
 }

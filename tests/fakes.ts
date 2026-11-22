@@ -1,13 +1,13 @@
 // Offline stand-ins for t3 and Discord, with the behaviour the bridge relies on (as observed in the t3 stress test / documented by
 // Discord) and crash hooks. A "crash" closes the bridge's buffer first, so nothing the bridge does after the crash
 // point can reach durable state (like a killed process); the test then restarts on the same database file.
-import type { CreateMessagePayload, DiscordMessage, ModelSelection, Projection, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead, T3Port } from "../lib/types.ts";
+import type { CreateMessagePayload, DiscordMessage, InterruptResult, ModelSelection, Projection, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead, T3Port } from "../lib/types.ts";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "rolled_back"]);
 
 export interface FakeRun { runId: string; ordinal: number; status: string; userMessageId: string; text: string; queueHeld?: boolean; inputType?: "user_message" | "notification" }
 export interface FakeThread { id: string; projectId: string; title: string; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[]; archived?: boolean }
-export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; launch?: "after"; archive?: "after"; post?: "before" | "after"; react?: "before" }
+export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; launch?: "after"; interrupt?: "before" | "after"; archive?: "after"; post?: "before" | "after"; react?: "before" }
 export interface FakeCall { tool: string; title?: string; threadId?: string; mode?: string; clientRequestId?: string; message?: string }
 type SendArgs = { threadId: string; message: string; mode: string; clientRequestId: string };
 export interface FakeT3 {
@@ -21,6 +21,9 @@ export interface FakeT3 {
   projection(threadId: string): Promise<Projection>;
   queue(threadId: string): Promise<QueueList>;
   send(args: SendArgs): Promise<{ messageId: string; runId?: string; delivery?: string; status?: string }>;
+  interruptDelay: boolean; // test control: leave the run active until interrupted(threadId, runId) is called
+  interrupt(args: { threadId: string; clientRequestId: string }): Promise<InterruptResult>;
+  interrupted(threadId: string, runId: string): void;
   archiveError: string | null; // test control: archive fails with this message (once)
   archive(threadId: string): Promise<{ archived: true }>; // like t3: a second archive of a thread is an error
   // the messages view of a thread (as live t3 answers it for an archived conversation), paged by `limit`
@@ -40,7 +43,7 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
   const calls: FakeCall[] = [];
   const crash: Crash = {}; // { send: "before" | "after", launch: "after" } -> consumed once; needs crash.buffer
   let n = 0;
-  const die = (point: "send" | "launch" | "archive"): never => { crash.buffer?.close(); delete crash[point]; throw new Error(`CRASH at ${point}`); };
+  const die = (point: "send" | "launch" | "interrupt" | "archive"): never => { crash.buffer?.close(); delete crash[point]; throw new Error(`CRASH at ${point}`); };
   const th = (id: string) => { const t = threads.get(id); if (!t) throw new Error(`no thread ${id}`); return t; };
   const promote = (t: FakeThread) => {
     if (t.runs.some((r) => ["running", "preparing", "waiting"].includes(r.status))) return;
@@ -98,6 +101,26 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       }
       if (crash.send === "after") die("send");
       return { messageId, runId: run.runId, delivery, status: run.status };
+    },
+    interruptDelay: false,
+    async interrupt({ threadId, clientRequestId }) {
+      calls.push({ tool: "interrupt", threadId, clientRequestId });
+      if (crash.interrupt === "before") die("interrupt");
+      const t = th(threadId);
+      const active = [...t.runs].reverse().find((r) => !TERMINAL.has(r.status) && r.status !== "queued");
+      if (!active) return { threadId, runId: null, status: "no_active_run" };
+      if (!api.interruptDelay) {
+        active.status = "interrupted";
+        promote(t);
+      }
+      if (crash.interrupt === "after") die("interrupt");
+      return { threadId, runId: active.runId, status: "interrupt_requested" };
+    },
+    interrupted(threadId, runId) {
+      const t = th(threadId);
+      const r = t.runs.find((x) => x.runId === runId)!;
+      r.status = "interrupted";
+      promote(t);
     },
     archiveError: null,
     archiveReadError: null,

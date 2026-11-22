@@ -27,6 +27,7 @@ const command = (name: string, description: string): CommandBody =>
 export const COMMANDS: readonly CommandBody[] = [
   command("new", "Archive this bot's session in this channel and start a fresh one"),
   command("status", "What this bot is doing in this channel"),
+  command("stop", "Stop this bot's running turn in this channel"),
 ];
 
 // What Discord returns for a command, as far as it matters here.
@@ -89,6 +90,8 @@ export interface InteractionPort {
 export interface CommandBot {
   // `/new` as a command: queued (accepted) or why not
   requestNew(cmd: { id: string; author: string; receivedAt: number; source: "interaction" }): { accepted: boolean; reason?: string };
+  // `/stop` as a command: interrupt the running turn, or report idle/already pending
+  requestStop(cmd: { id: string; author: string; receivedAt: number }): Promise<{ accepted: boolean; reason?: string }>;
   status(): Promise<string>;
 }
 interface Interaction {
@@ -115,7 +118,7 @@ export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, no
     const id = String(i.id), token = String(i.token), name = String(i.data?.name);
     const user = i.member?.user ?? i.user;
     const bot = typeof i.channel_id === "string" ? bots.get(i.channel_id) : undefined;
-    if (name !== "new" && name !== "status") { await safe(token, "reply", () => port.reply(id, token, "Unknown command.")); log.emit("bridge.interaction_refused", { why: "unknown command" }); return; }
+    if (name !== "new" && name !== "status" && name !== "stop") { await safe(token, "reply", () => port.reply(id, token, "Unknown command.")); log.emit("bridge.interaction_refused", { why: "unknown command" }); return; }
     // anything but our own commands, from our user, in our channels: refused, ephemeral, nothing else done
     if (!bot) { await safe(token, "reply", () => port.reply(id, token, "This bot is not active in this channel.")); log.emit("bridge.interaction_refused", { command: name, why: "channel" }); return; }
     if (typeof user?.id !== "string" || !allowed.has(user.id)) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: name, why: "user" }); return; }
@@ -126,6 +129,14 @@ export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, no
         const r = bot.requestNew({ id, author: typeof user.username === "string" ? user.username : "user", receivedAt: now(), source: "interaction" });
         text = r.accepted ? "Queued. This bot finishes what is before it, writes its note, archives this session and starts a fresh one."
           : r.reason === "new pending" ? "A /new is already pending for this bot in this channel." : "That /new was already handled.";
+        if (r.accepted) nudge();
+      } else if (name === "stop") {
+        const r = await bot.requestStop({ id, author: typeof user.username === "string" ? user.username : "user", receivedAt: now() });
+        text = r.accepted ? "Stopping the running turn."
+          : r.reason === "not started" ? "Nothing is running (no session started yet)."
+          : r.reason === "idle" ? "Nothing is running."
+          : r.reason === "stop pending" ? "A /stop is already in progress for this bot in this channel."
+          : "That /stop was already handled.";
         if (r.accepted) nudge();
       } else text = await bot.status();
     } catch (e) { log.emit("bridge.interaction_error", { what: name, error: redact(errText(e), token) }); }

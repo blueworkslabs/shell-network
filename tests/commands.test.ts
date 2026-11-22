@@ -31,21 +31,21 @@ function fakeApp(initial: ExistingCommand[] = [], fail: { create?: string } = {}
 const kv = () => { const m = new Map<string, string>(); return { kvGet: (k: string) => m.get(k) ?? null, kvSet: (k: string, v: unknown) => { m.set(k, String(v)); } }; };
 const names = (a: ReturnType<typeof fakeApp>) => [...a.cmds.values()].map((c) => c.name).sort();
 
-test("COMMANDS: /new and /status, no options, guild only", () => {
-  assert.deepEqual(COMMANDS.map((c) => c.name), ["new", "status"]);
+test("COMMANDS: /new, /status and /stop, no options, guild only", () => {
+  assert.deepEqual(COMMANDS.map((c) => c.name), ["new", "status", "stop"]);
   for (const c of COMMANDS) assert.deepEqual([c.type, c.contexts, c.integration_types, c.options], [1, [0], [0], []]);
 });
 
-test("RECONCILE: a fresh application gets both commands; the next start makes no command calls at all", async () => {
+test("RECONCILE: a fresh application gets all three commands; the next start makes no command calls at all", async () => {
   const app = fakeApp(), store = kv(), log = memoryLog();
-  assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 2, edited: 0, deleted: 0 });
-  assert.deepEqual(names(app), ["new", "status"]);
+  assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 3, edited: 0, deleted: 0 });
+  assert.deepEqual(names(app), ["new", "status", "stop"]);
   app.calls.length = 0;
   assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log }), { skipped: true });
   assert.deepEqual(app.writes().concat(app.calls.filter((c) => c === "list")), [], "no list, no writes while the hash is unchanged");
 });
 
-test("RECONCILE: an application with foreign commands, some with our names, ends with exactly our two", async () => {
+test("RECONCILE: an application with foreign commands, some with our names, ends with exactly our three", async () => {
   const [cNew, cStatus] = COMMANDS;
   const app = fakeApp([
     { id: "1", name: "new", description: "something else", type: 1, contexts: null, integration_types: null },    // ours by name, different
@@ -56,19 +56,19 @@ test("RECONCILE: an application with foreign commands, some with our names, ends
     { id: "6", name: "help", description: "foreign", type: 1 },
   ]);
   const r = await reconcileCommands({ port: app.port, buffer: kv(), hashKey: "h", log: memoryLog() });
-  assert.deepEqual(r, { skipped: false, created: 0, edited: 1, deleted: 4 });
-  assert.deepEqual(app.writes().sort(), ["delete help", "delete new", "delete ping", "delete status", "edit new"]);
-  assert.deepEqual([...app.cmds.values()].map((c) => [c.name, c.type ?? 1]).sort(), [["new", 1], ["status", 1]]);
+  assert.deepEqual(r, { skipped: false, created: 1, edited: 1, deleted: 4 });
+  assert.deepEqual(app.writes().sort(), ["create stop", "delete help", "delete new", "delete ping", "delete status", "edit new"]);
+  assert.deepEqual([...app.cmds.values()].map((c) => [c.name, c.type ?? 1]).sort(), [["new", 1], ["status", 1], ["stop", 1]]);
   assert.ok(commandMatches([...app.cmds.values()].find((c) => c.name === "new")!, cNew), "the existing /new was edited into ours");
   assert.equal(app.cmds.get("2")!.version, "1", "the already-right /status was left alone");
 });
 
 test("RECONCILE: Discord's added fields do not count as a difference, and a changed description is edited", async () => {
-  const [cNew, cStatus] = COMMANDS;
+  const [cNew, cStatus, cStop] = COMMANDS;
   assert.ok(commandMatches(registered(cNew, "1"), cNew));
   assert.ok(commandMatches({ ...registered(cNew, "1"), contexts: [0], integration_types: [0], options: undefined, nsfw: undefined }, cNew), "defaults count as defaults");
   assert.ok(!commandMatches({ ...registered(cNew, "1"), contexts: [0, 1] }, cNew));
-  const app = fakeApp([registered(cNew, "1"), { ...registered(cStatus, "2"), description: "old text" }]);
+  const app = fakeApp([registered(cNew, "1"), { ...registered(cStatus, "2"), description: "old text" }, registered(cStop, "3")]);
   assert.deepEqual(await reconcileCommands({ port: app.port, buffer: kv(), hashKey: "h", log: memoryLog() }), { skipped: false, created: 0, edited: 1, deleted: 0 });
   assert.deepEqual(app.writes(), ["edit status"]);
 });
@@ -80,20 +80,20 @@ test("RECONCILE hash is per application: one application's registration does not
   assert.equal((await reconcileCommands({ port: b.port, buffer: store, hashKey: "h", log })).skipped, false, "the other application registers although the first one is done");
   assert.equal((await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log })).skipped, true);
   // rollback: bin/clear-commands.ts reconciles to the empty set under the same key; the next normal start registers again
-  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log, commands: [] }), { skipped: false, created: 0, edited: 0, deleted: 2 });
+  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log, commands: [] }), { skipped: false, created: 0, edited: 0, deleted: 3 });
   assert.deepEqual(names(a), []);
-  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 2, edited: 0, deleted: 0 });
-  assert.deepEqual(names(a), ["new", "status"]);
-  assert.deepEqual(names(b), ["new", "status"], "the other application was not touched by the removal");
+  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 3, edited: 0, deleted: 0 });
+  assert.deepEqual(names(a), ["new", "status", "stop"]);
+  assert.deepEqual(names(b), ["new", "status", "stop"], "the other application was not touched by the removal");
 });
 
 test("RECONCILE failure: the rest is still done, the error surfaces, no hash is stored, and the next start finishes the job", async () => {
   const app = fakeApp([{ id: "3", name: "ping", description: "foreign", type: 1 }], { create: "new" }), store = kv();
   await assert.rejects(reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log: memoryLog() }), /create new: boom/);
-  assert.deepEqual(names(app), ["status"], "status created and ping deleted although new failed");
+  assert.deepEqual(names(app), ["status", "stop"], "status and stop created and ping deleted although new failed");
   assert.equal(store.kvGet("h:700"), null);
   assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log: memoryLog() }), { skipped: false, created: 1, edited: 0, deleted: 0 });
-  assert.deepEqual(names(app), ["new", "status"]);
+  assert.deepEqual(names(app), ["new", "status", "stop"]);
   assert.notEqual(store.kvGet("h:700"), null);
 });
 
@@ -320,4 +320,128 @@ test("INTERACTION /new resets the Discord tool's budget too: /status and discord
   assert.throws(() => send("blocked-again"), /exchange cap reached/, "the budget is the same size again, from the command on");
   w.restart();
   assert.throws(() => send("blocked-after-restart"), /exchange cap reached/);
+});
+
+test("INTERACTION /stop while idle or not started is a no-op with a clear reply and never calls interrupt", async () => {
+  const w = world();
+  await w.run("stop", { user: STRANGER_ID });
+  await w.run("stop", { channel: OTHER_CH });
+  assert.deepEqual(w.calls, ["reply:Not allowed.", "reply:This bot is not active in this channel."]);
+
+  await w.run("stop");
+  assert.match(w.calls.at(-1)!, /^edit:Nothing is running \(no session started yet\)\.$/);
+  assert.equal(w.nudges(), 0);
+  assert.equal(w.t3.calls.filter((c) => c.tool === "interrupt").length, 0);
+
+  await w.bot.accept(w.discord.userSays("quick job"));
+  await w.steps(2);
+  w.finish(w.thread(), "done");
+  await w.steps(2);
+  await w.run("stop");
+  assert.match(w.calls.at(-1)!, /^edit:Nothing is running\.$/);
+  assert.equal(w.nudges(), 0);
+  assert.equal(w.t3.calls.filter((c) => c.tool === "interrupt").length, 0);
+  assert.equal(w.discord.botPosts().filter((m) => m.content.startsWith("⏹")).length, 0);
+});
+
+test("INTERACTION /stop interrupts a running turn, posts one fixed confirmation, keeps queued input for the next turn, and shows in /status", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("long task"));
+  await w.steps(2);
+  const t1 = w.thread();
+  // a second message arrives while the first turn is still running: stays buffered in the bridge
+  await w.bot.accept(w.discord.userSays("follow up after stop"));
+  assert.equal(w.buffer.buffered(KEY).length, 1);
+
+  await w.run("stop");
+  assert.equal(w.calls.at(-2), "defer");
+  assert.match(w.calls.at(-1)!, /^edit:Stopping the running turn\.$/);
+  assert.equal(w.nudges(), 1);
+
+  await w.steps(3);
+  assert.equal(w.t3.calls.filter((c) => c.tool === "interrupt").length, 1);
+  assert.equal(w.t3.threads.get(t1)!.runs[0].status, "interrupted");
+  const confirmations = w.discord.botPosts().filter((m) => m.content === "⏹ Stopped the running turn.");
+  assert.equal(confirmations.length, 1);
+  assert.equal(confirmations[0].message_reference, undefined, "no reply reference to an interaction id");
+  // the stopped batch settled cleanly (never escalated) and the buffered follow-up went out as the next turn
+  assert.equal(w.buffer.openBatches(KEY).length, 1);
+  assert.match(w.buffer.openBatches(KEY)[0].text, /follow up after stop/);
+  assert.equal(w.t3.threads.get(t1)!.runs.length, 2);
+  assert.equal(w.t3.threads.get(t1)!.runs[1].status, "running");
+
+  w.finish(t1, "handled follow up");
+  await w.steps(2);
+  assert.ok(w.discord.botPosts().some((m) => m.content === "handled follow up"));
+
+  await w.run("status");
+  assert.match(w.calls.at(-1)!, /Last \/stop: stopped at \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/);
+  assert.doesNotMatch(w.calls.at(-1)!, /thread-\d|\/home|[0-9]{10}/, "no ids or paths");
+  w.restart();
+  await w.run("status");
+  assert.match(w.calls.at(-1)!, /Last \/stop: stopped at \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/);
+});
+
+test("INTERACTION /stop handles async interrupt, duplicate /stop while pending, and crash after interrupt without escalating", async () => {
+  const w = world();
+  w.t3.interruptDelay = true;
+  await w.bot.accept(w.discord.userSays("slow turn"));
+  await w.steps(2);
+  const t1 = w.thread();
+  const r1 = w.t3.threads.get(t1)!.runs[0].runId;
+  await w.bot.accept(w.discord.userSays("queued while slow"));
+
+  await w.run("stop");
+  await w.steps(1);
+  // still waiting for provider to report interrupted
+  await w.run("status");
+  assert.match(w.calls.at(-1)!, /\/stop: stopping running turn/);
+  await w.run("stop");
+  assert.match(w.calls.at(-1)!, /^edit:A \/stop is already in progress/);
+  assert.equal(w.t3.calls.filter((c) => c.tool === "interrupt").length, 1, "interrupt called once");
+  assert.equal(w.buffer.openBatches(KEY)[0].status, "sent", "not escalated while waiting");
+
+  w.t3.interrupted(t1, r1);
+  await w.steps(3);
+  assert.equal(w.discord.botPosts().filter((m) => m.content === "⏹ Stopped the running turn.").length, 1);
+  assert.match(w.buffer.openBatches(KEY)[0].text, /queued while slow/);
+  w.finish(t1, "after async stop");
+  await w.steps(2);
+  assert.ok(w.discord.botPosts().some((m) => m.content === "after async stop"));
+
+  // crash right after t3.interrupt took effect, before the bridge recorded stage=wait
+  w.t3.interruptDelay = false;
+  await w.bot.accept(w.discord.userSays("crash stop turn"));
+  await w.steps(2);
+  await w.bot.accept(w.discord.userSays("survives crash"));
+  await w.run("stop");
+  w.t3.crash.interrupt = "after";
+  await assert.rejects(w.steps(1), /CRASH at interrupt|database is not open/);
+  w.restart();
+  await w.steps(4);
+  assert.equal(w.discord.botPosts().filter((m) => m.content === "⏹ Stopped the running turn.").length, 2);
+  assert.match(w.buffer.openBatches(KEY)[0].text, /survives crash/);
+  w.finish(t1, "after crash stop");
+  await w.steps(2);
+  assert.ok(w.discord.botPosts().some((m) => m.content === "after crash stop"));
+});
+
+test("INTERACTION /stop also stops a background/scheduled turn without an open batch", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("seed"));
+  await w.steps(2);
+  const t1 = w.thread();
+  w.finish(t1, "seeded");
+  await w.steps(2);
+  w.t3.wake(t1, { type: "user_message", text: "scheduled job running" });
+  await w.bot.accept(w.discord.userSays("queued behind wake"));
+
+  await w.run("stop");
+  assert.match(w.calls.at(-1)!, /^edit:Stopping the running turn\.$/);
+  await w.steps(3);
+  assert.equal(w.discord.botPosts().filter((m) => m.content === "⏹ Stopped the running turn.").length, 1);
+  assert.match(w.buffer.openBatches(KEY)[0].text, /queued behind wake/);
+  w.finish(t1, "after wake stop");
+  await w.steps(2);
+  assert.ok(w.discord.botPosts().some((m) => m.content === "after wake stop"));
 });

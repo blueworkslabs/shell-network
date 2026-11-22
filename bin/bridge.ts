@@ -35,7 +35,7 @@ import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch } from "../lib/startup.ts";
 import { stepLoop } from "../lib/steploop.ts";
-import { bridgeConfig, conversationKeyFor } from "../lib/bots.ts";
+import { bridgeConfig, conversationKeyFor, modelSelectionFor } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
 import { shellWatch } from "../lib/shellwatch.ts";
 import { mcpCallLog, t3Adapter } from "../lib/t3.ts";
@@ -111,7 +111,7 @@ if (me.id !== cfg.id) { console.error("BRIDGE_CREW_FILE: own bot id does not mat
 const dms = await openDms({ discord, users: dmUserIds, log });
 for (const d of dms) { dmChannels.add(d.channelId); keys.push(conversationKeyFor(cfg.key, d.channelId)); }
 const conversations = [...channelIds, ...dms.map((d) => d.channelId)];
-const modelSelection = { instanceId: cfg.instanceId, model: cfg.model };
+const modelSelection = modelSelectionFor(cfg);
 // live gateway session token; set below once the gateway exists (null until then: no dispatch)
 const session = () => (gateway?.state.connected ? gateway.state.gen : null);
 // Files of tool posts are staged here by the Discord tool and uploaded by this bridge (lib/attachments.ts); copies nobody
@@ -125,8 +125,8 @@ for (const [i, channelId] of conversations.entries()) {
   const dm = dmChannels.has(channelId);
   const botRoleId = dm ? null : await managedRole({ discord, channelId, botUserId: cfg.id, log });
   const channelName = dm ? "dm" : await discord.getChannel(channelId).then((c) => c.name ?? channelId, () => channelId);
-  // MCP allowlist: this project, this instance, this conversation's one thread (kv, set once launched/adopted)
-  const policy = { projectId, instanceId: modelSelection.instanceId, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`),
+  // MCP allowlist: this project, this instance (and configured model options), this conversation's one thread (kv, set once launched/adopted)
+  const policy = { projectId, instanceId: modelSelection.instanceId, ...(modelSelection.options ? { modelOptions: modelSelection.options } : {}), boundThread: () => buffer.kvGet(`${conversationKey}:threadId`),
     handoff: () => {
       const reset = JSON.parse(buffer.kvGet(`${conversationKey}:reset`) ?? "null") as { stage: string; handoff?: ScheduleHandoff; handoffSent?: boolean } | null;
       return reset?.stage === "handoff" && reset.handoff ? { ...reset.handoff, conversationKey, sent: reset.handoffSent } : null;

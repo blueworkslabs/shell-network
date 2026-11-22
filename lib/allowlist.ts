@@ -4,7 +4,8 @@
 // before any request is made:
 //   - every tool not named below;
 //   - any argument not listed for that tool, or with a value outside its rule;
-//   - launch: only in the configured project, on the configured provider instance, and only while no thread is bound;
+//   - launch: only in the configured project, on the configured provider instance (and configured model options, if any),
+//     and only while no thread is bound;
 //   - list: only the configured project;
 //   - read / queue_list / send: only the bound thread (the bot's one thread); send only with mode "queue" and a
 //     clientRequestId; read also a thread of the conversation's own `archived` ledger, but then only the "messages" view
@@ -13,7 +14,7 @@
 // It constrains the bridge's code, not the token: the token's own authority is checked on the t3 host, and the token file
 // must stay out of reach of the provider processes (both outside this module).
 import { handoffInput, type ScheduleHandoff } from "./schedule-handoff.ts";
-import type { Log } from "./types.ts";
+import type { Log, ModelOptions, ModelOptionValue } from "./types.ts";
 
 export class ToolDenied extends Error {
   declare tool: string;
@@ -27,7 +28,7 @@ type Check = (v: unknown) => boolean;
 interface Rule { args: Record<string, Check>; required: string[]; when?: (args: Record<string, unknown>) => string | null }
 export type Rules = Record<string, Rule>;
 // archivedThreads: the conversation's own archived threads (its `archived` ledger), readable for the export after /new
-export interface AllowlistPolicy { projectId: string; instanceId: string; boundThread: () => string | null; archivedThreads?: () => string[];
+export interface AllowlistPolicy { projectId: string; instanceId: string; modelOptions?: ModelOptions; boundThread: () => string | null; archivedThreads?: () => string[];
   handoff?: () => (ScheduleHandoff & { conversationKey: string; sent?: boolean }) | null }
 // The part of the MCP client the allowlist wraps.
 export interface McpLike {
@@ -38,11 +39,32 @@ export interface McpLike {
 
 const isStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
 const isInt = (lo: number, hi: number): Check => (v) => Number.isInteger(v) && (v as number) >= lo && (v as number) <= hi;
+const isOptionKey = (k: string): boolean => k.trim().length > 0 && k !== "__proto__" && k !== "constructor" && k !== "prototype";
+const isOptionValue = (v: unknown): v is ModelOptionValue => typeof v === "boolean" || (typeof v === "string" && v.trim().length > 0);
+const snapshotOptions = (raw: unknown): ModelOptions => {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) throw new Error("allowlist: modelOptions must be a nonempty object of nonempty string or boolean values");
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (!entries.length) throw new Error("allowlist: modelOptions must be a nonempty object of nonempty string or boolean values");
+  const copy: ModelOptions = {};
+  for (const [k, v] of entries) {
+    if (!isOptionKey(k) || !isOptionValue(v)) throw new Error("allowlist: modelOptions must be a nonempty object of nonempty string or boolean values");
+    copy[k] = v;
+  }
+  return copy;
+};
+const sameOptions = (v: unknown, expected: ModelOptions): boolean => {
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  const keys = Object.keys(o);
+  const expKeys = Object.keys(expected);
+  return keys.length === expKeys.length && expKeys.every((k) => Object.hasOwn(o, k) && o[k] === expected[k]);
+};
 
-// policy: { projectId, instanceId, boundThread: () => threadId | null }
+// policy: { projectId, instanceId, modelOptions?, boundThread: () => threadId | null }
 export function allowlistRules(policy: AllowlistPolicy): Rules {
-  const { projectId, instanceId, boundThread } = policy ?? ({} as Partial<AllowlistPolicy>);
+  const { projectId, instanceId, modelOptions, boundThread } = policy ?? ({} as Partial<AllowlistPolicy>);
   if (!isStr(projectId) || !isStr(instanceId) || typeof boundThread !== "function") throw new Error("allowlist: projectId, instanceId and boundThread required");
+  const expectedOptions = modelOptions === undefined ? undefined : snapshotOptions(modelOptions);
   const ownThread: Check = (v) => isStr(v) && v === boundThread();
   const archived = (v: unknown) => isStr(v) && v !== boundThread() && (policy.archivedThreads?.() ?? []).includes(v);
   const handoff = () => {
@@ -55,8 +77,16 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
       args: {
         projectId: (v) => v === projectId,
         title: isStr,
-        modelSelection: (v) => v !== null && typeof v === "object" && !Array.isArray(v) && (v as Record<string, unknown>).instanceId === instanceId && isStr((v as Record<string, unknown>).model) &&
-          Object.keys(v).every((k) => k === "instanceId" || k === "model"),
+        modelSelection: (v) => {
+          if (v === null || typeof v !== "object" || Array.isArray(v)) return false;
+          const ms = v as Record<string, unknown>;
+          if (ms.instanceId !== instanceId || !isStr(ms.model)) return false;
+          const keys = Object.keys(ms);
+          if (expectedOptions === undefined) return keys.every((k) => k === "instanceId" || k === "model");
+          return keys.every((k) => k === "instanceId" || k === "model" || k === "options")
+            && Object.hasOwn(ms, "options")
+            && sameOptions(ms.options, expectedOptions);
+        },
       },
       required: ["projectId", "title", "modelSelection"],
       when: (a) => {

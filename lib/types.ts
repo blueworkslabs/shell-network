@@ -208,9 +208,12 @@ export interface DiscordPort {
 }
 
 // ---- t3 port used by the bot core (lib/t3.ts implements it) ----
+export type ModelOptionValue = string | boolean;
+export type ModelOptions = Record<string, ModelOptionValue>;
 export interface ModelSelection {
   instanceId: string;
   model: string;
+  options?: ModelOptions;
 }
 export interface ThreadListItem {
   threadId?: unknown;

@@ -16,7 +16,7 @@ const CH = "shell-network";
 const BOT = "333333333333333333", HERMES = "444444444444444444";
 const KEY = conversationKeyFor("gem", CH);
 
-function world() {
+function world(modelSelection: { instanceId: string; model: string; options?: Record<string, string | boolean> } = { instanceId: "crewGemClaude", model: "m" }) {
   const path = join(tempDir("new-"), "buffer.db");
   let clock = 1_792_500_000_000;
   const now = () => clock;
@@ -29,7 +29,7 @@ function world() {
       w.buffer = openTempBuffer(path, { now });
       t3.crash.buffer = w.buffer;
       discord.crash.buffer = w.buffer;
-      w.bot = makeBot({ name: "Gem", conversationKey: KEY, channelId: CH, botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem", modelSelection: { instanceId: "crewGemClaude", model: "m" },
+      w.bot = makeBot({ name: "Gem", conversationKey: KEY, channelId: CH, botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem", modelSelection,
         buffer: w.buffer, t3, discord, log, now, session: () => "s1", allowedBots: [{ id: HERMES, name: "Hermes" }] });
       return w;
     },
@@ -358,4 +358,24 @@ test("a skipped rebind keeps the reset pending and alerts once", async () => {
   assert.deepEqual(w.archives(), []);
   assert.equal(w.confirmations().length, 0);
   assert.equal(w.discord.botPosts().filter((m) => m.content.includes("Stuck, needs help") && m.content.includes("standing-job")).length, 1);
+});
+
+test("NEW carries configured modelSelection.options into the fresh session (and omits them when unset)", async () => {
+  const withOpts = { instanceId: "crewGemAntigravity", model: "gemini-4-neon", options: { thought_level: "high" } };
+  const w = world(withOpts);
+  const { t1 } = await toWrapup(w);
+  assert.deepEqual(w.t3.threads.get(t1)!.modelSelection, withOpts);
+  w.finish(t1, "NO_REPLY");
+  await w.steps(5);
+  const t2 = w.thread();
+  assert.notEqual(t2, t1);
+  assert.deepEqual(w.t3.threads.get(t2)!.modelSelection, withOpts);
+
+  const plain = world();
+  const { t1: p1 } = await toWrapup(plain);
+  plain.finish(p1, "NO_REPLY");
+  await plain.steps(5);
+  const p2 = plain.thread();
+  assert.deepEqual(plain.t3.threads.get(p2)!.modelSelection, { instanceId: "crewGemClaude", model: "m" });
+  assert.equal("options" in plain.t3.threads.get(p2)!.modelSelection!, false);
 });

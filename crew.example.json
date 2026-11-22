@@ -1,5 +1,5 @@
 [
-  { "key": "gem", "name": "Gem", "id": "333333333333333333", "instanceId": "exampleClaude", "model": "example-model" },
+  { "key": "gem", "name": "Gem", "id": "333333333333333333", "instanceId": "exampleClaude", "model": "example-model", "options": { "effort": "high" } },
   { "key": "hermes", "name": "Hermes", "id": "444444444444444444", "instanceId": "exampleCodex", "model": "example-model" },
   { "key": "advisor", "name": "Advisor", "id": "666666666666666666" }
 ]

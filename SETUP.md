@@ -42,10 +42,18 @@ node bin/bridge.ts
 Copy `crew.example.json` to a private location outside the repository and set `BRIDGE_CREW_FILE` to its path
 for every bridge process. The JSON array lists each member's unique lowercase `key`, display `name`, and Discord
 user `id` (a string). Members run by this bridge also need `instanceId` and `model`; omit both for talk-only
-members. Set `BRIDGE_BOT` to this process's member key. Its identity and model come from the file; all other
-members are allowed crew, including talk-only members. Talk-only messages reset the exchange cap like allowlisted
-human messages; a bare mention from them resumes a bot. Only exchanges between bridge-run members consume the cap.
-Their unread messages follow the same rules as other crew bots. The people allowlist remains `BRIDGE_ALLOWED_AUTHORS`.
+members. Bridge-run members may also set an optional `options` object (a nonempty JSON object of nonempty string
+or boolean values) for provider-specific model options such as reasoning level, e.g.
+`"options": { "thought_level": "high" }`. The bridge passes `options` through unchanged in `modelSelection` on every
+session launch (initial start and `/new`), and the MCP allowlist admits only the configured options; `options` is
+not allowed on talk-only members. Option keys are provider-specific and not interpreted by the bridge (check
+`orchestrator_capabilities` on your t3 server for the exact options a model accepts; in t3 0.1.11, Claude uses
+`effort` plus optional `ultracode` / `fastMode`, Codex uses `reasoningEffort` plus optional `serviceTier` /
+`cyberAccessProgram`, and Antigravity uses `thought_level`). Set `BRIDGE_BOT` to this process's member key. Its
+identity and model come from the file; all other members are allowed crew, including talk-only members. Talk-only
+messages reset the exchange cap like allowlisted human messages; a bare mention from them resumes a bot. Only
+exchanges between bridge-run members consume the cap. Their unread messages follow the same rules as other crew
+bots. The people allowlist remains `BRIDGE_ALLOWED_AUTHORS`.
 
 The file is read once at startup. Invalid members, duplicate keys or ids, a missing or talk-only own bot, and an
 own id that differs from the Discord token are refused. Restart the bridge after changing the file. Keep real crew

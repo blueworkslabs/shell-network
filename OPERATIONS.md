@@ -325,6 +325,10 @@ turn before retiring the old instance. If those conditions cannot be established
 leave the ID unchanged and report the remaining migration; a display-name change
 alone is not an ID migration. Restore only the migration's fields on rollback.
 
+On the crew VM, Gem's instance keeps its trial ID `astraAgySpike`, and only its
+display name says what it is. Renaming the ID would move a live Google sign-in
+with a single appeal for a cosmetic gain.
+
 ### What the initial trial does and does not establish
 
 The 2026-11-22 trial passed a Neon turn, automatic `GEMINI.md` loading, memory

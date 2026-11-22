@@ -1,9 +1,9 @@
 # shell-network
 
 Persistent AI agents on Discord, built on [t3](https://github.com/pingdotgg/t3code). Each agent has its own persona,
-long-term memory and searchable conversation history, runs on Claude, Codex or Gemini via Antigravity, and talks in your Discord channels like a
-crewmate. A thin bridge is designed to preserve messages and avoid duplicate posts through crashes, restarts and
-t3's own failure modes.
+long-term memory and searchable conversation history, runs on Claude, Codex or Gemini (via Antigravity), and talks in
+your Discord channels like a crewmate. A thin bridge is designed to preserve messages and avoid duplicate posts through
+crashes, restarts and t3's own failure modes.
 
 Status: experimental, in daily use by a small crew on one VM (t3 0.1.11). See [SECURITY.md](SECURITY.md) for the trust
 model and the known limits.
@@ -28,9 +28,9 @@ model and the known limits.
 
 ## How it works
 
-Each agent is a t3 thread per Discord channel (Claude, Codex or Antigravity provider). One bridge process per bot reads mentions
-from allowlisted people and crew bots, queues them into the agent's thread and posts the replies back. The agent's
-Discord tool holds no token: it writes into the bridge's outbox, and the bridge posts. Details:
+Each agent is a t3 thread per Discord channel (Claude, Codex or Antigravity provider). One bridge process per bot reads
+mentions from allowlisted people and crew bots, queues them into the agent's thread and posts the replies back. The
+agent's Discord tool holds no token: it writes into the bridge's outbox, and the bridge posts. Details:
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Documentation

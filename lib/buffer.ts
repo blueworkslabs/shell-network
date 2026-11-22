@@ -601,9 +601,9 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     batchOfMessage: (conversationKey: string, sourceMessageId: string): BatchRow | undefined => one<BatchRow>(
       "SELECT b.* FROM batch b JOIN inbound i ON i.batch_id = b.id WHERE i.conversation_key = ? AND i.source_message_id = ?", conversationKey, sourceMessageId),
 
-    // Is a staged attachment directory named by an outbox entry that is not settled (pending or posting)?
     // Is a Discord message still waiting for its turn (buffered, or in a batch not yet delivered)? Its saved images stay.
     inboundWaiting: (messageId: string): boolean => one<{ n: number }>(`SELECT count(*) n FROM inbound WHERE source = 'discord' AND source_message_id = ? AND (state = 'buffered' OR batch_id IN (SELECT id FROM batch WHERE ${OPEN_SQL}))`, messageId)!.n > 0,
+    // Is a staged attachment directory named by an outbox entry that is not settled (pending or posting)?
     stagedInUse: (dirId: string): boolean => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE state IN ('pending','posting') AND instr(meta, ?) > 0", dirId)!.n > 0,
     // A person's action that is not a channel message (a slash command) cuts the channel's episode like a message does:
     // the receiving side (inbound) and the Discord tool's budget (human_message) both read this boundary.

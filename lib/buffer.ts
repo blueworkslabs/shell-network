@@ -545,6 +545,8 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     isToolThread: (conversationKey: string, threadId: string): boolean => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?", conversationKey, threadId)!.n > 0,
     // The posted entry of a conversation that made this message (a reply part, a tool send, an alert, ...).
     outboxByMessage: (conversationKey: string, messageId: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND channel_message_id = ? AND state = 'posted'", conversationKey, messageId),
+    // Edits queued after entry `afterId` that have not been attempted: a newer one for the same message supersedes it.
+    pendingEditsAfter: (conversationKey: string, afterId: number): OutboxRow[] => db.prepare("SELECT * FROM outbox WHERE conversation_key = ? AND id > ? AND state = 'pending' AND substr(key, 1, 5) = 'edit:' ORDER BY id").all(conversationKey, afterId) as unknown as OutboxRow[],
     outboxById: (id: number): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE id = ?", id),
     // The oldest entry not posted (or dropped) yet: the only one the worker may touch.
     outboxHead: (conversationKey: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND state IN ('pending','posting') ORDER BY id LIMIT 1", conversationKey),

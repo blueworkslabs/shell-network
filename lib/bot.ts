@@ -612,19 +612,33 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // which is out by now). Checked again while pending: the place, the text, and that the target is a post of this
   // conversation there that names every crew bot the new text names. `posting` stores the target id before the PATCH;
   // the PATCH sets the same text again, so recovery repeats it. A deleted target (404): back to pending, then dropped.
+  // Edits of one message queued faster than they go out collapse: a pending edit that a newer valid edit of the same
+  // message follows is done without a PATCH (its text would be replaced at once), so only the latest text is sent.
+  const editPlace = (h: OutboxRow) => { const m = toolMeta(h); return m.thread === 1 ? m.channel ?? "" : channelId; };
+  function editCheck(h: OutboxRow): { why: string } | { messageId: string } {
+    const meta = toolMeta(h), place = editPlace(h);
+    const id = resolveReplyTo(h);
+    const post = id === null ? undefined : buffer.outboxByMessage(conversationKey, id);
+    const at = post ? (JSON.parse(post.meta) as { thread?: number; channel?: string }) : null;
+    const why = (meta.thread === 1 ? !buffer.isToolThread(conversationKey, place) : meta.channel !== channelId) ? "channel not allowed"
+      : !h.content.trim() || h.content.length > PART ? "content empty or too long"
+      : !post || (meta.thread === 1 ? at!.thread !== 1 || at!.channel !== place : at!.thread === 1) ? "target is not a post of this bot there"
+      : mentionsIn(h.content).some((u) => !mentionsIn(post.content).includes(u)) ? "an edit cannot add mentions" : null;
+    return why ? { why } : { messageId: id! };
+  }
   async function applyEdit(h: OutboxRow): Promise<void> {
-    const meta = toolMeta(h), place = meta.thread === 1 ? meta.channel ?? "" : channelId;
+    const place = editPlace(h);
     let messageId = h.boundary ?? "";
     if (h.state === "pending") {
-      const id = resolveReplyTo(h);
-      const post = id === null ? undefined : buffer.outboxByMessage(conversationKey, id);
-      const at = post ? (JSON.parse(post.meta) as { thread?: number; channel?: string }) : null;
-      const why = (meta.thread === 1 ? !buffer.isToolThread(conversationKey, place) : meta.channel !== channelId) ? "channel not allowed"
-        : !h.content.trim() || h.content.length > PART ? "content empty or too long"
-        : !post || (meta.thread === 1 ? at!.thread !== 1 || at!.channel !== place : at!.thread === 1) ? "target is not a post of this bot there"
-        : mentionsIn(h.content).some((u) => !mentionsIn(post.content).includes(u)) ? "an edit cannot add mentions" : null;
-      if (why) return rejectTool(h, why);
-      messageId = id!;
+      const c = editCheck(h);
+      if ("why" in c) return rejectTool(h, c.why);
+      messageId = c.messageId;
+      const newer = buffer.pendingEditsAfter(conversationKey, h.id).find((n) => { const d = editCheck(n); return "messageId" in d && d.messageId === messageId && editPlace(n) === place; });
+      if (newer) {
+        buffer.outboxApplied(h.id);
+        log.emit("bridge.tool_edit_superseded", { bot: name, key: h.key, by: newer.key, messageId });
+        return;
+      }
       buffer.outboxPosting(h.id, messageId);
     }
     try {

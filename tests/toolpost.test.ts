@@ -131,6 +131,28 @@ test("TOOL EDIT: one progress message is sent and edited in place (also queued r
   assert.ok(w.log.events.some((e) => e.event === "bridge.tool_rejected" && e.key === gone && e.why === "target deleted"));
 });
 
+test("TOOL EDIT collapse: edits of one message queued faster than they go out send only the latest text; other messages' edits and a later invalid edit do not collapse it", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const t = w.tools();
+  const a = ref(t.send({ channel: CH, content: "job A: starting", idempotency_key: "pa" }));
+  const b = ref(t.send({ channel: CH, content: "job B: starting", idempotency_key: "pb" }));
+  await w.steps(1);
+  const edits = [1, 2, 3, 4].map((i) => ref(t.edit({ channel: CH, ref: a, content: `job A: ${i}/5`, idempotency_key: `ea${i}` })));
+  const other = ref(t.edit({ channel: CH, ref: b, content: "job B: 1/2", idempotency_key: "eb1" }));
+  const last = ref(t.edit({ channel: CH, ref: a, content: "job A: 5/5", idempotency_key: "ea5" }));
+  const tampered = ref(t.edit({ channel: CH, ref: a, content: "job A: done", idempotency_key: "ea6" }));
+  w.buffer.db.prepare("UPDATE outbox SET content = ? WHERE key = ?").run(`job A: done <@${HERMES}>`, tampered); // fails the bridge's check
+  await w.steps(1);
+  const patched = w.discord.writes.filter((x) => x.kind === "edit").map((x) => x.payload!.content);
+  assert.deepEqual(patched, ["job B: 1/2", "job A: 5/5"], "one PATCH per message, the latest valid text");
+  const msgA = w.buffer.outboxEntry(key, a)!.channel_message_id!;
+  assert.equal(w.discord.messages.find((m) => m.id === msgA)!.content, "job A: 5/5");
+  for (const k of [...edits, other, last]) assert.equal(w.buffer.outboxEntry(key, k)!.state, "posted", k);
+  assert.equal((w.tools().edit({ channel: CH, ref: a, content: "job A: 2/5", idempotency_key: "ea2" }).structuredContent as { status: string }).status, "done", "a superseded edit reads as done");
+  assert.equal(w.buffer.outboxEntry(key, tampered)!.state, "dropped");
+});
+
 test("TOOL EDIT re-check: an entry tampered with after the tool queued it (another author's message, an added mention) is dropped, nothing is edited", async () => {
   const w = world();
   const key = conversationKeyFor("gem", CH);

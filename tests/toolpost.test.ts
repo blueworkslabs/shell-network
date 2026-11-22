@@ -100,6 +100,116 @@ test("TOOL REACT: the bridge adds the reaction; killed before the PUT it is repe
   w.discord.react = real;
 });
 
+test("TOOL EDIT: one progress message is sent and edited in place (also queued right behind it); no pings, the log shows the new text; killed before the PATCH it is repeated; a deleted target is dropped", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const t = w.tools();
+  const sent = ref(t.send({ channel: CH, content: `starting the import <@${HERMES}>`, idempotency_key: "p1" }));
+  ref(t.edit({ channel: CH, ref: sent, content: `import 1/3 <@${HERMES}>`, idempotency_key: "e1" }));
+  await w.steps(1);
+  const msgId = w.buffer.outboxEntry(key, sent)!.channel_message_id!;
+  const post = w.discord.messages.find((m) => m.id === msgId)!;
+  assert.equal(post.content, `import 1/3 <@${HERMES}>`, "edited right after it went out");
+  await w.bot.accept(post); // the bridge sees its own post: it is in the channel log
+  ref(t.edit({ channel: CH, message_id: msgId, content: `import 2/3 <@${HERMES}>`, idempotency_key: "e2" }));
+  w.discord.crash.edit = "before";
+  await assert.rejects(w.bot.step(), /CRASH|not open/);
+  w.restart();
+  await w.steps(1);
+  assert.equal(post.content, `import 2/3 <@${HERMES}>`);
+  const edits = w.discord.writes.filter((x) => x.kind === "edit");
+  assert.equal(edits.length, 3, "one PATCH each, the interrupted one repeated once");
+  for (const e of edits) assert.deepEqual(e.payload!.allowed_mentions, { parse: [] }, "an edit pings nobody");
+  assert.equal(w.discord.botPosts().length, 1, "one message, never a second post");
+  assert.equal((w.tools().read({ channel: CH }).structuredContent as { messages: { id: string; content: string }[] }).messages.find((m) => m.id === msgId)!.content, `import 2/3 <@${HERMES}>`);
+  w.discord.messages.splice(w.discord.messages.indexOf(post), 1); // someone deleted it
+  const gone = ref(w.tools().edit({ channel: CH, message_id: msgId, content: "import done", idempotency_key: "e3" }));
+  const after = ref(w.tools().send({ channel: CH, content: "all done", idempotency_key: "p2" }));
+  await w.steps(1);
+  assert.equal(w.buffer.outboxEntry(key, gone)!.state, "dropped");
+  assert.equal(w.buffer.outboxEntry(key, after)!.state, "posted", "the queue moves on");
+  assert.ok(w.log.events.some((e) => e.event === "bridge.tool_rejected" && e.key === gone && e.why === "target deleted"));
+});
+
+test("TOOL EDIT collapse: edits of one message queued faster than they go out send only the latest text; other messages' edits and a later invalid edit do not collapse it", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const t = w.tools();
+  const a = ref(t.send({ channel: CH, content: "job A: starting", idempotency_key: "pa" }));
+  const b = ref(t.send({ channel: CH, content: "job B: starting", idempotency_key: "pb" }));
+  await w.steps(1);
+  const edits = [1, 2, 3].map((i) => ref(t.edit({ channel: CH, ref: a, content: `job A: ${i}/5`, idempotency_key: `ea${i}` })));
+  const other = ref(t.edit({ channel: CH, ref: b, content: "job B: 1/2", idempotency_key: "eb1" }));
+  const last = ref(t.edit({ channel: CH, ref: a, content: "job A: 5/5", idempotency_key: "ea5" }));
+  const tampered = ref(t.edit({ channel: CH, ref: a, content: "job A: done", idempotency_key: "ea6" }));
+  w.buffer.db.prepare("UPDATE outbox SET content = ? WHERE key = ?").run(`job A: done <@${HERMES}>`, tampered); // fails the bridge's check
+  await w.steps(1);
+  const patched = w.discord.writes.filter((x) => x.kind === "edit").map((x) => x.payload!.content);
+  assert.deepEqual(patched, ["job B: 1/2", "job A: 5/5"], "one PATCH per message, the latest valid text");
+  const msgA = w.buffer.outboxEntry(key, a)!.channel_message_id!;
+  assert.equal(w.discord.messages.find((m) => m.id === msgA)!.content, "job A: 5/5");
+  for (const k of [...edits, other, last]) assert.equal(w.buffer.outboxEntry(key, k)!.state, "posted", k);
+  assert.equal((w.tools().edit({ channel: CH, ref: a, content: "job A: 2/5", idempotency_key: "ea2" }).structuredContent as { status: string }).status, "done", "a superseded edit reads as done");
+  assert.equal(w.buffer.outboxEntry(key, tampered)!.state, "dropped");
+});
+
+test("TOOL EDIT refused: an edit Discord refuses (403) is retried a bounded number of times, then dropped with a notice, and the next post goes out", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const sent = ref(w.tools().send({ channel: CH, content: "progress", idempotency_key: "p1" }));
+  await w.steps(1);
+  const e = ref(w.tools().edit({ channel: CH, ref: sent, content: "progress 2", idempotency_key: "e1" }));
+  const next = ref(w.tools().send({ channel: CH, content: "next post", idempotency_key: "p2" }));
+  const real = w.discord.editMessage;
+  let tries = 0;
+  w.discord.editMessage = async () => { tries++; throw Object.assign(new Error("Missing Permissions"), { status: 403, code: 50013 }); };
+  await w.steps(5);
+  w.discord.editMessage = real;
+  assert.equal(tries, 3, "bounded: REFUSE_LIMIT tries");
+  assert.equal(w.buffer.outboxEntry(key, e)!.state, "dropped");
+  assert.equal(w.buffer.outboxEntry(key, next)!.state, "posted", "the queue moves on");
+  assert.ok(w.discord.botPosts().some((m) => /could not update one of its messages/.test(m.content)), "one notice says so");
+});
+
+test("TOOL EDIT collapse across ref and message id, and after a throttled attempt: only the latest text goes out; replaying an older request does not bring its text back", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const t = w.tools();
+  const sent = ref(t.send({ channel: CH, content: "build: start", idempotency_key: "p1" }));
+  await w.steps(1);
+  const msgId = w.buffer.outboxEntry(key, sent)!.channel_message_id!;
+  const first = ref(t.edit({ channel: CH, ref: sent, content: "build: 1/3", idempotency_key: "e1" }));
+  const real = w.discord.editMessage;
+  w.discord.editMessage = async () => { throw Object.assign(new Error("You are being rate limited."), { status: 429 }); };
+  await assert.rejects(w.bot.step(), /rate limited/);
+  w.discord.editMessage = real;
+  assert.equal(w.buffer.outboxEntry(key, first)!.state, "posting", "throttled: attempted, not settled");
+  ref(t.edit({ channel: CH, message_id: msgId, content: "build: 2/3", idempotency_key: "e2" }));
+  ref(t.edit({ channel: CH, ref: sent, content: "build: 3/3", idempotency_key: "e3" }));
+  await w.steps(1);
+  assert.deepEqual(w.discord.writes.filter((x) => x.kind === "edit").map((x) => x.payload!.content), ["build: 3/3"], "the throttled text is not repeated; only the latest goes out");
+  const replay = t.edit({ channel: CH, ref: sent, content: "build: 1/3", idempotency_key: "e1" }).structuredContent as { status: string; replay?: boolean };
+  assert.deepEqual([replay.status, replay.replay], ["done", true]);
+  await w.steps(1);
+  assert.equal(w.discord.messages.find((m) => m.id === msgId)!.content, "build: 3/3", "a replay queues nothing");
+});
+
+test("TOOL EDIT re-check: an entry tampered with after the tool queued it (another author's message, an added mention) is dropped, nothing is edited", async () => {
+  const w = world();
+  const key = conversationKeyFor("gem", CH);
+  const human = await w.human("my message");
+  const sent = ref(w.tools().send({ channel: CH, content: "progress", idempotency_key: "p1" }));
+  await w.steps(1);
+  const a = ref(w.tools().edit({ channel: CH, ref: sent, content: "progress 2", idempotency_key: "e1" }));
+  const b = ref(w.tools().edit({ channel: CH, ref: sent, content: "progress 3", idempotency_key: "e2" }));
+  w.buffer.db.prepare("UPDATE outbox SET reply_to = ? WHERE key = ?").run(human.id, a);
+  w.buffer.db.prepare("UPDATE outbox SET content = ? WHERE key = ?").run(`progress 3 <@${HERMES}>`, b);
+  await w.steps(1);
+  assert.deepEqual([w.buffer.outboxEntry(key, a)!.state, w.buffer.outboxEntry(key, b)!.state], ["dropped", "dropped"]);
+  assert.equal(w.discord.writes.filter((x) => x.kind === "edit").length, 0);
+  assert.equal(human.content, "my message");
+});
+
 test("TOOL ORDER: a tool send queued behind an unsettled head waits for it (one ordered outbox)", async () => {
   const w = world();
   await w.human("hi");

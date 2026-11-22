@@ -3,7 +3,7 @@
 // It holds no Discord token and opens no network connection except to the embedding endpoint when one is configured
 // (how the code behaves, not an isolation boundary: under the trusted-VM model the boundary is the VM). It works only on the bridge DB, through the narrow connection of
 // lib/tooldb.ts; the bridge, the one writer per bot token, does every post. Tools (lib/tools.ts): discord_send,
-// discord_react, discord_thread and discord_read; every call names one of the bot's channels.
+// discord_edit, discord_react, discord_thread and discord_read; every call names one of the bot's channels.
 //   DISCORD_TOOL_BOT   bot key (lowercase letters, lib/bots.ts)
 //   DISCORD_TOOL_DB    the bridge's buffer DB (must exist: the bridge creates it)
 //   DISCORD_TOOL_WORKSPACE  optional, absolute path of the agent's workspace: the only place discord_send may attach files

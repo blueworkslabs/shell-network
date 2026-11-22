@@ -202,6 +202,7 @@ export interface DiscordPort {
   createMessage(channelId: string, payload: CreateMessagePayload): Promise<DiscordMessage>;
   typing(channelId: string): Promise<unknown>;
   react(channelId: string, messageId: string, emoji: string): Promise<unknown>;
+  editMessage(channelId: string, messageId: string, payload: { content: string; allowed_mentions: { parse: string[] } }): Promise<unknown>;
   messagesAfter(channelId: string, afterId: string, limit?: number): Promise<DiscordMessage[]>;
   startThread(channelId: string, messageId: string, name: string): Promise<{ id: string }>;
   getChannel(channelId: string): Promise<{ id: string; name?: string; parent_id?: string | null; guild_id?: string }>;

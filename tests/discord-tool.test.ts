@@ -50,7 +50,7 @@ test("TOOL PROCESS: handshake and the tool list over stdio (idempotency key requ
   assert.equal(a.id, 1);
   assert.equal(a.result.protocolVersion, "2025-06-18");
   assert.equal(b.id, 2);
-  assert.deepEqual(b.result.tools.map((t: { name: string }) => t.name), ["discord_send", "discord_react", "discord_thread", "discord_read"]);
+  assert.deepEqual(b.result.tools.map((t: { name: string }) => t.name), ["discord_send", "discord_edit", "discord_react", "discord_thread", "discord_read"]);
   for (const t of b.result.tools) assert.equal(t.inputSchema.required.includes("idempotency_key"), t.name !== "discord_read", `${t.name}: idempotency_key required unless read-only`);
   const code = await new Promise<number | null>((r) => { proc.once("exit", (c) => r(c)); proc.stdin!.end(); });
   assert.equal(code, 0);

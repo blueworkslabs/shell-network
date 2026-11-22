@@ -608,6 +608,53 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     buffer.outboxApplied(h.id);
     log.emit("bridge.tool_thread", { bot: name, key: h.key, threadId: h.reply_to });
   }
+  // A tool edit of one of this bot's own posts (its target: a message id, or `outbox:<id>` of a post queued before it,
+  // which is out by now). Checked again while pending: the place, the text, and that the target is a post of this
+  // conversation there that names every crew bot the new text names. `posting` stores the target id before the PATCH;
+  // the PATCH sets the same text again, so recovery repeats it. A deleted target (404): back to pending, then dropped.
+  // Edits of one message queued faster than they go out collapse: a pending edit that a newer valid edit of the same
+  // message follows is done without a PATCH (its text would be replaced at once), so only the latest text is sent.
+  const editPlace = (h: OutboxRow) => { const m = toolMeta(h); return m.thread === 1 ? m.channel ?? "" : channelId; };
+  function editCheck(h: OutboxRow): { why: string } | { messageId: string } {
+    const meta = toolMeta(h), place = editPlace(h);
+    const id = resolveReplyTo(h);
+    const post = id === null ? undefined : buffer.outboxByMessage(conversationKey, id);
+    const at = post ? (JSON.parse(post.meta) as { thread?: number; channel?: string }) : null;
+    const why = (meta.thread === 1 ? !buffer.isToolThread(conversationKey, place) : meta.channel !== channelId) ? "channel not allowed"
+      : !h.content.trim() || h.content.length > PART ? "content empty or too long"
+      : !post || (meta.thread === 1 ? at!.thread !== 1 || at!.channel !== place : at!.thread === 1) ? "target is not a post of this bot there"
+      : mentionsIn(h.content).some((u) => !mentionsIn(post.content).includes(u)) ? "an edit cannot add mentions" : null;
+    return why ? { why } : { messageId: id! };
+  }
+  // Returns false when the drain should stop for this step (a refusal under REFUSE_LIMIT).
+  async function applyEdit(h: OutboxRow): Promise<boolean> {
+    const place = editPlace(h);
+    let messageId = h.boundary ?? "";
+    if (h.state === "pending") {
+      const c = editCheck(h);
+      if ("why" in c) { rejectTool(h, c.why); return true; }
+      messageId = c.messageId;
+    }
+    // also for an attempted one (`posting`, e.g. throttled): the newer text replaces it anyway, so it is not repeated
+    const newer = buffer.pendingEditsAfter(conversationKey, h.id).find((n) => { const d = editCheck(n); return "messageId" in d && d.messageId === messageId && editPlace(n) === place; });
+    if (newer) {
+      buffer.outboxApplied(h.id);
+      log.emit("bridge.tool_edit_superseded", { bot: name, key: h.key, by: newer.key, messageId });
+      return true;
+    }
+    if (h.state === "pending") buffer.outboxPosting(h.id, messageId);
+    try {
+      await discord.editMessage(place, messageId, { content: h.content, allowed_mentions: { parse: [] } });
+    } catch (e) {
+      const status = errStatus(e)?.status;
+      if (status === 404) { buffer.outboxPending(h.id); rejectTool(h, "target deleted"); return true; }
+      if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: repeated (or superseded) next step
+      return countRefusal(h, status) >= REFUSE_LIMIT; // Discord refused it: counted, and dropped at the limit so the queue moves on
+    }
+    buffer.atomically(() => { buffer.outboxApplied(h.id); if (state.botUserId) buffer.editChannelMessage(messageId, state.botUserId, h.content); });
+    log.emit("bridge.tool_edited", { bot: name, key: h.key, messageId, ...(h.state === "posting" ? { recovered: true } : {}) });
+    return true;
+  }
   function staleAlert(h: OutboxRow): boolean {
     const [kind, a, b] = h.key.split(":");
     if (kind === "alert") {
@@ -628,6 +675,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (!h) return true;
       if (h.key.startsWith("react:")) { await applyReaction(h); continue; }
       if (h.key.startsWith("thread:")) { await applyThread(h); continue; }
+      if (h.key.startsWith("edit:")) { if (await applyEdit(h)) continue; return false; }
       const replyTo = resolveReplyTo(h);
       const target = targetOf(h);
       if (h.state === "posting") {
@@ -666,20 +714,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       } catch (e) {
         const status = errStatus(e)?.status;
         if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: a post may exist; recovery decides
-        // Discord refused the request: nothing was created. Back to pending with the refusal counted, and after
-        // REFUSE_LIMIT refusals dropped, all in one transaction: a restart can neither lose a refusal nor post again.
-        const n = buffer.atomically(() => {
-          buffer.outboxPending(h.id);
-          buffer.kvDelete(K(`outboxEnd:${h.id}`));
-          const count = Number(buffer.kvGet(K(`outboxRefused:${h.id}`)) ?? 0) + 1;
-          buffer.kvSet(K(`outboxRefused:${h.id}`), String(count));
-          if (count >= REFUSE_LIMIT) dropRefused(h);
-          return count;
-        });
-        log.emit("bridge.outbox_refused", { bot: name, key: h.key, status, attempts: n });
-        if (n < REFUSE_LIMIT) return false; // the next step tries again; nothing behind it goes out meanwhile
+        if (countRefusal(h, status) < REFUSE_LIMIT) return false; // the next step tries again; nothing behind it goes out meanwhile
         unstage(h);
-        log.emit("bridge.outbox_dropped", { bot: name, key: h.key });
         continue;
       }
       buffer.outboxPosted(h.id, m.id, () => onPosted(h, m.id));
@@ -688,6 +724,21 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     }
   }
 
+  // Discord refused the request: nothing was created (or changed). Back to pending with the refusal counted, and after
+  // REFUSE_LIMIT refusals dropped, all in one transaction: a restart can neither lose a refusal nor post again.
+  function countRefusal(h: OutboxRow, status: number): number {
+    const n = buffer.atomically(() => {
+      buffer.outboxPending(h.id);
+      buffer.kvDelete(K(`outboxEnd:${h.id}`));
+      const count = Number(buffer.kvGet(K(`outboxRefused:${h.id}`)) ?? 0) + 1;
+      buffer.kvSet(K(`outboxRefused:${h.id}`), String(count));
+      if (count >= REFUSE_LIMIT) dropRefused(h);
+      return count;
+    });
+    log.emit("bridge.outbox_refused", { bot: name, key: h.key, status, attempts: n });
+    if (n >= REFUSE_LIMIT) log.emit("bridge.outbox_dropped", { bot: name, key: h.key });
+    return n;
+  }
   // A post Discord refused REFUSE_LIMIT times (a missing permission, a file the channel does not allow, a message it
   // rejects) is dropped so the queue moves on. What waited for it is closed (a reply counts as answered with nothing
   // posted, a relay as empty), and one notice says so in the channel, without ids or the error. A refused notice or alert
@@ -703,7 +754,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       else if (kind === "relay") buffer.recordRelayPart(Number(a), Number(b), parts, `refused:${h.id}`);
       if (!["notice", "alert", "clear", "talert", "tclear", "refused", "ralert", "rclear"].includes(kind)) {
         buffer.enqueue(conversationKey, { key: `refused:${h.id}`, nonce: `f${h.id}`,
-          content: `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
+          content: kind === "edit" ? `⚠️ ${name} could not update one of its messages here: Discord refused the edit. It was skipped so later messages can go out.`
+            : `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
       }
       buffer.kvDelete(K(`outboxRefused:${h.id}`));
       // counted for /status too, so a skip stays visible when the channel refuses the notice as well

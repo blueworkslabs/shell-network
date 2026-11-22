@@ -1,7 +1,8 @@
 # Install and rollback
 
 For the current Linux staging layout, run as the service-owning user over SSH.
-This is a bridge release procedure, not a t3/provider upgrade. Keep credentials,
+The release procedure below is for the bridge, not a t3/provider upgrade.
+Antigravity-specific cutover and rollback are covered separately below. Keep credentials,
 backups and instance-specific configuration off git. Do not print environment files.
 
 ## Locations and prerequisites
@@ -149,12 +150,18 @@ other operators' changes; revert only this release's fields if any were changed.
   WorkingDirectory and ExecStart to the candidate, daemon-reload/start, and check
   health. Its current normal stop can take about 40 seconds. Restore its saved
   override to roll back. Do not restart `t3-staging` for a bridge deployment.
-- Gem: `gem-discord-mcp.json` → `mcpServers.discord.args[0]` points to the installed
-  `bin/discord-tool.ts`; its `env` contains `DISCORD_TOOL_BOT=gem` and
+- Claude profiles: a file such as `gem-discord-mcp.json` or
+  `hermes-discord-mcp.json`, is selected by that instance's `--mcp-config`.
+  Its `mcpServers.discord.args[0]` points to the installed
+  `bin/discord-tool.ts`; its `env` contains the owning bot's `DISCORD_TOOL_BOT` and
   `DISCORD_TOOL_DB` pointing to the shared buffer.
-- Hermes: settings JSON → `providerInstances.crewHermesCodex.config.launchArgs`
-  carries `-c mcp_servers.discord.command`, `.args`, `.env.DISCORD_TOOL_BOT=hermes`
+- Codex profiles (including the retained `crewHermesCodex` rollback profile):
+  settings JSON → the instance's `config.launchArgs` carries
+  `-c mcp_servers.discord.command`, `.args`, and the owning bot's `.env.DISCORD_TOOL_BOT`
   and `.env.DISCORD_TOOL_DB`. Preserve all unrelated flags, including plugins/apps.
+- Antigravity: the instance's private `<profile>/config/mcp_config.json` selects
+  the Discord MCP executable and the owning bot's workspace/notes/index. Updating
+  an old Claude profile's MCP file does not update a live Antigravity instance.
 - For an attachment-capable release, add `DISCORD_TOOL_WORKSPACE` to each server's
   env using that bot's own workspace (`~/work/crew/gem` or `~/work/crew/hermes`,
   expanded to an absolute path). Do not share a parent workspace between bots.
@@ -265,3 +272,80 @@ That combination means t3 could not find a supported hosting provider for the
 checkout's remote. The lookup falls back to cached PR information or no PR
 information, and Git status and Discord bridge delivery continue. No operator
 action is needed for this warning alone.
+
+## Antigravity cutover and rollback
+
+Use [SETUP.md](SETUP.md#gemini-through-antigravity) for the verified runtime and
+sign-in path. Keep the old provider, its credentials, persona entrypoint and
+installed MCP release for rollback. Never treat a completed spike profile as
+unused after a live agent has adopted it.
+
+### Move an existing agent without resetting conversations
+
+1. Record the current crew entry, t3 provider config, all of the bot's bound thread
+   IDs and model selections (including options), persona entrypoints and MCP pins.
+   Back up private configuration and take a consistent bridge DB snapshot. Keep
+   backups private; never print credentials or commit profiles.
+2. Finish active work. Check **all** of the bot's channels and DMs for active runs,
+   queued input, pending resets and undelivered replies. Stop only its bridge,
+   recheck for work, and do not interrupt another agent. Stopping a bridge alone
+   does not stop the provider process.
+3. Change only this bot's crew `instanceId` and `model`. Through native t3
+   configuration, change each existing bound thread to the same provider/model
+   and intended options. Do not use `/new`, replace thread bindings, edit t3's DB
+   directly or discard the old conversation. Keep the existing workspace and
+   memory paths. Update runtime wording in the persona, not the persona itself.
+4. Start that bridge. Compare the full binding map with the saved map and read
+   back each changed thread selection. Check MCP startup, then request one live
+   turn using memory and Discord tools. Confirm completion and exactly one
+   delivered reply, and inspect the actual run's provider/model. A model's own
+   claim about its identity or effort is not independent runtime evidence.
+
+If acceptance fails, wait for idle and stop only that bridge. Restore only its
+saved crew entry and thread selections through t3, restore changed persona/MCP
+fields as needed, and start/verify again. Do **not** restore an old live DB or the
+whole settings file over concurrent changes. Keep the Antigravity profile intact;
+rollback does not require logging out, deleting credentials or another Google
+sign-in. Stop on suspension rather than trying other Google clients.
+
+### Provider names are not interchangeable with IDs
+
+In t3 0.1.11, the Antigravity profile is
+`<t3 stateDir>/providers/antigravity/<sha256(instanceId)>`; temporary runtime data
+has a separate path. Changing `displayName` keeps the profile. Changing
+`instanceId` does not: a new ID resolves to a new directory with no existing
+sign-in or MCP config. The schema has no Antigravity profile-path override.
+
+An ID migration therefore needs a separately reviewed, idle-window procedure:
+record all references, stop the old instance's live processes without logging out,
+preserve the private profile and permissions at the destination, then update the
+crew and existing thread selections. Never enable two instances against the same
+live credential profile. Verify catalog/auth readiness, bindings and one real
+turn before retiring the old instance. If those conditions cannot be established,
+leave the ID unchanged and report the remaining migration; a display-name change
+alone is not an ID migration. Restore only the migration's fields on rollback.
+
+### What the initial trial does and does not establish
+
+The 2026-11-22 trial passed a Neon turn, automatic `GEMINI.md` loading, memory
+search, Discord reading and live reply delivery. It did not prove that every
+upstream Antigravity issue is fixed:
+
+- [t3 #36169](https://github.com/pingdotgg/t3code/issues/36169), text generation on
+  CLI 1.5.0+: not exercised. The ACP conversation path worked; the separate
+  text-generation provider was not changed.
+- [t3 #39046](https://github.com/pingdotgg/t3code/issues/39046), long TMPDIR/socket
+  paths: startup succeeded with the deployed runtime path. This is not a general
+  fix or a test of all path lengths. Check the actual inherited runtime path if
+  another deployment fails; do not repeatedly restart the provider blindly.
+- [t3 #39111](https://github.com/pingdotgg/t3code/issues/39111), stale model picker:
+  explicit catalog refresh and Neon selection passed. Long-term invalidation
+  remains unverified. Refresh once and check readiness before selecting a model
+  missing from the current catalog; do not infer its ID from its marketing name.
+
+For the specific PR-lookup warning, see [PR lookup warning](#pr-lookup-warning).
+On the headless crew VM, `keepAwakeWhileAgentsWork: false` disables t3's sleep
+inhibitor request; the operator confirmed the Access denied warning stopped on
+subsequent work. This is appropriate for an always-on VM, not a recommendation to
+disable sleep protection on a laptop. Provider-ID migration remains separate from
+these warning settings under [#67](https://github.com/blueworkslabs/shell-network/issues/67).

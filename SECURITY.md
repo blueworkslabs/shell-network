@@ -58,12 +58,12 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   to 10 threads per bot (counting both active and closing threads until archive and export complete). Restored threads
   stay disabled after a restart (with their saved `tool_config` cleared) until type, parent allowlist and bot access
   are revalidated (closing on `403`/`404` or removed parent). Closing, closed, archived, deleted or unrevalidated
-  threads are denied immediately at the REST write guard, including when a legacy `discord_thread` outbox record exists.
-  Closing threads with bound scheduled jobs hold archive with a redacted warning in parent `/status` and notices until a
-  person moves or deletes them (no automatic move across audiences). Parent `/status` and notices never expose private
-  thread names. Starter-message lookup (`getMessage`) is restricted to configured parent channels and skips messages
-  from unlisted authors. Each thread conversation uses the exact same per-conversation MCP allowlist policy (no wider
-  grant).
+  threads are denied immediately at the REST write guard, at tool admission, and on parent-outbox drain (settling any
+  already-queued writes so later parent posts are not stranded), including when a legacy `discord_thread` outbox record
+  exists. Closing threads with bound scheduled jobs hold archive with a redacted warning in parent `/status` until a
+  person moves or deletes them (no automatic move across audiences). Parent `/status` never exposes private thread
+  names. Starter-message lookup (`getMessage`) is restricted to configured parent channels and skips messages from
+  unlisted authors. Each thread conversation uses the exact same per-conversation MCP allowlist policy (no wider grant).
 - **Files.** An agent can attach only files inside its workspace (`DISCORD_TOOL_WORKSPACE`; the path is resolved
   through symlinks and the target opened without following one). The Discord tool copies them into a staging directory
   and has no credential; the bridge validates the staged copies again before uploading them, so a tampered outbox

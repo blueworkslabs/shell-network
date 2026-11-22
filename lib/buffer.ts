@@ -552,8 +552,17 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       AND state = 'posted' AND channel_message_id IS NOT NULL
       AND (CASE WHEN ?2 IS NULL THEN json_extract(meta, '$.thread') IS NULL ELSE json_extract(meta, '$.thread') = 1 AND json_extract(meta, '$.channel') = ?2 END)
       ORDER BY length(channel_message_id) DESC, channel_message_id DESC LIMIT 1`, conversationKey, threadId)?.id ?? null,
-    // A thread this bot's tool created (thread id = its starter message id), posted: writable for the bot.
-    isToolThread: (conversationKey: string, threadId: string): boolean => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?", conversationKey, threadId)!.n > 0,
+    // A thread this bot's tool created (thread id = its starter message id), posted and not closed/denied: writable for the bot.
+    isToolThread: (conversationKey: string, threadId: string): boolean => one<{ n: number }>(
+      "SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ? AND COALESCE(json_extract(meta, '$.closed'), 0) = 0",
+      conversationKey, threadId,
+    )!.n > 0,
+    // Mark or clear `$.closed` on any legacy discord_thread outbox record for this bot + thread so both lib/tools.ts
+    // and the parent's outbox drain reject/settle writes to closed, deleted, or unrevalidated threads.
+    setToolThreadClosed(botKey: string, threadId: string, closed: boolean): void {
+      const expr = closed ? "json_set(meta, '$.closed', 1)" : "json_remove(meta, '$.closed')";
+      db.prepare(`UPDATE outbox SET meta = ${expr} WHERE substr(conversation_key, 1, length(?1) + 1) = ?1 || '.' AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?2`).run(botKey, threadId);
+    },
     // The posted entry of a conversation that made this message (a reply part, a tool send, an alert, ...).
     outboxByMessage: (conversationKey: string, messageId: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND channel_message_id = ? AND state = 'posted'", conversationKey, messageId),
     // Edits queued after entry `afterId` that have not been attempted: a newer one for the same message supersedes it.

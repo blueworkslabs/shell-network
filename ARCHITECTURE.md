@@ -189,12 +189,13 @@ channels are ignored.
   closing threads until archive and export finish); an 11th receives one fixed notice and starts no session. After a
   restart, saved active threads stay disabled until `READY`/`RESUMED` revalidates thread type, configured parent and
   bot access (a `403`, `404` or removed parent closes the thread). When Discord archives or deletes the thread, the
-  bridge immediately revokes REST writes (including any legacy `discord_thread` fallback) and `tool_config`, stops
-  accepting new input, waits for any running t3 turn to settle, checks for bound standing scheduled jobs (enabled and
-  paused, failing closed on error; if any remain, holds archiving and surfaces a redacted warning in parent `/status`
-  and the parent channel until a person moves or deletes them), archives the t3 session, purges leftover buffered input
-  and pending/posting outbox rows so reopening cannot replay stale work, exports to `sessions/` (same as `/new`), and
-  frees the slot. The existing per-conversation MCP allowlist needs no wider grant.
+  bridge immediately revokes REST writes (including any legacy `discord_thread` fallback) and `tool_config` (rejecting
+  new tool requests and settling any queued parent-outbox writes to the closed thread so later parent posts proceed),
+  stops accepting new input, waits for any running t3 turn to settle, checks for bound standing scheduled jobs (enabled
+  and paused, failing closed on error; if any remain, holds archiving and surfaces a redacted warning in parent
+  `/status` until a person moves or deletes them), archives the t3 session, purges leftover buffered input and
+  pending/posting outbox rows so reopening cannot replay stale work, exports to `sessions/` (same as `/new`), and frees
+  the slot. The existing per-conversation MCP allowlist needs no wider grant.
 
 ## Output: one outbox per bot
 

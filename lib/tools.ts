@@ -55,7 +55,7 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
     const known = channels();
     if (!known.length) throw new ToolError("the bridge has not started for this bot yet; nothing can be posted");
     if (known.includes(channel)) { const key = conversationKeyFor(bot, channel); return { key, c: configOf(key)!, thread: false }; }
-    const t = threadOk && SNOWFLAKE.test(channel) ? one<{ conversation_key: string }>(`SELECT conversation_key FROM outbox WHERE ${mine} AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?2`, bot, channel) : undefined;
+    const t = threadOk && SNOWFLAKE.test(channel) ? one<{ conversation_key: string }>(`SELECT conversation_key FROM outbox WHERE ${mine} AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?2 AND COALESCE(json_extract(meta, '$.closed'), 0) = 0`, bot, channel) : undefined;
     if (t) return { key: t.conversation_key, c: configOf(t.conversation_key)!, thread: true };
     throw new ToolError(`channel ${channel} is not allowed; your channels are ${known.join(", ")}${threadOk ? " (or a thread this bot created in one of them)" : ""}`);
   }

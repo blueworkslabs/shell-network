@@ -190,6 +190,7 @@ export function makeThreadManager({
 
   function markClosing(threadId: string, why: string): void {
     pendingRestore.delete(threadId);
+    buffer.setToolThreadClosed(botKey, threadId, true);
     const records = loadRecords();
     const idx = records.findIndex((r) => r.threadId === threadId);
     if (idx < 0 || records[idx].state === "closing") return;
@@ -220,6 +221,7 @@ export function makeThreadManager({
         }
         if (pendingRestore.delete(r.threadId) && !bots.has(r.threadId)) {
           const cur = recordOf(r.threadId) ?? r;
+          buffer.setToolThreadClosed(botKey, r.threadId, false);
           const bot = instantiate(cur);
           bot.initWatermark(cur.createdAt);
           nudge();
@@ -229,6 +231,7 @@ export function makeThreadManager({
         if (status === 403 || status === 404) {
           metaCache.set(r.threadId, null);
           buffer.kvSet(deniedKey(r.threadId), "1");
+          buffer.setToolThreadClosed(botKey, r.threadId, true);
           markClosing(r.threadId, status === 403 ? "access-denied" : "deleted-offline");
         } else log.emit("bridge.thread_check_error", { bot: botName, threadId: r.threadId, error: errText(e) });
       }
@@ -275,6 +278,7 @@ export function makeThreadManager({
       const bot = instantiate(record);
       // Clear any closing/denied markers and stale state if this Discord thread was previously archived and later unarchived.
       buffer.kvDelete(deniedKey(threadId));
+      buffer.setToolThreadClosed(botKey, threadId, false);
       bot.reopen();
       // Start watermark right before the activating message so catch-up starts here without missing it.
       bot.initWatermarkAt(String(BigInt(msg.id) - 1n));
@@ -293,6 +297,7 @@ export function makeThreadManager({
     for (let i = 0; i < records.length; i++) {
       const r = records[i];
       if (r.state === "closing") {
+        buffer.setToolThreadClosed(botKey, r.threadId, true);
         instantiate(r);
         continue;
       }
@@ -300,14 +305,16 @@ export function makeThreadManager({
       if (!parentChannels.has(r.parentId) || typeof r.type !== "number" || !THREAD_TYPES.has(r.type)) {
         records[i] = { ...r, state: "closing" };
         changed = true;
+        buffer.setToolThreadClosed(botKey, r.threadId, true);
         const bot = instantiate(records[i]);
         bot.requestClose();
         log.emit("bridge.thread_closing", { bot: botName, threadId: r.threadId, why: !parentChannels.has(r.parentId) ? "parent-removed" : "invalid-type" });
         continue;
       }
-      // Keep active restored threads disabled (and revoke their saved tool_config) until checkThreads() revalidates
-      // Discord type, parent, and bot access.
+      // Keep active restored threads disabled (and revoke their saved tool_config and legacy tool-thread fallback)
+      // until checkThreads() revalidates Discord type, parent, and bot access.
       buffer.deleteToolConfig(`${botKey}.${r.threadId}`);
+      buffer.setToolThreadClosed(botKey, r.threadId, true);
       pendingRestore.add(r.threadId);
     }
     if (changed) saveRecords(records);
@@ -332,9 +339,13 @@ export function makeThreadManager({
       if (!meta) return undefined;
       if (meta.archived) {
         buffer.kvSet(deniedKey(d.id), "1");
+        buffer.setToolThreadClosed(botKey, d.id, true);
         markClosing(d.id, "archived");
       } else {
-        if (recordOf(d.id)?.state !== "closing") buffer.kvDelete(deniedKey(d.id));
+        if (recordOf(d.id)?.state !== "closing") {
+          buffer.kvDelete(deniedKey(d.id));
+          if (!recordOf(d.id) && buffer.kvGet(`${botKey}.${d.id}:threadClosed`) !== "1") buffer.setToolThreadClosed(botKey, d.id, false);
+        }
         const records = loadRecords();
         const idx = records.findIndex((r) => r.threadId === d.id);
         if (idx >= 0 && (records[idx].name !== meta.name || records[idx].type !== meta.type)) {
@@ -348,6 +359,7 @@ export function makeThreadManager({
       if (typeof d?.id === "string") {
         metaCache.set(d.id, null);
         buffer.kvSet(deniedKey(d.id), "1");
+        buffer.setToolThreadClosed(botKey, d.id, true);
         markClosing(d.id, "deleted");
       }
       return undefined;
@@ -357,6 +369,7 @@ export function makeThreadManager({
         const meta = cacheChannel(t as DiscordChannel);
         if (meta?.archived) {
           buffer.kvSet(deniedKey(t.id), "1");
+          buffer.setToolThreadClosed(botKey, t.id, true);
           markClosing(t.id, "archived-sync");
         }
       }

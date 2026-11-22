@@ -311,16 +311,18 @@ test("THREADS: cap refuses the (N+1)th thread with one fixed notice, holds the s
   assert.equal(w.t3ThreadOf(t3bId), null);
   assert.equal(w.threads.isAllowedThread(t3bId), false, "write guard closes immediately after cap notice");
   assert.equal(w.discord.botPosts(t3bId).length, 1);
-  // Restored unrevalidated t1 is also denied even with isToolThread fallback
-  assert.equal(w.threads.isAllowedWrite(t1, w.buffer.isToolThread(parentKey, t1)), false, "unrevalidated thread denied despite isToolThread");
+  // Restored unrevalidated t1 is also denied (both isToolThread and explicit fallback)
+  assert.equal(w.buffer.isToolThread(parentKey, t1), false, "unrevalidated thread revokes isToolThread");
+  assert.equal(w.threads.isAllowedWrite(t1, true), false, "unrevalidated thread denied despite fallback");
 
   // Archive t1 while its turn is STILL running:
-  // 1) writes are revoked immediately even though bots.has(t1) and isToolThread(t1) are true
+  // 1) writes are revoked immediately even though bots.has(t1) is true
   // 2) cap slot remains occupied while t1 is closing (running turn)
   await w.dispatch("THREAD_UPDATE", { id: t1, parent_id: PARENT_CH, name: "t1", type: 11, thread_metadata: { archived: true } });
   assert.equal(w.threads.bots.has(t1), true);
   assert.equal(w.threads.isAllowedThread(t1), false, "closing thread denied immediately");
-  assert.equal(w.threads.isAllowedWrite(t1, w.buffer.isToolThread(parentKey, t1)), false, "isToolThread fallback cannot bypass closing denial");
+  assert.equal(w.buffer.isToolThread(parentKey, t1), false, "closing thread revokes isToolThread");
+  assert.equal(w.threads.isAllowedWrite(t1, true), false, "fallback cannot bypass closing denial");
 
   const t3cId = "200000000000000026";
   w.openThread(t3cId, { name: "t3c" });
@@ -591,7 +593,7 @@ test("THREADS: close -> restart -> reopen purges stale buffered input, pending e
   assert.deepEqual(contents, ["first post", "fresh reopened answer"]);
 });
 
-test("THREADS: closing a thread with enabled and paused standing jobs holds archive and surfaces redacted parent /status + notice without automatic move", async () => {
+test("THREADS: closing a thread with enabled and paused standing jobs holds archive and surfaces redacted parent /status warning only (no parent notice, no automatic move)", async () => {
   const notesRoot = tempDir("thread-jobs-notes-");
   const w = world({ notesRoot });
   const thId = "200000000000000071";
@@ -616,17 +618,12 @@ test("THREADS: closing a thread with enabled and paused standing jobs holds arch
   assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "fails closed when listStandingJobs errors");
   w.t3.listStandingJobs = origList;
 
-  // Step again: discovers both jobs, holds archive, posts one redacted parent notice, surfaces redacted parent /status warning,
+  // Step again: discovers both jobs, holds archive, posts NO parent-channel notice, surfaces redacted parent /status warning,
   // and does NOT automatically move jobs or send any handoff to the parent session
   await w.steps(3);
   assert.equal(w.t3.threads.get(thT3)!.archived ?? false, false, "holds archive while enabled + paused jobs remain bound");
   assert.equal(w.t3.sends().some((s) => s.clientRequestId?.includes("schedule-handoff")), false, "no automatic job handoff to parent");
-
-  // Parent channel received one redacted notice without leaking private thread name or job IDs
-  const notices = w.discord.botPosts(PARENT_CH).filter((m) => m.content.includes("scheduled job"));
-  assert.equal(notices.length, 1);
-  assert.match(notices[0].content, /a private thread closed with 2 scheduled jobs \(1 active, 1 paused\)/);
-  assert.doesNotMatch(notices[0].content, /secret-job-thread|job-active|job-paused/);
+  assert.equal(w.discord.botPosts(PARENT_CH).length, 0, "no parent-channel notice posted (/status only)");
 
   // Parent /status surfaces the redacted warning even though the Discord thread is already archived
   await w.runCmd("status", PARENT_CH);
@@ -650,6 +647,60 @@ test("THREADS: closing a thread with enabled and paused standing jobs holds arch
   assert.equal(w.threads.records().length, 0);
   await w.runCmd("status", PARENT_CH);
   assert.doesNotMatch(w.ixCalls.at(-1)!, /Warning: .*scheduled job/);
+});
+
+test("THREADS: closing a legacy discord_thread rejects new tool writes and settles queued parent outbox entries so the next parent post goes through", async () => {
+  const w = world();
+  const parentKey = conversationKeyFor("gem", PARENT_CH);
+  const tools = w.tools();
+
+  // Enforce the same strict REST write guard as bin/bridge.ts (throws without HTTP status if denied)
+  const origCreate = w.discord.createMessage.bind(w.discord);
+  const origEdit = w.discord.editMessage.bind(w.discord);
+  const checkWrite = (ch: string) => {
+    if (ch !== PARENT_CH && !w.threads.isAllowedWrite(ch, w.buffer.isToolThread(parentKey, ch))) {
+      throw new Error(`channel ${ch} is not allowed`);
+    }
+  };
+  w.discord.createMessage = async (ch, payload) => { checkWrite(ch); return origCreate(ch, payload); };
+  w.discord.editMessage = async (ch, mid, payload) => { checkWrite(ch); return origEdit(ch, mid, payload); };
+
+  // Create a legacy discord_thread from a parent message and post one initial message into it
+  const starter = w.discord.userSays("legacy thread root", { mention: false, channel: PARENT_CH, guildId: GUILD });
+  await w.dispatch("MESSAGE_CREATE", starter);
+  const toolTh = starter.id;
+  w.openThread(toolTh, { name: "legacy-tool-thread", type: 11 });
+  tools.thread({ channel: PARENT_CH, message_id: toolTh, name: "legacy-tool-thread", idempotency_key: "mk-th-1" });
+  await w.steps(2);
+  assert.equal(w.buffer.isToolThread(parentKey, toolTh), true);
+
+  const first = tools.send({ channel: toolTh, content: "initial thread post", idempotency_key: "lt-send-0" });
+  const firstRef = (first.structuredContent as { ref: string }).ref;
+  await w.steps(2);
+  const postedInThread = w.discord.botPosts(toolTh);
+  assert.equal(postedInThread.length, 1);
+
+  // Queue a pending send, a pending edit, and a posting send targeting the legacy thread on the PARENT's outbox,
+  // followed by a normal parent-channel post behind them
+  tools.send({ channel: toolTh, content: "queued send to closed thread", idempotency_key: "lt-send-1" });
+  tools.edit({ channel: toolTh, ref: firstRef, content: "queued edit to closed thread", idempotency_key: "lt-edit-1" });
+  w.buffer.enqueue(parentKey, { key: "tool:posting-stale", content: "posting send to closed thread", nonce: "ps1", state: "posting", boundary: postedInThread[0].id, meta: { channel: toolTh, thread: 1 } });
+  tools.send({ channel: PARENT_CH, content: "next parent post goes through", idempotency_key: "parent-after-1" });
+
+  // Archive the legacy thread before draining
+  await w.dispatch("THREAD_UPDATE", { id: toolTh, parent_id: PARENT_CH, name: "legacy-tool-thread", type: 11, thread_metadata: { archived: true } });
+
+  // New tool calls targeting the closed thread are rejected immediately at tool admission
+  assert.throws(() => tools.send({ channel: toolTh, content: "new send after close", idempotency_key: "lt-send-2" }), /not allowed/);
+  assert.throws(() => tools.edit({ channel: toolTh, ref: firstRef, content: "new edit after close", idempotency_key: "lt-edit-2" }), /not allowed/);
+
+  // Draining the parent outbox settles/drops every queued write to the closed thread without stalling,
+  // and delivers the subsequent parent post cleanly
+  await w.steps(3);
+  assert.equal(w.discord.botPosts(toolTh).length, 1, "no queued posts reached the closed thread");
+  assert.equal(w.discord.writes.filter((x) => x.kind === "edit" && x.channelId === toolTh).length, 0, "no queued edit reached the closed thread");
+  assert.deepEqual(w.discord.botPosts(PARENT_CH).map((m) => m.content), ["next parent post goes through"]);
+  assert.equal(w.buffer.outboxHead(parentKey), undefined, "parent outbox drained completely");
 });
 
 test("THREADS: existing per-conversation allowlist policy covers launch, archive and export without any wider grant", async () => {

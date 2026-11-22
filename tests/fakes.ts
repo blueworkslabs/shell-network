@@ -160,7 +160,7 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
 export const HUMAN_ID = "111111111111111111";
 export const STRANGER_ID = "222222222222222222";
 
-export interface DiscordCrash { buffer?: { close(): void }; post?: "before" | "after"; react?: "before" | "after"; thread?: "before" | "after" }
+export interface DiscordCrash { buffer?: { close(): void }; post?: "before" | "after"; react?: "before" | "after"; thread?: "before" | "after"; edit?: "before" | "after" }
 export interface FakeMessage extends DiscordMessage { author: { id: string; username?: string; bot?: boolean }; content: string }
 export type FakeAttachment = NonNullable<DiscordMessage["attachments"]>[number];
 export interface FakeDiscord {
@@ -174,6 +174,7 @@ export interface FakeDiscord {
   createMessage(ch: string, payload: CreateMessagePayload): Promise<FakeMessage>;
   typing(ch: string): Promise<void>;
   react(ch: string, messageId: string, emoji: string): Promise<void>;
+  editMessage(ch: string, messageId: string, payload: { content: string; allowed_mentions: { parse: string[] } }): Promise<FakeMessage>;
   messagesAfter(ch: string, afterId: string, limit?: number): Promise<FakeMessage[]>;
   startThread(ch: string, messageId: string, name: string): Promise<{ id: string }>;
   getChannel(id: string): Promise<{ id: string; parent_id?: string | null; guild_id?: string }>;
@@ -190,7 +191,7 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
   const nonces = new Map<string | undefined, FakeMessage>();
   const crash: DiscordCrash = {};    // { post: "before" | "after", react: "before" } -> consumed once; needs crash.buffer
   const threads: FakeDiscord["threads"] = new Map(); // threads from messages: id = the starter message id
-  const die = (point: "post" | "react" | "thread"): never => { crash.buffer?.close(); delete crash[point]; throw new Error(`CRASH at ${point}`); };
+  const die = (point: "post" | "react" | "thread" | "edit"): never => { crash.buffer?.close(); delete crash[point]; throw new Error(`CRASH at ${point}`); };
   const api: FakeDiscord = {
     messages, writes, reactions, nonces, crash, threads,
     // a user message in a channel (not through the bridge)
@@ -224,6 +225,17 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
       if (reactions.filter((r) => r.messageId === messageId && r.emoji === emoji).length >= 20) throw new Error(`fake Discord: reaction ${emoji} on ${messageId} PUT more than 20 times`);
       reactions.push({ messageId, emoji, at: api.onReact?.(messageId) });
       if (crash.react === "after") die("react");
+    },
+    // only the bot's own messages, in their channel (Discord: 404 for an unknown message, 403 for another author's)
+    async editMessage(ch, messageId, payload) {
+      writes.push({ kind: "edit", channelId: ch, payload: payload as CreateMessagePayload });
+      if (crash.edit === "before") die("edit");
+      const m = messages.find((x) => x.id === messageId && x.channel_id === ch);
+      if (!m) throw Object.assign(new Error("Unknown Message"), { status: 404, code: 10008 });
+      if (m.author.id !== botUserId) throw Object.assign(new Error("Cannot edit a message authored by another user"), { status: 403, code: 50005 });
+      m.content = payload.content;
+      if (crash.edit === "after") die("edit");
+      return m;
     },
     async messagesAfter(ch, afterId, limit = 100) {
       return messages.filter((m) => m.channel_id === ch && BigInt(m.id) > BigInt(afterId)).slice(0, limit).reverse(); // Discord: newest first

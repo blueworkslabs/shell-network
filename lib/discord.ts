@@ -85,6 +85,11 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
     },
     typing: (channelId: string) => { writeGuard(channelId); return api.channels.showTyping(channelId); },
     react: (channelId: string, messageId: string, emoji: string) => { writeGuard(channelId); return api.channels.addMessageReaction(channelId, messageId, emoji); },
+    editMessage: (channelId: string, messageId: string, payload: { content: string; allowed_mentions: { parse: string[] } }) => {
+      writeGuard(channelId);
+      if (!SNOWFLAKE.test(messageId)) throw new Error("message id malformed");
+      return api.channels.editMessage(channelId, messageId, payload as never);
+    },
     messagesAfter: (channelId: string, afterId: string, limit = 100): Promise<DiscordMessage[]> =>
       api.channels.getMessages(channelId, { after: afterId, limit }) as unknown as Promise<DiscordMessage[]>,
     // a thread from a message (its id is the message id), only under an allowed channel itself (not under a thread)

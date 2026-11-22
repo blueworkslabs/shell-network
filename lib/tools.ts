@@ -1,4 +1,4 @@
-// The Discord tool's operations: discord_send, discord_react, discord_thread (mutating) and
+// The Discord tool's operations: discord_send, discord_edit, discord_react, discord_thread (mutating) and
 // discord_read (read-only, from the bridge's channel log). They never talk to Discord: each mutating call
 // validates its arguments against what the bridge published (tool_config) and the channel log, then inserts one
 // outbox entry and its request row in one IMMEDIATE transaction; the bridge posts it in order (lib/bot.ts drainOutbox)
@@ -11,7 +11,9 @@
 //   - mentions only of the configured crew bots (allowed_mentions users), never roles, everyone or the replied user;
 //   - a send that names another crew bot uses the bot-to-bot exchange budget of the conversation: bot messages naming
 //     another crew bot since the last message of a person, plus every bot's tool sends to a bot not in the log yet; the check
-//     and the insert are one transaction, so two concurrent calls cannot both pass. Reactions do not use the cap.
+//     and the insert are one transaction, so two concurrent calls cannot both pass. Reactions do not use the cap;
+//   - an edit replaces the text of one of this bot's own posts in the same place (#59), pings nobody and may name only
+//     crew bots the post already named, so it neither hands work over nor uses the cap.
 import { randomBytes } from "node:crypto";
 import { ATTACH_MAX_FILES, removeStaged, stageFiles, type StagedFile } from "./attachments.ts";
 import { conversationKeyFor } from "./bots.ts";
@@ -26,9 +28,9 @@ const EMOJI = /^(?=.*(?:\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣))(?
 
 export class ToolError extends Error {}
 
-type Op = "send" | "react" | "thread";
-const PREFIX: Record<Op, string> = { send: "tool", react: "react", thread: "thread" };
-const NONCE: Record<Op, string> = { send: "t", react: "x", thread: "h" };
+type Op = "send" | "edit" | "react" | "thread";
+const PREFIX: Record<Op, string> = { send: "tool", edit: "edit", react: "react", thread: "thread" };
+const NONCE: Record<Op, string> = { send: "t", edit: "e", react: "x", thread: "h" };
 export const READ_MAX = 50;
 
 interface Config { channel_id: string; bot_user_id: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchange_cap: number }
@@ -145,6 +147,31 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
     }, { threadOk: true });
   }
 
+  // The post an edit replaces: by `ref` (a discord_send result, posted or still queued) or by `message_id` (any post of
+  // this bot's conversation, a reply part included). Only entries with a message of their own qualify: reactions,
+  // threads and edits never get a channel message id.
+  type Post = { id: number; key: string; state: string; content: string; meta: string; channel_message_id: string | null };
+  function edit(a: Record<string, unknown>): ToolResult {
+    const channel = str(a.channel, "channel"), content = str(a.content, "content").trim();
+    const byRef = a.ref !== undefined && a.ref !== null, byId = a.message_id !== undefined && a.message_id !== null;
+    if (byRef === byId) throw new ToolError("give exactly one of message_id and ref");
+    const target = byRef ? str(a.ref, "ref") : str(a.message_id, "message_id");
+    return request("edit", a.idempotency_key, { channel, content, ...(byRef ? { ref: target } : { message_id: target }) }, ({ key, c, thread }) => {
+      if (!content) throw new ToolError("content is empty");
+      if (content.length > MAX_CONTENT) throw new ToolError(`content is ${content.length} characters; at most ${MAX_CONTENT}`);
+      const post = byRef
+        ? (/^tool:[0-9a-f]{24}$/.test(target) ? one<Post>("SELECT id, key, state, content, meta, channel_message_id FROM outbox WHERE conversation_key = ? AND key = ?", key, target) : undefined)
+        : SNOWFLAKE.test(target) ? one<Post>("SELECT id, key, state, content, meta, channel_message_id FROM outbox WHERE conversation_key = ? AND channel_message_id = ? AND state = 'posted'", key, target) : undefined;
+      const where = post ? (JSON.parse(post.meta) as { thread?: number; channel?: string }) : null;
+      if (!post || post.state === "dropped" || (thread ? where!.thread !== 1 || where!.channel !== channel : where!.thread === 1))
+        throw new ToolError(`${byRef ? "ref" : "message_id"} ${target} is not a post of this bot in channel ${channel}`);
+      const added = c.crew.filter((b) => names(content, b.id) && !names(post.content, b.id));
+      if (added.length) throw new ToolError(`an edit cannot add mentions (${added.map((b) => b.name).join(", ")}); use discord_send to hand work over`);
+      // posted: its message id; still queued: a reference the bridge resolves once that post is out (it goes first)
+      return { content, replyTo: post.state === "posted" ? post.channel_message_id : `outbox:${post.id}`, users: [], meta: { channel, ...(thread ? { thread: 1 } : {}) } };
+    }, { threadOk: true });
+  }
+
   function react(a: Record<string, unknown>): ToolResult {
     const channel = str(a.channel, "channel"), messageId = str(a.message_id, "message_id"), emoji = str(a.emoji, "emoji");
     return request("react", a.idempotency_key, { channel, message_id: messageId, emoji }, ({ c }) => {
@@ -186,6 +213,11 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
         properties: { channel: { type: "string", description: "Channel id: one of the bot's channels, or a thread this bot created in one." }, content: { type: "string", maxLength: MAX_CONTENT, description: "May be empty when files are given." }, reply_to: { type: "string", description: "Optional: id of a message in the channel to reply to." },
           files: { type: "array", maxItems: ATTACH_MAX_FILES, items: { type: "string" }, description: "Optional: paths of files in your workspace to attach (absolute, or relative to the workspace; at most 8 MiB in all)." }, idempotency_key: idemProp } },
       call: send },
+    { name: "discord_edit", description: "Replace the text of a message this bot already posted, e.g. one progress message you keep updating during long work instead of posting new ones. Name the message by the `ref` a discord_send returned (also while it is still queued) or by its message id. An edit pings nobody and cannot add mentions. Your final text is still posted unless it is exactly NO_REPLY.",
+      inputSchema: { type: "object", additionalProperties: false, required: ["channel", "content", "idempotency_key"],
+        properties: { channel: { type: "string", description: "Channel id where the message is (or the thread id)." }, ref: { type: "string", description: "The ref of an earlier discord_send (tool:...). Give this or message_id." },
+          message_id: { type: "string", description: "Id of a message this bot posted. Give this or ref." }, content: { type: "string", maxLength: MAX_CONTENT, description: "The new text, replacing the old." }, idempotency_key: idemProp } },
+      call: edit },
     { name: "discord_react", description: "Add a reaction (one Unicode emoji) to a message in one of the bot's Discord channels.",
       inputSchema: { type: "object", additionalProperties: false, required: ["channel", "message_id", "emoji", "idempotency_key"],
         properties: { channel: { type: "string", description: "Channel id of the message." }, message_id: { type: "string" }, emoji: { type: "string" }, idempotency_key: idemProp } },
@@ -199,5 +231,5 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
         properties: { channel: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: READ_MAX }, before: { type: "string", description: "Optional: only messages older than this message id." } } },
       call: read },
   ];
-  return { tools, send, react, thread, read };
+  return { tools, send, edit, react, thread, read };
 }

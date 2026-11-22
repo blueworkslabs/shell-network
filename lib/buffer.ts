@@ -543,6 +543,8 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       ORDER BY length(channel_message_id) DESC, channel_message_id DESC LIMIT 1`, conversationKey, threadId)?.id ?? null,
     // A thread this bot's tool created (thread id = its starter message id), posted: writable for the bot.
     isToolThread: (conversationKey: string, threadId: string): boolean => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE conversation_key = ? AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to = ?", conversationKey, threadId)!.n > 0,
+    // The posted entry of a conversation that made this message (a reply part, a tool send, an alert, ...).
+    outboxByMessage: (conversationKey: string, messageId: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND channel_message_id = ? AND state = 'posted'", conversationKey, messageId),
     outboxById: (id: number): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE id = ?", id),
     // The oldest entry not posted (or dropped) yet: the only one the worker may touch.
     outboxHead: (conversationKey: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND state IN ('pending','posting') ORDER BY id LIMIT 1", conversationKey),
@@ -571,6 +573,8 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         exchange_cap = excluded.exchange_cap, updated_at = excluded.updated_at`).run(conversationKey, c.channelId, c.botUserId, JSON.stringify(c.crew), c.exchangeCap, now());
     },
     // A message of the channel log (allowlisted people, allowed crew bots, this bot): tool targets must be one.
+    // An edit of the bot's own post (discord_edit), applied: the channel log shows the new text.
+    editChannelMessage: (id: string, authorId: string, content: string): void => { db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND author_id = ?").run(content, id, authorId); },
     channelMessage: (id: string): { id: string; author_id: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).

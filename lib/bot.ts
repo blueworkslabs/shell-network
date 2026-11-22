@@ -608,6 +608,34 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     buffer.outboxApplied(h.id);
     log.emit("bridge.tool_thread", { bot: name, key: h.key, threadId: h.reply_to });
   }
+  // A tool edit of one of this bot's own posts (its target: a message id, or `outbox:<id>` of a post queued before it,
+  // which is out by now). Checked again while pending: the place, the text, and that the target is a post of this
+  // conversation there that names every crew bot the new text names. `posting` stores the target id before the PATCH;
+  // the PATCH sets the same text again, so recovery repeats it. A deleted target (404): back to pending, then dropped.
+  async function applyEdit(h: OutboxRow): Promise<void> {
+    const meta = toolMeta(h), place = meta.thread === 1 ? meta.channel ?? "" : channelId;
+    let messageId = h.boundary ?? "";
+    if (h.state === "pending") {
+      const id = resolveReplyTo(h);
+      const post = id === null ? undefined : buffer.outboxByMessage(conversationKey, id);
+      const at = post ? (JSON.parse(post.meta) as { thread?: number; channel?: string }) : null;
+      const why = (meta.thread === 1 ? !buffer.isToolThread(conversationKey, place) : meta.channel !== channelId) ? "channel not allowed"
+        : !h.content.trim() || h.content.length > PART ? "content empty or too long"
+        : !post || (meta.thread === 1 ? at!.thread !== 1 || at!.channel !== place : at!.thread === 1) ? "target is not a post of this bot there"
+        : mentionsIn(h.content).some((u) => !mentionsIn(post.content).includes(u)) ? "an edit cannot add mentions" : null;
+      if (why) return rejectTool(h, why);
+      messageId = id!;
+      buffer.outboxPosting(h.id, messageId);
+    }
+    try {
+      await discord.editMessage(place, messageId, { content: h.content, allowed_mentions: { parse: [] } });
+    } catch (e) {
+      if (errStatus(e)?.status === 404) { buffer.outboxPending(h.id); return rejectTool(h, "target deleted"); }
+      throw e;
+    }
+    buffer.atomically(() => { buffer.outboxApplied(h.id); if (state.botUserId) buffer.editChannelMessage(messageId, state.botUserId, h.content); });
+    log.emit("bridge.tool_edited", { bot: name, key: h.key, messageId, ...(h.state === "posting" ? { recovered: true } : {}) });
+  }
   function staleAlert(h: OutboxRow): boolean {
     const [kind, a, b] = h.key.split(":");
     if (kind === "alert") {
@@ -628,6 +656,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (!h) return true;
       if (h.key.startsWith("react:")) { await applyReaction(h); continue; }
       if (h.key.startsWith("thread:")) { await applyThread(h); continue; }
+      if (h.key.startsWith("edit:")) { await applyEdit(h); continue; }
       const replyTo = resolveReplyTo(h);
       const target = targetOf(h);
       if (h.state === "posting") {

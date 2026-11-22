@@ -121,6 +121,43 @@ test("TOOL THREAD ONLY: a posted entry that merely replies to a message does not
   assert.throws(() => t.send({ channel: m, content: "into a non-thread", idempotency_key: "nt" }), /not allowed/);
 });
 
+test("TOOL EDIT: a post of this bot by ref (also while queued) or by message id; foreign, wrong-place and dropped targets, added mentions and bad text are refused", () => {
+  const { b, t, say, out } = setup();
+  const key = conversationKeyFor("gem", CH);
+  const sent = out(t.send({ channel: CH, content: `working on it, <@${HERMES}> fyi`, idempotency_key: "p1" }));
+  const queued = out(t.edit({ channel: CH, ref: sent.ref, content: `step 2 of 3, <@${HERMES}> fyi`, idempotency_key: "e1" }));
+  assert.equal(queued.status, "queued");
+  assert.equal(b.outboxEntry(key, queued.ref)!.reply_to, `outbox:${b.outboxEntry(key, sent.ref)!.id}`, "queued target: resolved by the bridge once it is out");
+  assert.equal(out(t.edit({ channel: CH, ref: sent.ref, content: `step 2 of 3, <@${HERMES}> fyi`, idempotency_key: "e1" })).replay, true);
+  const posted = sf();
+  b.outboxPosted(b.outboxEntry(key, sent.ref)!.id, posted);
+  assert.equal(b.outboxEntry(key, out(t.edit({ channel: CH, message_id: posted, content: "done", idempotency_key: "e2" })).ref)!.reply_to, posted);
+  assert.equal(b.outboxEntry(key, out(t.edit({ channel: CH, ref: sent.ref, content: "done", idempotency_key: "e3" })).ref)!.reply_to, posted, "a posted ref becomes its message id");
+  const reply = b.enqueue(key, { key: "reply:1:0", content: "my answer", nonce: "b1p0", replyTo: null });
+  const replyId = sf();
+  b.outboxPosted(reply.id, replyId);
+  out(t.edit({ channel: CH, message_id: replyId, content: "my corrected answer", idempotency_key: "e4" }));
+  const human = say(HUMAN, "human", "hi");
+  const dropped = out(t.send({ channel: CH, content: "never out", idempotency_key: "p2" }));
+  b.outboxDrop(b.outboxEntry(key, dropped.ref)!.id);
+  const react = out(t.react({ channel: CH, message_id: human, emoji: "👍", idempotency_key: "r1" }));
+  const thread = out(t.thread({ channel: CH, message_id: human, name: "side", idempotency_key: "t1" }));
+  b.outboxApplied(b.outboxEntry(key, thread.ref)!.id);
+  const refused: [Record<string, unknown>, RegExp][] = [
+    [{ message_id: human }, /not a post of this bot/], [{ ref: dropped.ref }, /not a post of this bot/], [{ ref: react.ref }, /not a post of this bot/],
+    [{ ref: "tool:000000000000000000000000" }, /not a post of this bot/], [{ message_id: posted, channel: human }, /not a post of this bot/],
+    [{ message_id: posted, channel: "999" }, /not allowed/], [{}, /exactly one of/], [{ message_id: posted, ref: sent.ref }, /exactly one of/],
+    [{ ref: sent.ref, content: "  " }, /content is empty/], [{ ref: sent.ref, content: "x".repeat(MAX_CONTENT + 1) }, /at most/],
+    [{ message_id: replyId, content: `<@${HERMES}> please review` }, /cannot add mentions \(Hermes\)/],
+  ];
+  const inThread = out(t.send({ channel: human, content: "thread progress", idempotency_key: "p3" }));
+  assert.equal(out(t.edit({ channel: human, ref: inThread.ref, content: "thread progress 2", idempotency_key: "e5" })).status, "queued", "a post in a tool thread, edited there");
+  refused.push([{ ref: inThread.ref }, /not a post of this bot/]); // ... but not as if it were in the channel
+  const before = (b.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n;
+  for (const [args, re] of refused) assert.throws(() => t.edit({ channel: CH, content: "new text", idempotency_key: `x${Math.random()}`.replace("0.", ""), ...args }), (e) => e instanceof ToolError && re.test(e.message), JSON.stringify(args));
+  assert.equal((b.db.prepare("SELECT count(*) n FROM outbox").get() as { n: number }).n, before, "nothing was queued");
+});
+
 test("R1 SHARED CAP: Gem's and Hermes's queued tool sends to each other share one conversation budget", () => {
   const { path, b, t: gem, say, out } = setup({ cap: 2 });
   b.setToolConfig(conversationKeyFor("hermes", CH), { channelId: CH, botUserId: HERMES, crew: [{ id: ME, name: "Gem" }], exchangeCap: 2 });

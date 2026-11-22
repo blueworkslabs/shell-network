@@ -165,7 +165,7 @@ cap). Discord shows one entry per bot, so choosing the entry chooses the bot. Th
 
 Every message a bot posts goes into the `outbox` table, and one worker posts the entries strictly head first. This
 covers batch replies, relayed completions, stuck alerts and their follow-ups, thread alerts, watchdog notices, and
-the tool's sends, reactions and threads.
+the tool's sends, edits, reactions and threads.
 
 - Before the POST, the entry is set to `posting` and the channel boundary is stored (the newest message at that
   moment). After the POST, the message id and the domain record are stored in one transaction.
@@ -265,6 +265,11 @@ a timing SLA. No bridge code change was required.
   Targets must be messages in that channel's log. A tool thread may be used only if it was created by this bot's
   tool under one of its channels.
 - The bridge checks channel, target and mentions again right before the POST.
+- `discord_edit` (#59) replaces the text of one of the bot's own posts in the place it was posted (channel or tool
+  thread): a tool send by its `ref`, also while it is still queued (the edit waits behind it in the outbox), or any of
+  its posts by message id. An edit pings nobody (`allowed_mentions` empty) and may name only crew bots the post already
+  named, so it never hands work over or uses the cap. The bridge checks again before the PATCH; the PATCH is
+  idempotent, so a crash repeats it. A deleted target drops the edit. The channel log gets the new text.
 - `discord_read` reads only the named channel's log, with no network access.
 - **Files** (`lib/attachments.ts`). *Inbound:* each attachment of an accepted message is described under its text, one
   line each: `[attachment: name (type, size) url]`. The name and type are made harmless, the URL is kept only on Discord's

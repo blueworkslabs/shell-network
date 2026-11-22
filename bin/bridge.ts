@@ -36,6 +36,7 @@ import { INBOX_KEEP_MS, sweepInbox, sweepStaging } from "../lib/attachments.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
 import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch } from "../lib/startup.ts";
+import { makeThreadManager } from "../lib/threads.ts";
 import { stepLoop } from "../lib/steploop.ts";
 import { bridgeConfig, conversationKeyFor, modelSelectionFor } from "../lib/bots.ts";
 import { preflight } from "../lib/preflight.ts";
@@ -106,10 +107,11 @@ if (workspace !== undefined && (!workspace.startsWith("/") || !(() => { try { re
 const inboxDir = workspace ? join(workspace, ".inbox") : undefined;
 let dmUserIds: string[];
 try { dmUserIds = dmUsers(process.env.BRIDGE_DM_USERS, allowedAuthors); } catch (e) { console.error((e as Error).message); process.exit(2); }
-// writes: the bot's channels, its DM channels (opened below), and threads its tool created in a channel
+// writes: the bot's channels, its DM channels (opened below), threads its tool created in a channel, and verified child threads
 const dmChannels = new Set<string>();
 const keys: string[] = channelIds.map((ch) => conversationKeyFor(cfg.key, ch));
-const discord = discordRest({ token, allowedChannels: channelIds, alsoAllowed: (id) => dmChannels.has(id) || keys.some((k) => buffer.isToolThread(k, id)), log });
+let threads: ReturnType<typeof makeThreadManager> | null = null;
+const discord = discordRest({ token, allowedChannels: channelIds, alsoAllowed: (id) => dmChannels.has(id) || keys.some((k) => buffer.isToolThread(k, id)) || Boolean(threads?.isAllowedThread(id)), log });
 const me = await discord.me();
 if (me.id !== cfg.id) { console.error("BRIDGE_CREW_FILE: own bot id does not match Discord token"); process.exit(2); }
 // Every conversation: the guild channels, then one per DM (the user's DM channel, from Discord).
@@ -128,52 +130,83 @@ if (swept) log.emit("bridge.staging_swept", { removed: swept });
 const sweepImages = () => { if (inboxDir) { const removed = sweepInbox({ inboxDir, inUse: (id) => buffer.inboundWaiting(id) }); if (removed) log.emit("bridge.inbox_swept", { removed, keepMs: INBOX_KEEP_MS }); } };
 sweepImages();
 setInterval(sweepImages, 3_600_000).unref();
+const policyFor = (conversationKey: string) => ({
+  projectId,
+  instanceId: modelSelection.instanceId,
+  ...(modelSelection.options ? { modelOptions: modelSelection.options } : {}),
+  boundThread: () => buffer.kvGet(`${conversationKey}:threadId`),
+  handoff: () => {
+    const reset = JSON.parse(buffer.kvGet(`${conversationKey}:reset`) ?? "null") as { stage: string; handoff?: ScheduleHandoff; handoffSent?: boolean } | null;
+    return reset?.stage === "handoff" && reset.handoff ? { ...reset.handoff, conversationKey, sent: reset.handoffSent } : null;
+  },
+  stop: () => {
+    const pending = JSON.parse(buffer.kvGet(`${conversationKey}:stop`) ?? "null") as { id?: string; threadId?: string; runId?: string; stage?: string } | null;
+    return pending?.stage === "interrupt" && pending.id && pending.threadId && pending.runId
+      ? { id: pending.id, conversationKey, threadId: pending.threadId, runId: pending.runId } : null;
+  },
+  // the conversation's own archived threads (its /new or thread-close ledger), readable for the export only
+  // only with the export on (BRIDGE_NOTES_DIR): otherwise no archived thread is readable at all
+  archivedThreads: () => (notesRoot ? (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) : []),
+});
 const bots: ReturnType<typeof makeBot>[] = [];
+const parentChannels = new Map<string, { name: string; botRoleId: string | null }>();
 for (const [i, channelId] of conversations.entries()) {
   const conversationKey = keys[i];
   const dm = dmChannels.has(channelId);
   const botRoleId = dm ? null : await managedRole({ discord, channelId, botUserId: cfg.id, log });
   const channelName = dm ? "dm" : await discord.getChannel(channelId).then((c) => c.name ?? channelId, () => channelId);
-  // MCP allowlist: this project, this instance (and configured model options), this conversation's one thread (kv, set once launched/adopted)
-  const policy = { projectId, instanceId: modelSelection.instanceId, ...(modelSelection.options ? { modelOptions: modelSelection.options } : {}), boundThread: () => buffer.kvGet(`${conversationKey}:threadId`),
-    handoff: () => {
-      const reset = JSON.parse(buffer.kvGet(`${conversationKey}:reset`) ?? "null") as { stage: string; handoff?: ScheduleHandoff; handoffSent?: boolean } | null;
-      return reset?.stage === "handoff" && reset.handoff ? { ...reset.handoff, conversationKey, sent: reset.handoffSent } : null;
-    },
-    stop: () => {
-      const pending = JSON.parse(buffer.kvGet(`${conversationKey}:stop`) ?? "null") as { id?: string; threadId?: string; runId?: string; stage?: string } | null;
-      return pending?.stage === "interrupt" && pending.id && pending.threadId && pending.runId
-        ? { id: pending.id, conversationKey, threadId: pending.threadId, runId: pending.runId } : null;
-    },
-    // the conversation's own archived threads (its /new ledger), readable for the export only
-    // only with the export on (BRIDGE_NOTES_DIR): otherwise no archived thread is readable at all
-    archivedThreads: () => (notesRoot ? (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) : []) };
+  if (!dm) parentChannels.set(channelId, { name: channelName, botRoleId });
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
     allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, inboxDir, dm, notesRoot,
-    buffer, t3: t3Adapter({ mcp, policy, log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
+    ...(dm ? {} : { activeThreads: () => threads?.activeThreadsFor(channelId) ?? [] }),
+    buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
 }
 log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap });
 
 // Single-flight step loop (lib/steploop.ts); a gateway message or a t3 change wakes it early, also mid-step (latched).
-const loop = stepLoop({ step: stepAll(bots, log, conversations), tickMs, log });
+const stepTarget = { step: async () => (threads ? threads.step() : { phase: "idle" }) };
+const loop = stepLoop({ step: stepAll([...bots, stepTarget], log, [...conversations, "threads"]), tickMs, log });
 const nudge = loop.nudge;
 
-// Slash commands (`/new`, `/status`): answered per interaction, by the bot of the interaction's channel (lib/commands.ts).
-// guild channels only: the slash commands are guild-only, and a DM conversation is never a command target
-const interact = interactionDispatch({ port: discord.interactions, bots: new Map(bots.map((b, i) => [conversations[i], b] as const).filter(([ch]) => !dmChannels.has(ch))), allowedAuthors, nudge, log });
+// Dynamic Discord thread conversations under this bot's configured guild channels (#77).
+threads = makeThreadManager({
+  botKey: cfg.key, botName: cfg.name, botUserId: cfg.id, parentChannels, allowedAuthors, allowedBots: crew.allowedBots,
+  buffer, discord, nudge, log,
+  createBot: (record, botRoleId) => {
+    const conversationKey = conversationKeyFor(cfg.key, record.threadId);
+    const shortName = record.name.length > 40 ? `${record.name.slice(0, 40)}…` : record.name;
+    return makeBot({
+      name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
+      threadLabel: `${cfg.name} #${record.parentName} / ${shortName}`,
+      botUserId: cfg.id, botRoleId, projectId, modelSelection,
+      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, inboxDir, dm: false, notesRoot,
+      threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, starter: record.starter ?? null },
+      buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
+    });
+  },
+});
+threads.restore();
+
+// Slash commands (`/new`, `/status`, `/stop`): answered per interaction, by the bot of the interaction's channel or active thread (lib/commands.ts).
+// guild channels and their active threads only: the slash commands are guild-only, and a DM conversation is never a command target
+const channelBots = new Map(bots.map((b, i) => [conversations[i], b] as const).filter(([ch]) => !dmChannels.has(ch)));
+const interact = interactionDispatch({ port: discord.interactions, bots: { get: (ch) => channelBots.get(ch) ?? threads?.botFor(ch) }, allowedAuthors, nudge, log });
 const dmIgnored = dmIgnoredDispatch({ known: new Set(conversations), log });
 // Catch-up runs inside the step loop (single flight); every new live session (READY/RESUMED) closes the dispatch
 // gate until a catch-up has completed within it.
 var gateway: DiscordGateway = discordGateway({
   token, log,
-  onDispatch: ((ds) => (type: string, d: unknown) => { for (const f of ds) void f(type, d); void interact(type, d); dmIgnored(type, d); })(bots.map((bot, i) => gatewayDispatch({ bot, channelId: conversations[i], nudge, log }))),
+  onDispatch: ((ds) => (type: string, d: unknown) => { for (const f of ds) void f(type, d); void threads?.onDispatch(type, d); void interact(type, d); dmIgnored(type, d); })(bots.map((bot, i) => gatewayDispatch({ bot, channelId: conversations[i], nudge, log }))),
   onFatal: (code) => { log.emit("bridge.fatal", { code }); shutdown(3); },
 });
 // t3 thread changes wake the loop early (relayed completions of runs no batch started); the idle tick stays
 // as the safety net. Read-only session (T1_PUSH_TOKEN), same as the projection reads.
-const watches = keys.map((k) => shellWatch({ origin: new URL(need("T1_MCP_URL")).origin, tokenPath: PUSH_TOKEN_PATH, threadId: () => buffer.kvGet(`${k}:threadId`), onChange: nudge, log }));
+const watches = [
+  ...keys.map((k) => shellWatch({ origin: new URL(need("T1_MCP_URL")).origin, tokenPath: PUSH_TOKEN_PATH, threadId: () => buffer.kvGet(`${k}:threadId`), onChange: nudge, log })),
+  shellWatch({ origin: new URL(need("T1_MCP_URL")).origin, tokenPath: PUSH_TOKEN_PATH, hasThread: (id) => Boolean(threads?.activeT3ThreadIds().has(id)), onChange: nudge, log }),
+];
 function shutdown(code = 0) {
   loop.stop();
   for (const w of watches) w.stop();

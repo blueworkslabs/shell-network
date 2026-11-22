@@ -194,19 +194,20 @@ export type FakeAttachment = NonNullable<DiscordMessage["attachments"]>[number];
 export interface FakeDiscord {
   messages: FakeMessage[]; writes: { kind: string; channelId: string; payload?: CreateMessagePayload }[];
   reactions: { messageId: string; emoji: string; at: unknown }[]; nonces: Map<string | undefined, FakeMessage>; crash: DiscordCrash;
-  threads: Map<string, { id: string; parent_id: string; name: string }>;
+  threads: Map<string, { id: string; parent_id: string; name: string; type?: number; thread_metadata?: { archived?: boolean } }>;
   onReact?: (messageId: string) => unknown;
   // test control: Discord refuses a post with this HTTP status (and code) when it returns one; nothing is created
   refuse?: (ch: string, payload: CreateMessagePayload) => { status: number; code?: number } | null;
-  userSays(content: string, opts?: { mention?: boolean; channel?: string; bot?: boolean; author?: string; authorId?: string; mentionRoles?: string[]; attachments?: FakeAttachment[] }): FakeMessage;
+  userSays(content: string, opts?: { mention?: boolean; channel?: string; bot?: boolean; author?: string; authorId?: string; mentionRoles?: string[]; attachments?: FakeAttachment[]; guildId?: string }): FakeMessage;
   createMessage(ch: string, payload: CreateMessagePayload): Promise<FakeMessage>;
   typing(ch: string): Promise<void>;
   react(ch: string, messageId: string, emoji: string): Promise<void>;
   editMessage(ch: string, messageId: string, payload: { content: string; allowed_mentions: { parse: string[] } }): Promise<FakeMessage>;
   messagesAfter(ch: string, afterId: string, limit?: number): Promise<FakeMessage[]>;
   startThread(ch: string, messageId: string, name: string): Promise<{ id: string }>;
-  getChannel(id: string): Promise<{ id: string; parent_id?: string | null; guild_id?: string }>;
-  botPosts(): FakeMessage[];
+  getChannel(id: string): Promise<{ id: string; parent_id?: string | null; name?: string; type?: number; guild_id?: string; thread_metadata?: { archived?: boolean } }>;
+  getMessage(ch: string, messageId: string): Promise<FakeMessage>;
+  botPosts(ch?: string): FakeMessage[];
 }
 
 export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = () => Date.now() }: { channelId: string; botUserId: string; nonceWindow?: boolean; now?: () => number }): FakeDiscord {
@@ -224,10 +225,10 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
     messages, writes, reactions, nonces, crash, threads,
     // a user message in a channel (not through the bridge)
     // author "user1" is the allowlisted sender in the tests (HUMAN_ID); any other name gets STRANGER_ID unless authorId is given
-    userSays(content, { mention = true, channel = channelId, bot = false, author = "user1", authorId, mentionRoles = [], attachments } = {}) {
+    userSays(content, { mention = true, channel = channelId, bot = false, author = "user1", authorId, mentionRoles = [], attachments, guildId } = {}) {
       const aid = authorId ?? (author === "user1" ? HUMAN_ID : STRANGER_ID);
-      const m: FakeMessage = { id: id(), channel_id: channel, author: { id: aid, username: author, bot }, content: mention ? `<@${botUserId}> ${content}` : content,
-        mentions: mention ? [{ id: botUserId }] : [], mention_roles: mentionRoles, timestamp: new Date(now()).toISOString(), ...(attachments ? { attachments } : {}) };
+      const m: FakeMessage & { guild_id?: string } = { id: id(), channel_id: channel, author: { id: aid, username: author, bot }, content: mention ? `<@${botUserId}> ${content}` : content,
+        mentions: mention ? [{ id: botUserId }] : [], mention_roles: mentionRoles, timestamp: new Date(now()).toISOString(), ...(attachments ? { attachments } : {}), ...(guildId ? { guild_id: guildId } : {}) };
       messages.push(m);
       return m;
     },
@@ -282,7 +283,12 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
       if (!t) throw Object.assign(new Error("Unknown Channel"), { status: 404, code: 10003 });
       return t;
     },
-    botPosts: () => messages.filter((m) => m.author.id === botUserId),
+    async getMessage(ch, messageId) {
+      const m = messages.find((x) => x.channel_id === ch && x.id === messageId);
+      if (!m) throw Object.assign(new Error("Unknown Message"), { status: 404, code: 10008 });
+      return m;
+    },
+    botPosts: (ch) => messages.filter((m) => m.author.id === botUserId && (ch === undefined || m.channel_id === ch)),
   };
   return api;
 }

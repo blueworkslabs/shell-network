@@ -585,10 +585,13 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         ON CONFLICT (conversation_key) DO UPDATE SET channel_id = excluded.channel_id, bot_user_id = excluded.bot_user_id, crew = excluded.crew,
         exchange_cap = excluded.exchange_cap, updated_at = excluded.updated_at`).run(conversationKey, c.channelId, c.botUserId, JSON.stringify(c.crew), c.exchangeCap, now());
     },
+    deleteToolConfig(conversationKey: string): void {
+      db.prepare("DELETE FROM tool_config WHERE conversation_key = ?").run(conversationKey);
+    },
     // A message of the channel log (allowlisted people, allowed crew bots, this bot): tool targets must be one.
     // An edit of the bot's own post (discord_edit), applied: the channel log shows the new text.
     editChannelMessage: (id: string, authorId: string, content: string): void => { db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND author_id = ?").run(content, id, authorId); },
-    channelMessage: (id: string): { id: string; author_id: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
+    channelMessage: (id: string): { id: string; author_id: string; author_name: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_name, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).
     relayOf: (conversationKey: string, runId: string): RelayRow | undefined => one<RelayRow>("SELECT * FROM relay WHERE conversation_key = ? AND run_id = ?", conversationKey, runId),

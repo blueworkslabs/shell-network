@@ -88,6 +88,26 @@ const REFUSED = new Set([400, 403, 404, 413]), REFUSE_LIMIT = 3;
 export const RESET_STUCK_MS = 10 * 60_000;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
+// Markdown images of local paths (`![x](/abs/path.png)`, `![x](<...>)` around such a path, `![x](file:...)`, with an
+// optional title) are removed from a final before the checks: Discord cannot show them, and a final that is NO_REPLY
+// plus such an image (an agent pointing at a file it made) counts as NO_REPLY (#79). Images on the web (`https://`)
+// stay, and so does anything in code (fenced blocks, inline code of any backtick run) or escaped (`\![...]`). A final
+// without such an image is returned as it is; with one, only the image goes, plus its line when nothing else was on it.
+// Known gaps, left as they are: reference-style images (`![x][ref]`), HTML `<img>`, paths with nested parentheses,
+// relative paths, and inline code spans that run over a line break.
+const LOCAL_PATH = String.raw`(?:[^\s()<>]|\([^\s()]*\))+`; // one level of parentheses, as in chart(1).png
+const LOCAL_IMAGE = String.raw`!\[[^\]\n]*\]\(\s*(?:<(?:\/|file:)[^>\n]*>|(?:\/|file:)${LOCAL_PATH})(?:\s+(?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\)))?\s*\)`;
+// left to right: code and escapes are consumed as they are, so an image inside them is never seen
+const SKIP = String.raw`\`{3,}[\s\S]*?(?:\`{3,}|$)|~{3,}[\s\S]*?(?:~{3,}|$)|(\`+)[^\n]*?(?<!\`)\1(?!\`)|\\.`;
+const SCAN = new RegExp(`(?:${SKIP})|(${LOCAL_IMAGE})`, "gi");
+const GONE = "\u0000";
+export function withoutLocalImages(text: unknown): string {
+  const t = String(text ?? "");
+  let hit = false;
+  const marked = t.replace(SCAN, (m: string, _ticks: string | undefined, image: string | undefined) => (image ? ((hit = true), GONE) : m));
+  if (!hit) return t;
+  return marked.split("\n").filter((line) => !(line.includes(GONE) && !line.split(GONE).join("").trim())).join("\n").split(GONE).join("");
+}
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
 export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(?:^|\r?\n)[ \t]*NO_REPLY\s*$/, "");
 const splitReply = (text: unknown): string[] => {
@@ -993,13 +1013,14 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!runId) { log.emit("bridge.reply_no_run", { bot: name, batchId: b.id }); return false; }
     const last = (read.items ?? []).filter((i) => i.runId === runId && i.type === "assistant_message").at(-1);
     if (last && (last.textTruncated !== false || (last.nextTextOffset ?? null) !== null)) { log.emit("bridge.reply_incomplete", { bot: name, batchId: b.id }); return false; }
+    const final = withoutLocalImages(last?.text);
     // A final of exactly NO_REPLY (the agent answered with a tool post): complete, nothing posted.
-    if (isNoReply(last?.text) && !buffer.postedParts(b.id).length && !buffer.outboxEntry(conversationKey, `reply:${b.id}:0`)) {
+    if (isNoReply(final) && !buffer.postedParts(b.id).length && !buffer.outboxEntry(conversationKey, `reply:${b.id}:0`)) {
       buffer.markReplyNone(b.id);
       log.emit("bridge.reply_none", { bot: name, batchId: b.id });
       return true;
     }
-    const parts = splitReply(withoutNoReply(last?.text));
+    const parts = splitReply(withoutNoReply(final));
     const first = buffer.inboundOf(b.id)[0];
     if (!first) throw new Error(`batch ${b.id} has no inbound rows`);
     const done = new Set(buffer.postedParts(b.id).map((p) => p.part));
@@ -1157,10 +1178,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const last = (read.items ?? []).filter((i) => i.runId === c.runId && i.type === "assistant_message").at(-1);
     if (last && (last.textTruncated !== false || (last.nextTextOffset ?? null) !== null)) { log.emit("bridge.relay_incomplete", { bot: name, ordinal: c.ordinal }); return false; }
     const row = buffer.relayOf(conversationKey, c.runId) ?? buffer.addRelay({ conversationKey, threadId, runId: c.runId, ordinal: c.ordinal, origin: c.origin });
-    const text = withoutNoReply(last?.text).trim();
+    const final = withoutLocalImages(last?.text);
+    const text = withoutNoReply(final).trim();
     if (!text && !buffer.outboxEntry(conversationKey, `relay:${row.id}:0`)) {
       buffer.markRelayEmpty(row.id);
-      log.emit("bridge.relay_empty", { bot: name, relayId: row.id, ordinal: c.ordinal, ...(isNoReply(last?.text) ? { noReply: true } : {}) });
+      log.emit("bridge.relay_empty", { bot: name, relayId: row.id, ordinal: c.ordinal, ...(isNoReply(final) ? { noReply: true } : {}) });
       return true;
     }
     const parts = splitReply(text);

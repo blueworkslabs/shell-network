@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { type Buffer } from "../lib/buffer.ts";
-import { makeBot } from "../lib/bot.ts";
+import { makeBot, withoutLocalImages } from "../lib/bot.ts";
 import { memoryLog } from "../lib/log.ts";
 import { openToolDb } from "../lib/tooldb.ts";
 import { makeTools } from "../lib/tools.ts";
@@ -243,6 +243,34 @@ test("NO_REPLY: a batch whose final text is exactly NO_REPLY posts nothing and d
   w.t3.complete(w.thread(), w.t3.wake(w.thread()).runId, "NO_REPLY, but here is more");
   await w.steps(2);
   assert.equal(w.discord.botPosts().at(-1)!.content, "NO_REPLY, but here is more", "control: only an exact NO_REPLY is dropped");
+});
+
+test("LOCAL IMAGES (#79): NO_REPLY plus a local image posts nothing; text plus local images posts the text only; a web image stays; relays alike", async () => {
+  const w = world();
+  const run = () => w.t3.threads.get(w.thread())!.runs.at(-1)!.runId;
+  const turn = async (final: string) => { await w.bot.accept(w.discord.userSays("make a picture")); await w.steps(1); w.t3.complete(w.thread(), run(), final); await w.steps(2); };
+  await turn("NO_REPLY\n\n![golden wing](/home/agent/work/golden-wing.png)");
+  assert.deepEqual(w.discord.botPosts().map((p) => p.content), [], "NO_REPLY plus a local image: nothing posted");
+  await turn("Here it is:\n\n![a](/tmp/a.png)\n![b](<file:///tmp/my pic.png>)\n![c](</home/agent/c d.png> \"title\")\n\nEnjoy.");
+  assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["Here it is:\n\n\nEnjoy."], "text only: the image lines removed, the blank lines around them kept");
+  await turn("From the web: ![logo](https://example.com/logo.png)");
+  assert.equal(w.discord.botPosts().at(-1)!.content, "From the web: ![logo](https://example.com/logo.png)", "a web image stays");
+  w.t3.complete(w.thread(), w.t3.wake(w.thread()).runId, "![done](/tmp/done.png)\nNO_REPLY");
+  await w.steps(2);
+  assert.equal(w.discord.botPosts().length, 2, "relay: a local image plus NO_REPLY posts nothing");
+});
+
+test("LOCAL IMAGES (#79) filter: a final without a local image is untouched (hard breaks, blank lines, code examples); paths with parentheses and any title form are removed", () => {
+  const plain = "Line one  \nline two\n\n\n\nAfter three blank lines.\n```md\n![example](/tmp/example.png)\n```\nInline: `![x](/tmp/x.png)` stays.  ";
+  assert.equal(withoutLocalImages(plain), plain, "no local image outside code: returned exactly as it was");
+  assert.equal(withoutLocalImages("NO_REPLY\n![chart](/tmp/chart(1).png)"), "NO_REPLY", "a path with parentheses");
+  for (const img of [`![a](/tmp/a.png 'single')`, `![a](/tmp/a.png "double")`, `![a](/tmp/a.png (parens))`, `![a](<file:///tmp/a b.png> 'single')`])
+    assert.equal(withoutLocalImages(`NO_REPLY\n\n${img}`), "NO_REPLY\n", img);
+  assert.equal(withoutLocalImages("Before\n\n![a](/tmp/a.png)\n\n\nAfter"), "Before\n\n\n\nAfter", "only the image line goes; every blank line around it stays");
+  const literal = "Write ``![x](/tmp/x.png)`` or ` `` ![y](/tmp/y.png) `` ` or \\![z](/tmp/z.png) to show the syntax.";
+  assert.equal(withoutLocalImages(`${literal}\n![real](/tmp/real.png)`), `${literal}`, "double-backtick code and an escaped image stay; the real image goes");
+  assert.equal(withoutLocalImages("See ![a](/tmp/a.png) here.  \nNext line  \n```\n![b](/tmp/b.png)\n```"), "See  here.  \nNext line  \n```\n![b](/tmp/b.png)\n```",
+    "only the image goes: the rest of the text, its hard breaks and the code example stay");
 });
 
 test("NO_REPLY after text: a reply that ends with the sentinel posts the text without it, also when the sentinel lands in a second part (a capped send, then the answer in the final)", async () => {

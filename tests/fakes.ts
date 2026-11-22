@@ -165,6 +165,8 @@ export interface FakeDiscord {
   reactions: { messageId: string; emoji: string; at: unknown }[]; nonces: Map<string | undefined, FakeMessage>; crash: DiscordCrash;
   threads: Map<string, { id: string; parent_id: string; name: string }>;
   onReact?: (messageId: string) => unknown;
+  // test control: Discord refuses a post with this HTTP status (and code) when it returns one; nothing is created
+  refuse?: (ch: string, payload: CreateMessagePayload) => { status: number; code?: number } | null;
   userSays(content: string, opts?: { mention?: boolean; channel?: string; bot?: boolean; author?: string; authorId?: string; mentionRoles?: string[]; attachments?: FakeAttachment[] }): FakeMessage;
   createMessage(ch: string, payload: CreateMessagePayload): Promise<FakeMessage>;
   typing(ch: string): Promise<void>;
@@ -200,6 +202,8 @@ export function fakeDiscord({ channelId, botUserId, nonceWindow = true, now = ()
     async createMessage(ch, payload) {
       writes.push({ kind: "message", channelId: ch, payload });
       if (crash.post === "before") die("post");
+      const refusal = api.refuse?.(ch, payload);
+      if (refusal) throw Object.assign(new Error("Missing Permissions"), refusal);
       if (nonceWindow && payload.enforce_nonce && nonces.has(payload.nonce)) return nonces.get(payload.nonce)!;
       const m: FakeMessage = { id: id(), channel_id: ch, author: { id: botUserId, username: "Gem", bot: true }, content: payload.content.trim(),
         message_reference: payload.message_reference ? { message_id: payload.message_reference.message_id, channel_id: ch } : undefined, mentions: [], timestamp: new Date(now()).toISOString(),

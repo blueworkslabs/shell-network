@@ -60,6 +60,11 @@ export interface BotOptions {
 }
 
 const PART = 1900;
+// Discord's answers that mean "this request will never be accepted as it is": the outbox drops such a post after
+// REFUSE_LIMIT tries (401 is not among them: a bad token stops the whole bridge).
+const REFUSED = new Set([400, 403, 404, 413]), REFUSE_LIMIT = 3;
+// A /new whose archive or confirm stage has not finished after this long raises a stuck alert.
+export const RESET_STUCK_MS = 10 * 60_000;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
@@ -128,10 +133,16 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   //   confirm  the fresh thread is bound: one confirmation (outbox `new:<id>`), reset done (kv `resetSeen`)
   // A `/new` ignored while one is pending is recorded in kv `resetSeen` (the newest `/new` id handled or ignored).
   // A crash between the t3 call and the transaction repeats the archive call; t3 refuses it, and a thread that reads as archived counts as done.
-  type Reset = { id: string; source?: "discord" | "interaction"; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string };
+  type Reset = { id: string; source?: "discord" | "interaction"; stage: "drain" | "wrapup" | "archive" | "confirm"; oldThread?: string; oldTitle?: string | null; newTitle?: string;
+    stageSince?: number; lastError?: string };
   const maxId = (a: string | null, b: string): string => (a !== null && BigInt(a) > BigInt(b) ? a : b);
   const resetState = (): Reset | null => { const v = buffer.kvGet(K("reset")); return v ? (JSON.parse(v) as Reset) : null; };
-  const saveReset = (r: Reset) => buffer.kvSet(K("reset"), JSON.stringify(r));
+  // stageSince: when the current stage began (kept while the stage stays the same), for the stuck alert and /status
+  const saveReset = (r: Reset) => {
+    const cur = resetState();
+    const stageSince = cur && cur.id === r.id && cur.stage === r.stage ? (cur.stageSince ?? now()) : now();
+    buffer.kvSet(K("reset"), JSON.stringify({ ...r, stageSince, ...(cur?.stage !== r.stage ? { lastError: undefined } : {}) }));
+  };
   function isNewCommand(msg: DiscordMessage): boolean {
     const noUser = String(msg.content ?? "").replace(mentionRe(), "");
     return (botRoleId ? noUser.replace(roleRe(), "") : noUser).trim() === "/new";
@@ -160,6 +171,13 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   }
   const acceptNew = (msg: DiscordMessage & { id: string }): AcceptResult =>
     requestNew({ id: msg.id, author: msg.author?.username ?? "user", receivedAt: Date.parse(msg.timestamp as string) || now(), source: "discord" });
+  // for /status: how long a reset has hung in archive/confirm, and why (a fixed text)
+  const resetTrouble = (rs: Reset): string => {
+    if (rs.stage !== "archive" && rs.stage !== "confirm") return "";
+    const min = Math.floor((now() - (rs.stageSince ?? now())) / 60_000);
+    const why = rs.lastError ?? (rs.stage === "confirm" ? "the fresh session is not started yet" : "");
+    return min >= 1 || why ? `, for ${min} min${why ? `: ${why}` : ""}` : "";
+  };
   // `/status`: what this bot is doing in this channel, for the person who asked (an ephemeral reply). No ids or paths.
   async function status(): Promise<string> {
     const threadId = buffer.kvGet(K("threadId")), title = buffer.kvGet(K("threadTitle"));
@@ -169,7 +187,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return [`**${name}** in #${channelName ?? channelId}`,
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
-      `/new: ${rs ? `pending (${rs.stage})` : "none pending"}`,
+      `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,
       ...(notesRoot ? [`Archive export: ${pendingExports().length} pending${exportState.lastError ? `; last error: ${exportState.lastError}` : ""}`] : []),
       `Bot-to-bot messages since the last message from a person or talk-only member: ${exchangeCap > 0 ? `${n} of ${exchangeCap}` : `${n} (no cap)`}`].join("\n");
   }
@@ -232,7 +250,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         // error is fine if the thread itself reads as archived (its error text is not relied on). Otherwise, or if the
         // read fails, the error stands: the binding stays and the next step retries.
         const archived = await t3.read(rs.oldThread!).then((r) => r.thread?.archived === true, () => false);
-        if (!archived) throw e;
+        if (!archived) { saveReset({ ...rs, lastError: "archiving the old session failed" }); throw e; }
         log.emit("bridge.archive_already", { bot: name, threadId: rs.oldThread });
       }
       const r = rs;
@@ -567,13 +585,48 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       buffer.outboxPosting(h.id, boundary);
       // a tool post may ping only the crew bots it names that are still allowed now
       const users = (JSON.parse(h.users) as string[]).filter((u) => !tool || mentionsIn(h.content).includes(u));
-      const m = await discord.createMessage(target, { content: h.content, nonce: h.nonce, enforce_nonce: true,
-        allowed_mentions: { parse: [] as string[], ...(users.length ? { users } : {}), ...(tool ? { replied_user: false } : {}) },
-        ...(replyTo ? { message_reference: { message_id: replyTo, channel_id: target, fail_if_not_exists: false } } : {}), ...(upload.length ? { files: upload } : {}) });
+      let m: DiscordMessage;
+      try {
+        m = await discord.createMessage(target, { content: h.content, nonce: h.nonce, enforce_nonce: true,
+          allowed_mentions: { parse: [] as string[], ...(users.length ? { users } : {}), ...(tool ? { replied_user: false } : {}) },
+          ...(replyTo ? { message_reference: { message_id: replyTo, channel_id: target, fail_if_not_exists: false } } : {}), ...(upload.length ? { files: upload } : {}) });
+      } catch (e) {
+        const status = errStatus(e)?.status;
+        if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: a post may exist; recovery decides
+        // Discord refused the request: nothing was created. Back to pending; after REFUSE_LIMIT refusals it is dropped.
+        buffer.outboxPending(h.id);
+        buffer.kvDelete(K(`outboxEnd:${h.id}`));
+        const n = Number(buffer.kvGet(K(`outboxRefused:${h.id}`)) ?? 0) + 1;
+        buffer.kvSet(K(`outboxRefused:${h.id}`), String(n));
+        log.emit("bridge.outbox_refused", { bot: name, key: h.key, status, attempts: n });
+        if (n < REFUSE_LIMIT) return false; // the next step tries again; nothing behind it goes out meanwhile
+        dropRefused(h);
+        continue;
+      }
       buffer.outboxPosted(h.id, m.id, () => onPosted(h, m.id));
       unstage(h);
       log.emit(postedEvent(h, false), { bot: name, key: h.key, channelMessageId: m.id });
     }
+  }
+
+  // A post Discord refused REFUSE_LIMIT times (a missing permission, a file the channel does not allow, a message it
+  // rejects) is dropped so the queue moves on. What waited for it is closed (a reply counts as answered with nothing
+  // posted, a relay as empty), and one notice says so in the channel, without ids or the error. A refused notice or alert
+  // gets no notice of its own, so a channel that refuses everything cannot loop.
+  function dropRefused(h: OutboxRow): void {
+    const [kind, a] = h.key.split(":");
+    buffer.atomically(() => {
+      buffer.outboxDrop(h.id);
+      if (kind === "reply") buffer.markReplyNone(Number(a));
+      else if (kind === "relay") buffer.markRelayEmpty(Number(a));
+      if (!["notice", "alert", "clear", "talert", "tclear", "refused", "ralert", "rclear"].includes(kind)) {
+        buffer.enqueue(conversationKey, { key: `refused:${h.id}`, nonce: `f${h.id}`,
+          content: `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
+      }
+      buffer.kvDelete(K(`outboxRefused:${h.id}`));
+    });
+    unstage(h);
+    log.emit("bridge.outbox_dropped", { bot: name, key: h.key });
   }
 
   // The newest message id in the channel, read forward from `from` (or the watermark), resumable in `progressKey`;
@@ -638,6 +691,26 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return true;
   }
 
+  // A /new that is stuck in its archive or confirm stage (t3 refuses the archive, the fresh thread cannot be launched)
+  // raises one stuck alert after RESET_STUCK_MS (kv `resetAlert` = the reset's id) and a follow-up, as a reply to it, once
+  // that reset is gone. drain and wrapup wait for the agent's own turn, which the batch alerts already watch.
+  function resetAlertPass(): void {
+    const rs = resetState(), alerted = buffer.kvGet(K("resetAlert"));
+    if (rs && (rs.stage === "archive" || rs.stage === "confirm") && alerted !== rs.id && now() - (rs.stageSince ?? now()) >= RESET_STUCK_MS) {
+      buffer.atomically(() => {
+        buffer.enqueue(conversationKey, { key: `ralert:${rs.id}`, nonce: `w${rs.id}`, content: `⚠️ Stuck, needs help: ${name}'s /new could not finish (${rs.stage === "archive" ? "the old session could not be archived" : "the fresh session could not be started"}). It keeps trying.` });
+        buffer.kvSet(K("resetAlert"), rs.id);
+      });
+      log.emit("bridge.reset_stuck", { bot: name, stage: rs.stage });
+    }
+    if (alerted && rs?.id !== alerted) {
+      buffer.atomically(() => {
+        buffer.enqueue(conversationKey, { key: `rclear:${alerted}`, nonce: `v${alerted}`, content: `✅ The stuck /new above went through.`, replyTo: refTo(buffer.outboxEntry(conversationKey, `ralert:${alerted}`)) });
+        buffer.kvDelete(K("resetAlert"));
+      });
+    }
+  }
+
   // Stuck alerts: visible "stuck, needs help" in the channel instead of going quiet. One alert per batch and
   // status episode (stuck.ts limits), a follow-up note once that episode is over (a reply to the alert when it went
   // out), both with a nonce; no mentions, no ids or paths in the text. A thread escalation (no trustworthy t3 thread)
@@ -649,6 +722,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   const saveThreadAlert = (v: ThreadAlert) => buffer.kvSet(K("threadAlert"), JSON.stringify(v));
   const refTo = (e: OutboxRow | undefined): string | null => (e && e.state !== "dropped" ? (e.channel_message_id ?? `outbox:${e.id}`) : null);
   function alertsPass(): void {
+    resetAlertPass();
     for (const r of buffer.unclearedAlerts(conversationKey)) {
       const current = r.batch_episode === r.episode;
       const queued = buffer.outboxEntry(conversationKey, `alert:${r.batch_id}:${r.episode}`);

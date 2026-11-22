@@ -127,7 +127,7 @@ test("adapter: its real call shapes pass the allowlist (paged read, paged list, 
 });
 
 test("schedule handoff permits only its persisted replacement launch and exact queued input", async () => {
-  const state: ScheduleHandoff & { conversationKey: string } = {
+  const state: ScheduleHandoff & { conversationKey: string; sent?: boolean } = {
     resetId: "123", oldThread: T, newTitle: "replacement", jobs: [{ scheduledTaskId: "j1", enabled: false }], conversationKey: "gem.test",
   };
   const h = harness();
@@ -150,8 +150,15 @@ test("schedule handoff permits only its persisted replacement launch and exact q
     await assert.rejects(mcp.call("t3_thread_send", { ...send, ...extra }), ToolDenied);
   }
   await assert.rejects(mcp.call("t3_thread_organize", { action: "archive", threadId: "new" }), ToolDenied);
-  pending = false;
+  state.followup = { number: 1, jobs: [{ scheduledTaskId: "late-job", enabled: true }] };
+  const followup = { ...send, ...handoffInput(state.conversationKey, state) };
   await assert.rejects(mcp.call("t3_thread_send", send), ToolDenied);
+  await mcp.call("t3_thread_send", followup);
+  state.sent = true;
+  await assert.rejects(mcp.call("t3_thread_send", followup), ToolDenied);
+  state.sent = false;
+  pending = false;
+  await assert.rejects(mcp.call("t3_thread_send", followup), ToolDenied);
 });
 
 test("schedule listing keeps only verification fields and redacts transport diagnostics", async () => {

@@ -28,7 +28,7 @@ interface Rule { args: Record<string, Check>; required: string[]; when?: (args: 
 export type Rules = Record<string, Rule>;
 // archivedThreads: the conversation's own archived threads (its `archived` ledger), readable for the export after /new
 export interface AllowlistPolicy { projectId: string; instanceId: string; boundThread: () => string | null; archivedThreads?: () => string[];
-  handoff?: () => (ScheduleHandoff & { conversationKey: string }) | null }
+  handoff?: () => (ScheduleHandoff & { conversationKey: string; sent?: boolean }) | null }
 // The part of the MCP client the allowlist wraps.
 export interface McpLike {
   sessionId: string | null;
@@ -94,7 +94,7 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
       when: (a) => {
         if (ownThread(a.threadId)) return null;
         const pending = handoff();
-        if (!pending || !pending.jobs.length) return "no schedule handoff is pending";
+        if (!pending || pending.sent || !pending.jobs.length) return "no schedule handoff is pending";
         const expected = handoffInput(pending.conversationKey, pending);
         return a.message === expected.message && a.clientRequestId === expected.clientRequestId ? null : "only the fixed schedule handoff is allowed";
       },

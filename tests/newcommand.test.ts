@@ -302,11 +302,23 @@ test("standing jobs survive /new across a crash during replacement launch and ha
   const late = { scheduledTaskId: "late-job", boundThreadId: t1, enabled: true };
   w.t3.standingJobs.push(late);
   w.finish(t2, "NO_REPLY");
+  await w.steps(1); // discover and persist the next handoff
+  w.t3.crash.send = "after";
+  await assert.rejects(w.steps(1), /CRASH at send/);
+  w.restart();
   await w.steps(2);
+  const followups = w.t3.sends().filter((s) => s.threadId === t2 && s.clientRequestId !== handoffs[0].clientRequestId);
+  assert.equal(followups.length, 2);
+  assert.equal(followups[0].clientRequestId, followups[1].clientRequestId);
+  assert.equal(followups[0].message, followups[1].message);
+  assert.match(followups[0].message!, /late-job/);
+  assert.doesNotMatch(followups[0].message!, /recurring-job|paused-job|other-job/);
+  assert.equal(w.t3.threads.get(t2)!.runs.length, 2);
   assert.match(await w.bot.status(), /2 awaiting verification/);
   assert.deepEqual(w.archives(), []);
   paused.enabled = false;
   late.boundThreadId = t2;
+  w.finish(t2, "NO_REPLY");
 
   // Work dispatched before rebind still completes and posts from the old thread.
   const due = w.t3.wake(t1, { type: "user_message", text: "standing work already dispatched" });

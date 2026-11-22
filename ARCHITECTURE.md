@@ -218,8 +218,8 @@ Binding matters: an unbound task may create a different t3 thread that the bridg
 is not watching. During `/new`, the bridge records standing job IDs and starts the
 replacement thread while the old one is open. The replacement agent rebinds each job
 using its existing ID and `bindToCurrentThread:true`, preserving the schedule and
-enabled state. The bridge checks for jobs still attached to the old thread and drains
-its outstanding work before archiving it. If a job remains unverified, `/status`
+enabled state. The bridge queues a deduplicated follow-up for jobs discovered on the
+old thread during the handoff and drains its outstanding work before archiving it. If a job remains unverified, `/status`
 shows the pending handoff and the bridge raises a stuck alert. The same task can
 be rebound from the replacement thread to recover a skipped job.
 

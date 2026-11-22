@@ -280,8 +280,16 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         const current = byId.get(job.scheduledTaskId);
         return current?.boundThreadId !== handoff.replacement || current?.enabled !== job.enabled;
       }).map((job) => job.scheduledTaskId));
-      // A job created after the snapshot must be adopted before the old thread can be archived.
-      for (const job of jobs) if (job.boundThreadId === threadId) unverified.add(job.scheduledTaskId);
+      // Persist the next input and its sequence together, so a crash retries exactly the same follow-up.
+      const known = new Set(handoff.jobs.map((job) => job.scheduledTaskId));
+      const late = jobs.filter((job) => job.boundThreadId === threadId && !known.has(job.scheduledTaskId))
+        .map(({ scheduledTaskId, enabled }) => ({ scheduledTaskId, enabled }));
+      if (late.length) {
+        const followup = { number: (handoff.followup?.number ?? 0) + 1, jobs: late };
+        saveReset({ ...rs, handoff: { ...handoff, jobs: [...handoff.jobs, ...late], followup },
+          handoffSent: false, jobsPending: unverified.size + late.length });
+        return { done: { phase: "new" } };
+      }
       if (rs.jobsPending !== unverified.size) {
         rs = { ...rs, jobsPending: unverified.size };
         saveReset(rs);

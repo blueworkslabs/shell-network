@@ -10,16 +10,19 @@ export interface ScheduleHandoff {
   newTitle: string;
   replacement?: string;
   jobs: StandingJob[];
+  followup?: { number: number; jobs: StandingJob[] };
 }
 
 export function handoffInput(conversationKey: string, handoff: ScheduleHandoff) {
   return {
-    clientRequestId: `bridge-${conversationKey}-schedule-handoff-${handoff.resetId}`,
+    clientRequestId: `bridge-${conversationKey}-schedule-handoff-${handoff.resetId}${handoff.followup ? `-${handoff.followup.number}` : ""}`,
     message: [
-      "[Fresh session: read today's and yesterday's daily notes for continuity. The previous session is still draining.]",
+      handoff.followup
+        ? "[Additional standing jobs were found while the previous session was draining.]"
+        : "[Fresh session: read today's and yesterday's daily notes for continuity. The previous session is still draining.]",
       "Move each standing job below to this thread with schedule_task({ scheduledTaskId, bindToCurrentThread: true }).",
       "Pass only those two arguments. Preserve the schedule and enabled state. Do not run, recreate, or delete any job.",
-      JSON.stringify(handoff.jobs.map((job) => job.scheduledTaskId)),
+      JSON.stringify((handoff.followup?.jobs ?? handoff.jobs).map((job) => job.scheduledTaskId)),
       "When finished, reply with exactly NO_REPLY.",
     ].join("\n"),
   };

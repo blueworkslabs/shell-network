@@ -96,7 +96,7 @@ export interface CommandBot {
 }
 interface Interaction {
   id?: unknown; token?: unknown; type?: unknown; channel_id?: unknown; data?: { name?: unknown };
-  member?: { user?: { id?: unknown; username?: unknown } }; user?: { id?: unknown; username?: unknown };
+  member?: { user?: { id?: unknown; username?: unknown; bot?: unknown } }; user?: { id?: unknown; username?: unknown; bot?: unknown };
 }
 const FAILED = "That didn't work; try again in a moment.";
 // 10062: the interaction expired (Discord HTTP 404); 40060: it was already acknowledged, i.e. delivered twice
@@ -121,7 +121,7 @@ export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, no
     if (name !== "new" && name !== "status" && name !== "stop") { await safe(token, "reply", () => port.reply(id, token, "Unknown command.")); log.emit("bridge.interaction_refused", { why: "unknown command" }); return; }
     // anything but our own commands, from our user, in our channels: refused, ephemeral, nothing else done
     if (!bot) { await safe(token, "reply", () => port.reply(id, token, "This bot is not active in this channel.")); log.emit("bridge.interaction_refused", { command: name, why: "channel" }); return; }
-    if (typeof user?.id !== "string" || !allowed.has(user.id)) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: name, why: "user" }); return; }
+    if (user?.bot === true || typeof user?.id !== "string" || !allowed.has(user.id)) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: name, why: user?.bot === true ? "bot" : "user" }); return; }
     if (!(await safe(token, "defer", () => port.defer(id, token)))) return; // expired before we answered: nothing to do, nothing was started
     let text = FAILED;
     try {

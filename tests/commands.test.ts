@@ -100,7 +100,7 @@ test("RECONCILE failure: the rest is still done, the error surfaces, no hash is 
 // ---- interactions ----
 const CH = "100000000000000001", OTHER_CH = "100000000000000002", BOT = "333333333333333333", HERMES = "444444444444444444";
 const KEY = conversationKeyFor("gem", CH);
-type IxOpts = { channel?: string; user?: string; type?: number };
+type IxOpts = { channel?: string; user?: string; bot?: boolean; type?: number };
 function world({ cap = 12 }: { cap?: number } = {}) {
   const path = join(tempDir("slash-"), "buffer.db");
   let clock = 1_792_500_000_000;
@@ -135,9 +135,9 @@ function world({ cap = 12 }: { cap?: number } = {}) {
     thread: () => w.buffer.kvGet(`${KEY}:threadId`) as string,
     tools: () => makeTools(track(openToolDb(path)), "gem", { now }),
     steps: async (k = 3) => { for (let i = 0; i < k; i++) { await w.bot.step(); clock += 1000; } },
-    interaction: (name: string, { channel = CH, user = HUMAN_ID, type = 2 }: IxOpts = {}) => {
+    interaction: (name: string, { channel = CH, user = HUMAN_ID, bot, type = 2 }: IxOpts = {}) => {
       const id = snow();
-      return { id, token: `tok${id}-secret`, type, channel_id: channel, data: { name }, member: { user: { id: user, username: "user1" } } };
+      return { id, token: `tok${id}-secret`, type, channel_id: channel, data: { name }, member: { user: { id: user, username: "user1", ...(bot !== undefined ? { bot } : {}) } } };
     },
     run: async (name: string, o: IxOpts = {}) => { const i = w.interaction(name, o); await w.dispatch("INTERACTION_CREATE", i); return i.id; },
     finish: (t: string, text: string | null) => t3.complete(t, t3.threads.get(t)!.runs.at(-1)!.runId, text),
@@ -324,9 +324,12 @@ test("INTERACTION /new resets the Discord tool's budget too: /status and discord
 
 test("INTERACTION /stop while idle or not started is a no-op with a clear reply and never calls interrupt", async () => {
   const w = world();
-  await w.run("stop", { user: STRANGER_ID });
+  await w.run("stop", { user: STRANGER_ID, bot: false }); // unlisted human
+  await w.run("stop", { user: HUMAN_ID, bot: true });     // bot with an allowlisted id
+  await w.run("stop", { user: HERMES, bot: true });       // crew bot
   await w.run("stop", { channel: OTHER_CH });
-  assert.deepEqual(w.calls, ["reply:Not allowed.", "reply:This bot is not active in this channel."]);
+  assert.deepEqual(w.calls, ["reply:Not allowed.", "reply:Not allowed.", "reply:Not allowed.", "reply:This bot is not active in this channel."]);
+  assert.ok(w.log.events.some((e) => e.event === "bridge.interaction_refused" && e.why === "bot"));
 
   await w.run("stop");
   assert.match(w.calls.at(-1)!, /^edit:Nothing is running \(no session started yet\)\.$/);
@@ -444,4 +447,33 @@ test("INTERACTION /stop also stops a background/scheduled turn without an open b
   w.finish(t1, "after wake stop");
   await w.steps(2);
   assert.ok(w.discord.botPosts().some((m) => m.content === "after wake stop"));
+});
+
+test("INTERACTION /stop targets only its recorded runId: if that run finishes first, a queued successor keeps running", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("first turn"));
+  await w.steps(2);
+  const t1 = w.thread();
+  const r1 = w.t3.threads.get(t1)!.runs[0].runId;
+  // a successor run is already queued in t3 behind r1 (e.g. a scheduled wake)
+  const r2 = w.t3.wake(t1, { type: "user_message", text: "queued successor" });
+  assert.equal(r2.status, "queued");
+
+  await w.run("stop");
+  assert.match(w.calls.at(-1)!, /^edit:Stopping the running turn\.$/);
+  // before step() calls t3.interrupt, r1 finishes normally and t3 promotes r2 to running
+  w.t3.complete(t1, r1, "first turn done");
+  assert.equal(r2.status, "running");
+
+  await w.steps(3);
+  const ic = w.t3.calls.filter((c) => c.tool === "interrupt");
+  assert.equal(ic.length, 1);
+  assert.equal(ic[0].runId, r1, "interrupt passed the recorded runId, not the successor");
+  assert.equal(r2.status, "running", "the successor turn was not interrupted");
+  assert.ok(w.discord.botPosts().some((m) => m.content === "first turn done"));
+  assert.ok(w.discord.botPosts().some((m) => m.content === "⏹ The running turn finished before /stop took effect."));
+
+  w.t3.complete(t1, r2.runId, "successor completed");
+  await w.steps(2);
+  assert.ok(w.discord.botPosts().some((m) => m.content === "successor completed"));
 });

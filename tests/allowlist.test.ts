@@ -9,7 +9,7 @@ import { memoryLog } from "../lib/log.ts";
 
 const DEPLOYED: string[] = JSON.parse(readFileSync(new URL("./fixtures/t3-mcp-tool-names.json", import.meta.url), "utf8")).names;
 const ALLOWED = ["list_scheduled_tasks", "t3_thread_launch", "t3_thread_list", "t3_thread_read", "t3_queue", "t3_thread_send", "t3_thread_organize", "t3_thread_interrupt"];
-const P = "proj-gem", I = "crewGemClaude", T = "thread-gem", STOP_KEY = "gem.test", STOP_ID = "999";
+const P = "proj-gem", I = "crewGemClaude", T = "thread-gem", STOP_KEY = "gem.test", STOP_ID = "999", STOP_RUN = "run:thread-gem:1";
 
 type Harness = ReturnType<typeof harness>;
 function harness({ bound = T as string | null, modelOptions, stop = null as StopGrant | null }: { bound?: string | null; modelOptions?: Record<string, string | boolean>; stop?: StopGrant | null } = {}) {
@@ -28,7 +28,7 @@ const ok: Record<string, Record<string, unknown>> = {
   t3_queue: { action: "list", threadId: T },
   t3_thread_send: { threadId: T, message: "hi", mode: "queue", clientRequestId: "bridge-gem-1" },
   t3_thread_organize: { action: "archive", threadId: T },
-  t3_thread_interrupt: { threadId: T, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) },
+  t3_thread_interrupt: { threadId: T, runId: STOP_RUN, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) },
 };
 const denied = async (h: Harness, name: string, args: unknown, re?: RegExp) => {
   const before = h.calls.length;
@@ -49,7 +49,7 @@ test("DENY: every deployed tool outside the allowlist is refused before the clie
 
 test("NEG control: each allowed tool with the bridge's own argument shapes passes through unchanged", async () => {
   for (const [name, args] of Object.entries(ok)) {
-    const h = harness({ bound: name === "t3_thread_launch" ? null : T, stop: name === "t3_thread_interrupt" ? { id: STOP_ID, conversationKey: STOP_KEY, threadId: T } : null });
+    const h = harness({ bound: name === "t3_thread_launch" ? null : T, stop: name === "t3_thread_interrupt" ? { id: STOP_ID, conversationKey: STOP_KEY, threadId: T, runId: STOP_RUN } : null });
     await h.mcp.call(name, args);
     assert.deepEqual(h.calls, [{ name, args }]);
   }
@@ -79,19 +79,21 @@ test("DENY organize: only archive, only the bound thread, no other argument, not
   await denied(h, "t3_thread_organize", ok.t3_thread_organize);
 });
 
-test("DENY interrupt: only on the bound thread while a person's /stop is pending, with its fixed clientRequestId and no extra args", async () => {
+test("DENY interrupt: only on the bound thread while a person's /stop is pending, with its recorded runId and fixed clientRequestId and no extra args", async () => {
   const h = harness();
   // denied while no /stop is pending
   await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt, /no \/stop is pending/);
   // denied when the pending /stop belongs to a different thread
-  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: "other-thread" };
+  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: "other-thread", runId: STOP_RUN };
   await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt, /no \/stop is pending/);
   // active grant on bound thread
-  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: T };
+  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: T, runId: STOP_RUN };
   await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, threadId: "other-thread" });
-  await denied(h, "t3_thread_interrupt", { threadId: T }, /clientRequestId required/);
-  await denied(h, "t3_thread_interrupt", { threadId: T, clientRequestId: "wrong-id" }, /only the pending \/stop/);
-  for (const extra of [{ stop: true }, { stop: false }, { runId: "r1" }, { reason: "x" }, { environmentId: "other" }]) {
+  await denied(h, "t3_thread_interrupt", { threadId: T, runId: STOP_RUN }, /clientRequestId required/);
+  await denied(h, "t3_thread_interrupt", { threadId: T, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) }, /runId required/);
+  await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, runId: "run:other:2" }, /only the pending \/stop run/);
+  await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, clientRequestId: "wrong-id" }, /only the pending \/stop request/);
+  for (const extra of [{ stop: true }, { stop: false }, { reason: "x" }, { environmentId: "other" }]) {
     await denied(h, "t3_thread_interrupt", { ...ok.t3_thread_interrupt, ...extra }, /not allowed/);
   }
   await h.mcp.call("t3_thread_interrupt", ok.t3_thread_interrupt);
@@ -101,7 +103,7 @@ test("DENY interrupt: only on the bound thread while a person's /stop is pending
   await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt, /no \/stop is pending/);
   // denied while no thread is bound
   h.state.bound = null;
-  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: T };
+  h.state.stop = { id: STOP_ID, conversationKey: STOP_KEY, threadId: T, runId: STOP_RUN };
   await denied(h, "t3_thread_interrupt", ok.t3_thread_interrupt);
 });
 
@@ -175,14 +177,14 @@ test("adapter: its real call shapes pass the allowlist (paged read, paged list, 
       return {};
     },
   };
-  const a = t3Adapter({ mcp: raw, policy: { projectId: P, instanceId: I, boundThread: () => bound, stop: () => (bound ? { id: STOP_ID, conversationKey: STOP_KEY, threadId: bound } : null) }, log: memoryLog() });
+  const a = t3Adapter({ mcp: raw, policy: { projectId: P, instanceId: I, boundThread: () => bound, stop: () => (bound ? { id: STOP_ID, conversationKey: STOP_KEY, threadId: bound, runId: STOP_RUN } : null) }, log: memoryLog() });
   assert.equal((await a.findThreads({ projectId: P, title: "Gem (bridge x)" })).length, 1);
   await a.launch({ projectId: P, title: "Gem (bridge x)", modelSelection: { instanceId: I, model: "m" } });
   bound = T;
   assert.deepEqual((await a.read(T)).items!.map((x) => x.text), ["earlier input", "latest reply"]);
   assert.deepEqual((await a.queue(T)).items.map((x) => x.text), ["first", "second"]);
   await a.send({ threadId: T, message: "m", mode: "queue", clientRequestId: "c" });
-  await a.interrupt({ threadId: T, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) });
+  await a.interrupt({ threadId: T, runId: STOP_RUN, clientRequestId: stopClientRequestId(STOP_KEY, STOP_ID) });
   await a.archive(T);
 });
 

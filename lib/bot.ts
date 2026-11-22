@@ -185,8 +185,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   };
   // ---- /stop: interrupt the bound thread's running turn ----
   // Persisted in kv `stop` while in flight so a crash cannot lose the stop or re-escalate an interrupted batch, and so
-  // the MCP allowlist admits `t3_thread_interrupt` only while stage === "interrupt" for this stop's clientRequestId.
-  type Stop = { id: string; threadId: string; author: string; requestedAt: number; stage: "interrupt" | "wait"; targetRunId?: string | null; runId?: string };
+  // the MCP allowlist admits `t3_thread_interrupt` only while stage === "interrupt" for this stop's recorded runId and clientRequestId.
+  type Stop = { id: string; threadId: string; runId: string; author: string; requestedAt: number; stage: "interrupt" | "wait" };
   type LastStop = { at: number; by: string };
   const stopState = (): Stop | null => { const v = buffer.kvGet(K("stop")); return v ? (JSON.parse(v) as Stop) : null; };
   const saveStop = (s: Stop) => buffer.kvSet(K("stop"), JSON.stringify(s));
@@ -207,19 +207,19 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const threadId = buffer.kvGet(K("threadId"));
     if (!threadId) return { accepted: false, reason: "not started" };
     const read = await t3.read(threadId);
-    const targetRunId = activeRunId(read);
+    const runId = activeRunId(read);
     const after = stopState();
     if (after?.id === cmd.id) return { accepted: true, inserted: false };
     if (after) return { accepted: false, reason: "stop pending" };
-    if (!targetRunId) {
+    if (!runId) {
       buffer.kvSet(K("stopSeen"), maxId(buffer.kvGet(K("stopSeen")), cmd.id));
       return { accepted: false, reason: "idle" };
     }
     buffer.atomically(() => {
       buffer.recordResetBoundary(cmd.id, channelId);
-      saveStop({ id: cmd.id, threadId, author: cmd.author, requestedAt: cmd.receivedAt, stage: "interrupt", targetRunId });
+      saveStop({ id: cmd.id, threadId, runId, author: cmd.author, requestedAt: cmd.receivedAt, stage: "interrupt" });
     });
-    log.emit("bridge.stop_command", { bot: name, sourceMessageId: cmd.id, threadId, targetRunId });
+    log.emit("bridge.stop_command", { bot: name, sourceMessageId: cmd.id, threadId, runId });
     return { accepted: true, inserted: true };
   }
   async function stopStep(threadId: string, read: ThreadRead): Promise<{ read?: ThreadRead; done?: StepResult }> {
@@ -254,28 +254,34 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     };
     let latest = read;
     if (st.stage === "interrupt") {
-      const target = st.targetRunId ?? activeRunId(latest);
-      if (target && target !== st.targetRunId) { st = { ...st, targetRunId: target }; saveStop(st); }
-      const r = await t3.interrupt({ threadId, clientRequestId: stopClientRequestId(conversationKey, st.id) });
-      log.emit("bridge.stop_interrupt", { bot: name, stopId: st.id, threadId, status: r?.status ?? null, runId: r?.runId ?? null });
+      const r = await t3.interrupt({ threadId, runId: st.runId, clientRequestId: stopClientRequestId(conversationKey, st.id) });
+      log.emit("bridge.stop_interrupt", { bot: name, stopId: st.id, threadId, status: r?.status ?? null, runId: r?.runId ?? st.runId });
+      if (r?.status === "completed") {
+        latest = await t3.read(threadId);
+        finish("finished", st.runId, latest);
+        return { read: latest };
+      }
+      if (r?.status && r.status !== "interrupt_requested" && r.status !== "no_active_run" && TERMINAL.has(r.status)) {
+        latest = await t3.read(threadId);
+        finish("stopped", st.runId, latest);
+        return { read: latest };
+      }
       if (r?.status === "no_active_run") {
         latest = await t3.read(threadId);
-        const prev = target ? (latest.recentRuns ?? []).find((x) => x.runId === target) : undefined;
-        if (prev && (prev.status === "interrupted" || prev.status === "cancelled")) finish("stopped", target, latest);
-        else if (prev && prev.status === "completed") finish("finished", target, latest);
+        const prev = (latest.recentRuns ?? []).find((x) => x.runId === st!.runId);
+        if (prev && (prev.status === "interrupted" || prev.status === "cancelled")) finish("stopped", st.runId, latest);
+        else if (prev && prev.status === "completed") finish("finished", st.runId, latest);
         else finish("idle", null, latest);
         return { read: latest };
       }
-      const runId = typeof r?.runId === "string" && r.runId ? r.runId : target;
-      if (!runId) { finish("idle", null, latest); return { read: latest }; }
-      st = { ...st, stage: "wait", runId };
+      st = { ...st, stage: "wait" };
       saveStop(st);
       latest = await t3.read(threadId);
     }
     const run = (latest.recentRuns ?? []).find((r) => r.runId === st!.runId);
     if (!run || !TERMINAL.has(run.status)) return { read: latest, done: { phase: "stop" } };
-    if (run.status === "completed") finish("finished", st.runId!, latest);
-    else finish("stopped", st.runId!, latest);
+    if (run.status === "completed") finish("finished", st.runId, latest);
+    else finish("stopped", st.runId, latest);
     return { read: latest };
   }
 

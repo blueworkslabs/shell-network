@@ -8,7 +8,7 @@ const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "ro
 export interface FakeRun { runId: string; ordinal: number; status: string; userMessageId: string; text: string; queueHeld?: boolean; inputType?: "user_message" | "notification" }
 export interface FakeThread { id: string; projectId: string; title: string; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[]; archived?: boolean }
 export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; launch?: "after"; interrupt?: "before" | "after"; archive?: "after"; post?: "before" | "after"; react?: "before" }
-export interface FakeCall { tool: string; title?: string; threadId?: string; mode?: string; clientRequestId?: string; message?: string }
+export interface FakeCall { tool: string; title?: string; threadId?: string; runId?: string; mode?: string; clientRequestId?: string; message?: string }
 type SendArgs = { threadId: string; message: string; mode: string; clientRequestId: string };
 export interface FakeT3 {
   standingJobs: Awaited<ReturnType<T3Port["listStandingJobs"]>>;
@@ -22,7 +22,7 @@ export interface FakeT3 {
   queue(threadId: string): Promise<QueueList>;
   send(args: SendArgs): Promise<{ messageId: string; runId?: string; delivery?: string; status?: string }>;
   interruptDelay: boolean; // test control: leave the run active until interrupted(threadId, runId) is called
-  interrupt(args: { threadId: string; clientRequestId: string }): Promise<InterruptResult>;
+  interrupt(args: { threadId: string; runId: string; clientRequestId: string }): Promise<InterruptResult>;
   interrupted(threadId: string, runId: string): void;
   archiveError: string | null; // test control: archive fails with this message (once)
   archive(threadId: string): Promise<{ archived: true }>; // like t3: a second archive of a thread is an error
@@ -103,12 +103,17 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       return { messageId, runId: run.runId, delivery, status: run.status };
     },
     interruptDelay: false,
-    async interrupt({ threadId, clientRequestId }) {
-      calls.push({ tool: "interrupt", threadId, clientRequestId });
+    async interrupt({ threadId, runId, clientRequestId }) {
+      calls.push({ tool: "interrupt", threadId, runId, clientRequestId });
       if (crash.interrupt === "before") die("interrupt");
       const t = th(threadId);
+      // Matches t3 0.1.11 ThreadManagementService.interruptThread when runId is supplied:
+      // an already-terminal run returns its terminal status without touching any running successor.
+      const explicit = t.runs.find((r) => r.runId === runId);
+      if (!explicit) throw new Error(`Run ${runId} not found`);
+      if (TERMINAL.has(explicit.status)) return { threadId, runId: explicit.runId, status: explicit.status };
       const active = [...t.runs].reverse().find((r) => !TERMINAL.has(r.status) && r.status !== "queued");
-      if (!active) return { threadId, runId: null, status: "no_active_run" };
+      if (!active || active.runId !== runId) throw new Error(`Run ${runId} is not interruptible`);
       if (!api.interruptDelay) {
         active.status = "interrupted";
         promote(t);

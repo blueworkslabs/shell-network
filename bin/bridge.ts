@@ -141,8 +141,9 @@ for (const [i, channelId] of conversations.entries()) {
       return reset?.stage === "handoff" && reset.handoff ? { ...reset.handoff, conversationKey, sent: reset.handoffSent } : null;
     },
     stop: () => {
-      const pending = JSON.parse(buffer.kvGet(`${conversationKey}:stop`) ?? "null") as { id?: string; threadId?: string; stage?: string } | null;
-      return pending?.stage === "interrupt" && pending.id && pending.threadId ? { id: pending.id, conversationKey, threadId: pending.threadId } : null;
+      const pending = JSON.parse(buffer.kvGet(`${conversationKey}:stop`) ?? "null") as { id?: string; threadId?: string; runId?: string; stage?: string } | null;
+      return pending?.stage === "interrupt" && pending.id && pending.threadId && pending.runId
+        ? { id: pending.id, conversationKey, threadId: pending.threadId, runId: pending.runId } : null;
     },
     // the conversation's own archived threads (its /new ledger), readable for the export only
     // only with the export on (BRIDGE_NOTES_DIR): otherwise no archived thread is readable at all

@@ -24,8 +24,8 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   - Bridge code reaches MCP only through a strict tool and argument allowlist (`lib/allowlist.ts`). The allowlist
     limits the code, not the token: the token itself can do more. Beyond `t3_thread_send` (queue-only), the allowlist
     admits only `t3_thread_organize` with action `archive` on the bot's own bound thread (`/new`), and
-    `t3_thread_interrupt` on the bound thread while a person's `/stop` is pending, with that stop's fixed
-    `clientRequestId` only (never `stop: true`, `runId`, `reason` or `environmentId`). A pending schedule handoff
+    `t3_thread_interrupt` on the bound thread while a person's `/stop` is pending, with that stop's recorded `runId`
+    and fixed `clientRequestId` only (never `stop: true`, `reason` or `environmentId`). A pending schedule handoff
     allows launch
     of the persisted replacement title in the configured project/provider and the current fixed, deduplicated
     handoff input to its persisted thread ID. Schedule listing is read-only and scoped to the configured project. The

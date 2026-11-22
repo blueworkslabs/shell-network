@@ -152,13 +152,14 @@ bot, so choosing the entry chooses the bot. The text `@Bot /new` keeps working.
   `interaction`: an interaction id is not a message, so no reaction or reply reference points at it. The confirmation
   still goes through the outbox, as a plain message. The command also records a reset boundary (`human_message`) like a person's message, so the cap
   resets on both sides: the receiving count and the Discord tool's budget agree.
-- **`/stop` by interaction** interrupts only the bound thread's newest running turn (`t3_thread_interrupt` without
-  `stop: true`, so queued input is not held). When the thread is idle or not started yet, it replies ephemerally as a
+- **`/stop` by interaction** interrupts only the bound thread's recorded running turn (`t3_thread_interrupt` with
+  that exact `runId`, never `stop: true`, so queued input is not held and a successor turn is never interrupted if the
+  target already finished). When the thread is idle or not started yet, it replies ephemerally as a
   no-op without calling t3 interrupt. While a turn is running, the stop request is persisted in kv (`stop`), the
-  allowlist admits `t3_thread_interrupt` only on the bound thread with that stop's fixed `clientRequestId` until the
-  interrupt call returns, the interrupted batch is cancelled and settled cleanly instead of escalating, one fixed
-  confirmation goes out through the outbox, `/status` shows the last stop, and any buffered messages go out on the next
-  turn.
+  allowlist admits `t3_thread_interrupt` only on the bound thread with that stop's recorded `runId` and fixed
+  `clientRequestId` until the interrupt call returns, the interrupted batch is cancelled and settled cleanly instead of
+  escalating, one fixed confirmation goes out through the outbox, `/status` shows the last stop, and any buffered
+  messages go out on the next turn.
 - An expired interaction (10062) and one delivered twice (Discord answers the second defer with 40060) are logged and
   dropped: the reset is durable (kv and the buffer) and its channel confirmation goes through the outbox, so neither an
   expired token nor a restart loses or repeats it. Interaction tokens are never stored or logged, errors included

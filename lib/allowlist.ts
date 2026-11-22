@@ -11,8 +11,8 @@
 //     clientRequestId; read also a thread of the conversation's own `archived` ledger, but then only the "messages" view
 //     with its text continuation (the export of an archived session into sessions/, #50);
 //   - organize: only action "archive", only on the bound thread (/new; no unarchive, pin, settle or other action);
-//   - interrupt: only on the bound thread, only while a person's `/stop` is pending, and only with that stop's fixed
-//     clientRequestId (no `stop: true`, `runId`, `reason` or `environmentId`).
+//   - interrupt: only on the bound thread, only while a person's `/stop` is pending, and only with that stop's
+//     recorded runId and fixed clientRequestId (no `stop: true`, `reason` or `environmentId`).
 // It constrains the bridge's code, not the token: the token's own authority is checked on the t3 host, and the token file
 // must stay out of reach of the provider processes (both outside this module).
 import { handoffInput, type ScheduleHandoff } from "./schedule-handoff.ts";
@@ -29,7 +29,7 @@ export class ToolDenied extends Error {
 type Check = (v: unknown) => boolean;
 interface Rule { args: Record<string, Check>; required: string[]; when?: (args: Record<string, unknown>) => string | null }
 export type Rules = Record<string, Rule>;
-export interface StopGrant { id: string; conversationKey: string; threadId: string }
+export interface StopGrant { id: string; conversationKey: string; threadId: string; runId: string }
 export const stopClientRequestId = (conversationKey: string, stopId: string): string => `bridge-${conversationKey}-stop-${stopId}`;
 // archivedThreads: the conversation's own archived threads (its `archived` ledger), readable for the export after /new
 export interface AllowlistPolicy { projectId: string; instanceId: string; modelOptions?: ModelOptions; boundThread: () => string | null; archivedThreads?: () => string[];
@@ -124,11 +124,12 @@ export function allowlistRules(policy: AllowlistPolicy): Rules {
       required: ["action", "threadId"],
     },
     t3_thread_interrupt: {
-      args: { threadId: ownThread, clientRequestId: isStr },
-      required: ["threadId", "clientRequestId"],
+      args: { threadId: ownThread, runId: isStr, clientRequestId: isStr },
+      required: ["threadId", "runId", "clientRequestId"],
       when: (a) => {
         const pending = policy.stop?.();
-        if (!pending || !isStr(pending.id) || !isStr(pending.conversationKey) || pending.threadId !== boundThread()) return "no /stop is pending";
+        if (!pending || !isStr(pending.id) || !isStr(pending.conversationKey) || !isStr(pending.runId) || pending.threadId !== boundThread()) return "no /stop is pending";
+        if (a.runId !== pending.runId) return "only the pending /stop run is allowed";
         return a.clientRequestId === stopClientRequestId(pending.conversationKey, pending.id) ? null : "only the pending /stop request is allowed";
       },
     },

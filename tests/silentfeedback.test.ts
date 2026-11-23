@@ -275,8 +275,8 @@ test("SILENT FEEDBACK: suppression follows the run's own tool output across chan
   assert.deepEqual(discord.botPosts(CH).map((p) => p.content), ["from another run", SILENT_NOTE_TEXT], "unrelated run activity does not suppress botA's silent note");
   assert.equal(discord.botPosts(CH)[1].message_reference?.message_id, m2.id);
 
-  // 3) Failed tool call, replay of an earlier call, dropped outbox entry, and output-less call sharing an idempotency_key
-  //    with an unrelated post in channel B do NOT suppress silent feedback
+  // 3) Failed tool call, replay of an earlier call, dropped outbox entry, and output-less call in CH sharing an
+  //    idempotency_key with an unrelated post in CH_B do NOT suppress silent feedback (lookup is scoped to target)
   const m3 = discord.userSays("failed/dropped/replayed/outputless calls", { channel: CH });
   await botA.accept(m3);
   await steps(1);
@@ -288,11 +288,32 @@ test("SILENT FEEDBACK: suppression follows the run's own tool output across chan
   t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "failed", idempotency_key: "fail-1" }, status: "failed", output: "Error: refused" });
   t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH_B, content: "posted in channel B", idempotency_key: "cross-1" }, output: JSON.stringify(replay.structuredContent) });
   t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "will be dropped", idempotency_key: "drop-1" }, output: JSON.stringify(droppedSend.structuredContent) });
-  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "no output recorded", idempotency_key: "shared-idem-key" } });
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "no output in A", idempotency_key: "shared-idem-key" } });
   t3.complete(tidOf(CH), runOf(CH), "NO_REPLY");
   await steps(2);
-  assert.equal(discord.botPosts(CH).at(-1)!.content, SILENT_NOTE_TEXT, "failed, replayed, dropped, and output-less tool calls do not suppress silent feedback");
+  assert.equal(discord.botPosts(CH).at(-1)!.content, SILENT_NOTE_TEXT, "same key in CH_B does not suppress CH when call targeted CH");
   assert.equal(discord.botPosts(CH).at(-1)!.message_reference?.message_id, m3.id);
+
+  // 4) Output-less call whose target IS CH_B with CH_B's key DOES resolve to CH_B's post and suppresses the note
+  const countBefore4 = discord.botPosts(CH).length;
+  const m4 = discord.userSays("outputless call targeting B", { channel: CH });
+  await botA.accept(m4);
+  await steps(1);
+  tools.send({ channel: CH_B, content: "target B outputless post", idempotency_key: "same-key-b" });
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH_B, content: "target B outputless post", idempotency_key: "same-key-b" } });
+  t3.complete(tidOf(CH), runOf(CH), "NO_REPLY");
+  await steps(2);
+  assert.equal(discord.botPosts(CH).length, countBefore4, "output-less call matched strictly in target CH_B suppresses note");
+
+  // 5) Output-less call without a known target `channel` stays silent (no misleading note)
+  const countBefore5 = discord.botPosts(CH).length;
+  const m5 = discord.userSays("outputless call with unknown target", { channel: CH });
+  await botA.accept(m5);
+  await steps(1);
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { content: "missing channel" } });
+  t3.complete(tidOf(CH), runOf(CH), "NO_REPLY");
+  await steps(2);
+  assert.equal(discord.botPosts(CH).length, countBefore5, "output-less call without target leaves turn silent (no note)");
 });
 
 test("SILENT FEEDBACK: never fires for bot-to-bot mentions (regular or talk-only), unmentioned batches, relays, or /new wrap-ups", async () => {

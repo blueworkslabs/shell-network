@@ -546,6 +546,17 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     },
     atomically: <T>(fn: () => T): T => tx(fn),
     outboxEntry: (conversationKey: string, key: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND key = ?", conversationKey, key),
+    lastOutboxId: (conversationKey: string): number => one<{ id: number }>("SELECT COALESCE(MAX(id), 0) id FROM outbox WHERE conversation_key = ?", conversationKey)!.id,
+    hasToolActivityAfter: (conversationKey: string, afterId: number): boolean => one<{ n: number }>(
+      `SELECT count(*) n FROM outbox WHERE conversation_key = ? AND id > ? AND state != 'dropped'
+       AND (substr(key, 1, 5) = 'tool:' OR substr(key, 1, 5) = 'edit:' OR substr(key, 1, 6) = 'react:' OR substr(key, 1, 7) = 'thread:')`,
+      conversationKey, afterId,
+    )!.n > 0,
+    hasToolActivitySince: (conversationKey: string, sinceMs: number): boolean => one<{ n: number }>(
+      `SELECT count(*) n FROM outbox WHERE conversation_key = ? AND created_at >= ? AND state != 'dropped'
+       AND (substr(key, 1, 5) = 'tool:' OR substr(key, 1, 5) = 'edit:' OR substr(key, 1, 6) = 'react:' OR substr(key, 1, 7) = 'thread:')`,
+      conversationKey, sinceMs,
+    )!.n > 0,
     // The newest post in the bot's channel, or (threadId) in one of its tool threads: entries posted into a
     // thread carry meta { channel: <thread id>, thread: 1 }; everything else is a channel post.
     lastOutboxPost: (conversationKey: string, threadId: string | null = null): string | null => one<{ id: string }>(`SELECT channel_message_id id FROM outbox WHERE conversation_key = ?1

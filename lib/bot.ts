@@ -28,6 +28,7 @@ import { attachmentLines, attachmentNames, readStaged, removeSaved, removeStaged
 import { handoffInput, type ScheduleHandoff } from "./schedule-handoff.ts";
 import { errText } from "./log.ts";
 import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./stuck.ts";
+import type { SilentFeedback } from "./bots.ts";
 import type { BatchLimit, Buffer } from "./buffer.ts";
 import type { BatchRow, DiscordMessage, DiscordPort, InboundRow, Log, ModelSelection, OutboxRow, Projection, QueueList, T3Port, ThreadRead, Verdict } from "./types.ts";
 
@@ -39,6 +40,9 @@ export const BARE_MENTION_TEXT = "[bridge: a mention without text, i.e. go on wi
 export const NEW_WRAPUP_TEXT = "/new: this session is being archived and a fresh one starts after this turn. Write today's daily note for the project of this channel now (what was done, decided and left open), then reply with exactly NO_REPLY.";
 // First batch of a fresh session: nothing carries over except what the agent wrote down.
 export const FRESH_SESSION_TEXT = "[Fresh session: the previous one was archived by /new and you remember nothing of it. Read today's and yesterday's daily notes before you answer; they are your continuity.]";
+// Deliberate NO_REPLY feedback on direct person mentions when nothing was posted (#82).
+export const SILENT_NOTE_TEXT = "(chose not to reply)";
+export const SILENT_REACTION_EMOJI = "🔇";
 // Unread header: per-line cut, marked so the agent can tell the line is incomplete. Messages that mention the bot
 // (e.g. a handoff the exchange cap held back) get Discord's whole message length, so a resumed bot reads them in full.
 export const HEADER_LINE_MAX = 300;
@@ -66,6 +70,8 @@ export interface BotOptions {
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
   allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
+  // Visible feedback on deliberate NO_REPLY to a person's direct mention when nothing was posted (#82): note (default), reaction, or off
+  silentFeedback?: SilentFeedback;
   // the bot's DM with the user: every message of an allowlisted person is addressed to the bot (no mention needed)
   dm?: boolean;
   // Discord thread conversation (#77): parent channel context and optional starter message
@@ -123,7 +129,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, activeThreads, notesRoot }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, silentFeedback = "note", headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, activeThreads, notesRoot }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -520,7 +526,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!fromBot && msg.id && isNewCommand(msg)) return acceptNew(msg as DiscordMessage & { id: string });
     // A crew bot's mention counts from its text too: whether Discord fills `mentions` for a bot-authored post is not
     // something the bridge relies on.
-    const mentioned = (dm && !fromBot) || Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (crewBot && mentionRe().test(String(msg.content ?? ""))) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
+    const personDirectMention = !fromBot && allowed.has(authorId) && Boolean(state.botUserId) && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)));
+    const mentioned = (dm && !fromBot) || personDirectMention || Boolean(state.botUserId) && ((crewBot && ((msg.mentions ?? []).some((m) => m.id === state.botUserId) || mentionRe().test(String(msg.content ?? "")) || (botRoleId !== null && (msg.mention_roles ?? []).includes(botRoleId)))));
     if (!mentioned) return { accepted: false, reason: "no mention" };
     // A person or talk-only member can resume with a bare mention; bridge-run bots cannot.
     const content = String(msg.content ?? "");
@@ -548,7 +555,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         return { accepted: false, reason: "exchange cap", wake: true };
       }
       r = b;
-    } else r = buffer.accept({ ...input, authorKind: "human" });
+    } else r = buffer.atomically(() => {
+      const accepted = buffer.accept({ ...input, authorKind: "human" });
+      if (personDirectMention && msg.id) buffer.kvSet(K(`directMention:${msg.id}`), "1");
+      return accepted;
+    });
     log.emit("bridge.accepted", { bot: name, sourceMessageId: msg.id, inserted: r.inserted, inboundId: r.id });
     const row = buffer.unacked(conversationKey).find((x) => x.id === r.id);
     if (row) await ack(row);
@@ -720,6 +731,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (kind === "alert" || kind === "talert") return "bridge.stuck_alert_posted";
     if (kind === "clear" || kind === "tclear") return "bridge.stuck_cleared";
     if (kind === "tool") return found ? "bridge.tool_found" : "bridge.tool_posted";
+    if (kind === "silent") return found ? "bridge.silent_note_found" : "bridge.silent_note_posted";
     return "bridge.notice_posted";
   };
   // Tool entries are checked again right before they go out: the channel they were made for must be this
@@ -863,11 +875,28 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     log.emit("bridge.stuck_alert_withdrawn", { bot: name, key: h.key, ...(kind === "talert" ? { thread: true } : {}) });
     return true;
   }
+  // A bridge-owned silent-feedback reaction (#82): PUT is idempotent, so recovery repeats it; 404 drops it,
+  // and repeated 4xx refusals drop it after REFUSE_LIMIT without stalling the outbox.
+  async function applySilentReaction(h: OutboxRow): Promise<boolean> {
+    if (h.state === "pending") buffer.outboxPosting(h.id, h.reply_to!);
+    try {
+      await discord.react(channelId, h.reply_to!, h.content);
+    } catch (e) {
+      const status = errStatus(e)?.status;
+      if (status === 404) { buffer.outboxPending(h.id); rejectTool(h, "target deleted"); return true; }
+      if (status === undefined || !REFUSED.has(status)) throw e;
+      return countRefusal(h, status) >= REFUSE_LIMIT;
+    }
+    buffer.outboxApplied(h.id);
+    log.emit("bridge.silent_reacted", { bot: name, key: h.key, messageId: h.reply_to, ...(h.state === "posting" ? { recovered: true } : {}) });
+    return true;
+  }
   async function drainOutbox(): Promise<boolean> {
     for (;;) {
       const h = buffer.outboxHead(conversationKey);
       if (!h) return true;
       if (h.key.startsWith("react:")) { await applyReaction(h); continue; }
+      if (h.key.startsWith("sreact:")) { if (await applySilentReaction(h)) continue; return false; }
       if (h.key.startsWith("thread:")) { await applyThread(h); continue; }
       if (h.key.startsWith("edit:")) { if (await applyEdit(h)) continue; return false; }
       const replyTo = resolveReplyTo(h);
@@ -910,12 +939,13 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       let upload: { name: string; data: Uint8Array }[] = [];
       if (hasFilesKey(h)) { try { upload = readStaged({ files: toolMeta(h).files, stagingDir: attachmentsDir }); } catch (e) { rejectTool(h, `attachment: ${errText(e)}`); continue; } }
       buffer.outboxPosting(h.id, boundary);
-      // a tool post may ping only the crew bots it names that are still allowed now
-      const users = (JSON.parse(h.users) as string[]).filter((u) => !tool || mentionsIn(h.content).includes(u));
+      const silent = h.key.startsWith("silent:");
+      // a tool post may ping only the crew bots it names that are still allowed now; silent notes never ping anyone
+      const users = silent ? [] : (JSON.parse(h.users) as string[]).filter((u) => !tool || mentionsIn(h.content).includes(u));
       let m: DiscordMessage;
       try {
         m = await discord.createMessage(target, { content: h.content, nonce: h.nonce, enforce_nonce: true,
-          allowed_mentions: { parse: [] as string[], ...(users.length ? { users } : {}), ...(tool ? { replied_user: false } : {}) },
+          allowed_mentions: { parse: [] as string[], ...(users.length ? { users } : {}), ...(tool || silent ? { replied_user: false } : {}) },
           ...(replyTo ? { message_reference: { message_id: replyTo, channel_id: target, fail_if_not_exists: false } } : {}), ...(upload.length ? { files: upload } : {}) });
       } catch (e) {
         const status = errStatus(e)?.status;
@@ -958,7 +988,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       // only this part is settled, as skipped: the reply or relay is done once all its parts are (the others still post)
       if (kind === "reply") buffer.recordReplyPart(Number(a), Number(b), parts, `refused:${h.id}`);
       else if (kind === "relay") buffer.recordRelayPart(Number(a), Number(b), parts, `refused:${h.id}`);
-      if (!["notice", "alert", "clear", "talert", "tclear", "refused", "ralert", "rclear"].includes(kind)) {
+      if (!["notice", "alert", "clear", "talert", "tclear", "refused", "ralert", "rclear", "silent", "sreact"].includes(kind)) {
         buffer.enqueue(conversationKey, { key: `refused:${h.id}`, nonce: `f${h.id}`,
           content: kind === "edit" ? `⚠️ ${name} could not update one of its messages here: Discord refused the edit. It was skipped so later messages can go out.`
             : `⚠️ ${name} could not post one message here: Discord refused it (for example a missing permission or a file type that isn't allowed). It was skipped so later messages can go out.` });
@@ -1005,6 +1035,25 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { status: "unknown" };
   }
 
+  // Target message id for deliberate-silence feedback (#82), or null if it does not apply.
+  function silentFeedbackTarget(b: BatchRow): string | null {
+    if (silentFeedback === "off") return null;
+    const rows = buffer.inboundOf(b.id);
+    if (rows.some((r) => r.text === NEW_WRAPUP_TEXT)) return null;
+    const hit = rows.find((r) => r.source === "discord" && r.author_kind === "human" && buffer.kvGet(K(`directMention:${r.source_message_id}`)) === "1");
+    if (!hit) return null;
+    const start = buffer.kvGet(K(`batchOutboxStart:${b.id}`));
+    const postedViaTool = start !== null
+      ? buffer.hasToolActivityAfter(conversationKey, Number(start))
+      : buffer.hasToolActivitySince(conversationKey, b.created_at);
+    if (postedViaTool) return null;
+    return hit.source_message_id;
+  }
+  function cleanupBatchMeta(b: BatchRow): void {
+    buffer.kvDelete(K(`batchOutboxStart:${b.id}`));
+    for (const r of buffer.inboundOf(b.id)) buffer.kvDelete(K(`directMention:${r.source_message_id}`));
+  }
+
   // A delivered batch's reply, queued part by part (part 0 replies to the batch's first message). False if the
   // reply cannot be read in full yet.
   function queueReply(b: BatchRow, read: ThreadRead): boolean {
@@ -1014,10 +1063,19 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const last = (read.items ?? []).filter((i) => i.runId === runId && i.type === "assistant_message").at(-1);
     if (last && (last.textTruncated !== false || (last.nextTextOffset ?? null) !== null)) { log.emit("bridge.reply_incomplete", { bot: name, batchId: b.id }); return false; }
     const final = withoutLocalImages(last?.text);
-    // A final of exactly NO_REPLY (the agent answered with a tool post): complete, nothing posted.
+    // A final of exactly NO_REPLY: complete, nothing posted unless deliberate-silence feedback applies (#82).
     if (isNoReply(final) && !buffer.postedParts(b.id).length && !buffer.outboxEntry(conversationKey, `reply:${b.id}:0`)) {
-      buffer.markReplyNone(b.id);
-      log.emit("bridge.reply_none", { bot: name, batchId: b.id });
+      const target = silentFeedbackTarget(b);
+      buffer.atomically(() => {
+        buffer.markReplyNone(b.id);
+        if (target && silentFeedback === "note") {
+          buffer.enqueue(conversationKey, { key: `silent:${b.id}`, content: SILENT_NOTE_TEXT, nonce: `q${b.id}`, replyTo: target, users: [], meta: { silent: 1 } });
+        } else if (target && silentFeedback === "reaction") {
+          buffer.enqueue(conversationKey, { key: `sreact:${b.id}`, content: SILENT_REACTION_EMOJI, nonce: `qr${b.id}`, replyTo: target, users: [], meta: { silent: 1 } });
+        }
+        cleanupBatchMeta(b);
+      });
+      log.emit(target ? "bridge.reply_silent_feedback" : "bridge.reply_none", { bot: name, batchId: b.id, ...(target ? { mode: silentFeedback } : {}) });
       return true;
     }
     const parts = splitReply(withoutNoReply(final));
@@ -1029,6 +1087,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       buffer.enqueue(conversationKey, { key: `reply:${b.id}:${i}`, content: parts[i], nonce: `b${b.id}p${i}`,
         replyTo: i === 0 && first.source === "discord" ? first.source_message_id : null, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
     }
+    cleanupBatchMeta(b);
     return true;
   }
 
@@ -1389,7 +1448,12 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!gateOpen()) return { phase: "catching-up" };
     const busy = isBusy(read);
     if (busy || !buffer.buffered(conversationKey, reset.limit).length) return { phase: busy ? "busy" : "idle" };
-    const b = buffer.createBatch(conversationKey, (rows) => unreadHeader(rows, reset.limit), reset.limit)!;
+    const b = buffer.atomically(() => {
+      const start = buffer.lastOutboxId(conversationKey);
+      const created = buffer.createBatch(conversationKey, (rows) => unreadHeader(rows, reset.limit), reset.limit)!;
+      buffer.kvSet(K(`batchOutboxStart:${created.id}`), String(start));
+      return created;
+    });
     await sendBatch(threadId, b);
     await typing();
     return { phase: "sent", batchId: b.id };

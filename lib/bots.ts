@@ -4,6 +4,7 @@ import type { ModelOptions, ModelSelection } from "./types.ts";
 // One conversation per bot and channel: its buffer rows, kv prefix, t3 thread, outbox and tool config.
 export const conversationKeyFor = (bot: string, channelId: string): string => `${bot}.${channelId}`;
 
+export type SilentFeedback = "note" | "reaction" | "off";
 export interface CrewMember { key: string; name: string; id: string; instanceId?: string; model?: string; options?: ModelOptions }
 export interface BotConfig extends CrewMember { instanceId: string; model: string }
 
@@ -56,9 +57,14 @@ export function bridgeConfig(env: Record<string, string | undefined>) {
   if (!self.instanceId || !self.model) return fail(`own bot ${key} is talk-only; instanceId and model required`);
   const cap = env.BRIDGE_EXCHANGE_CAP ?? "2";
   if (!/^\d{1,4}$/.test(cap)) throw new Error("BRIDGE_EXCHANGE_CAP: an integer >= 0 (0 = off)");
+  const silent = env.BRIDGE_SILENT_FEEDBACK ?? "note";
+  if (silent !== "note" && silent !== "reaction" && silent !== "off") {
+    throw new Error("BRIDGE_SILENT_FEEDBACK: must be note, reaction or off");
+  }
   return {
     bot: self as BotConfig,
     allowedBots: members.filter((m) => m.key !== key).map(({ id, name, instanceId }) => ({ id, name, ...(!instanceId ? { talkOnly: true } : {}) })),
     exchangeCap: Number(cap),
+    silentFeedback: silent as SilentFeedback,
   };
 }

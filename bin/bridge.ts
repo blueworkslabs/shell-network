@@ -16,6 +16,7 @@ import type { ScheduleHandoff } from "../lib/schedule-handoff.ts";
 //   BRIDGE_ALLOWED_AUTHORS   comma-separated Discord user ids whose mentions are accepted (the user only);
 //                            everyone else is dropped before the buffer
 //   BRIDGE_EXCHANGE_CAP      optional, bot-to-bot messages without a human message between (default 2, 0 = off)
+//   BRIDGE_SILENT_FEEDBACK   optional, deliberate NO_REPLY feedback on direct person mentions: note|reaction|off (default note)
 //   BRIDGE_NOTES_DIR         optional, absolute path of the bot's notes root (the Discord tool's DISCORD_TOOL_NOTES):
 //                            threads archived by /new are exported into its sessions/ (#50)
 //   BRIDGE_WORKSPACE         optional, absolute path of the agent's workspace (the Discord tool's DISCORD_TOOL_WORKSPACE):
@@ -162,12 +163,12 @@ for (const [i, channelId] of conversations.entries()) {
   if (!dm) parentChannels.set(channelId, { name: channelName, botRoleId });
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, inboxDir, dm, notesRoot,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm, notesRoot,
     ...(dm ? {} : { activeThreads: () => threads?.activeThreadsFor(channelId) ?? [] }),
     buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
 }
-log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap });
+log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback });
 
 // Single-flight step loop (lib/steploop.ts); a gateway message or a t3 change wakes it early, also mid-step (latched).
 const stepTarget = { step: async () => (threads ? threads.step() : { phase: "idle" }) };
@@ -187,7 +188,7 @@ threads = makeThreadManager({
       name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
       threadLabel: `${cfg.name} #${record.parentName} / ${shortName}`,
       botUserId: cfg.id, botRoleId, projectId, modelSelection,
-      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, attachmentsDir, inboxDir, dm: false, notesRoot,
+      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm: false, notesRoot,
       threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
       buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
     });

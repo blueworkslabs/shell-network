@@ -69,8 +69,8 @@ test("GEM -> HERMES: a Gem reply that mentions Hermes reaches Hermes's thread, t
   const payload = w.discord.writes.filter((x) => x.kind === "message").at(-1)!.payload!;
   assert.deepEqual(payload.allowed_mentions, { parse: [], users: [HERMES] }, "only the allowed crew bot can be pinged");
   const h = await w.turn(w.hermes, `<@${GEM}> green.`);
-  assert.match(h.sent, /Gem: @Hermes what does the build say\?/);
-  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => [r.author, r.text]), [["Hermes", "@Gem green."]]);
+  assert.match(h.sent, /Gem: \[replying to user1: @Gem ask hermes about the build\]\n@Hermes what does the build say\?/, "the bridge's reply names the message it answers (#86)");
+  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => [r.author, r.text]), [["Hermes", "[replying to Gem: @Hermes what does the build say?]\n@Gem green."]]);
 });
 
 test("NEG crew bots: a bot outside the allowlist, an allowed bot without a mention, a stranger -> nothing reaches a bot; plain replies ping nobody", async () => {
@@ -110,7 +110,7 @@ test("EXCHANGE CAP 2: the third bot-to-bot message is held back, one pause notic
   await w.person("hermes, your turn", HERMES);
   const t4 = await w.turn(w.hermes, `<@${GEM}> four`);
   assert.equal(t4.posted.length, 1);
-  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => r.text), ["@Gem four"]);
+  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => r.text), ["[replying to user1: @Hermes hermes, your turn]\n@Gem four"]);
 });
 
 test("EXCHANGE CAP 0 = off: bots keep talking", async () => {
@@ -118,7 +118,7 @@ test("EXCHANGE CAP 0 = off: bots keep talking", async () => {
   await w.person("go", GEM);
   for (let i = 0; i < 3; i++) { await w.turn(w.gem, `<@${HERMES}> g${i}`); await w.turn(w.hermes, `<@${GEM}> h${i}`); }
   await w.gem.bot.step();
-  assert.deepEqual(w.t3.sends().map((x) => x.message!.split("\n").at(-1)!.replace(/^\[discord:\d+\] /, "")), ["user1: @Gem go", "Gem: @Hermes g0", "Hermes: @Gem h0", "Gem: @Hermes g1", "Hermes: @Gem h1", "Gem: @Hermes g2", "Hermes: @Gem h2"], "every bot message reached the other bot");
+  assert.deepEqual(w.t3.sends().map((x) => x.message!.replace(/\[replying to [^\]\n]*\]\n/g, "").split("\n").at(-1)!.replace(/^\[discord:\d+\] /, "")), ["user1: @Gem go", "Gem: @Hermes g0", "Hermes: @Gem h0", "Gem: @Hermes g1", "Hermes: @Gem h1", "Gem: @Hermes g2", "Hermes: @Gem h2"], "every bot message reached the other bot");
   assert.equal(w.discord.messages.filter((m) => m.content.startsWith("⏸")).length, 0);
 });
 
@@ -331,7 +331,7 @@ test("CAP NOTICE per episode: the next capped episode gets its own 'waiting for 
   assert.equal(w.discord.messages.filter((m) => m.content.startsWith("⏸")).length, 1);
   await w.person("hermes, go on", HERMES); // new episode
   await w.turn(w.hermes, `<@${GEM}> c`);   // exchange 1 of episode 2
-  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => r.text), ["@Gem c"]);
+  assert.deepEqual(w.gem.buffer.buffered("gem").map((r) => r.text), ["[replying to user1: @Hermes hermes, go on]\n@Gem c"]);
   await w.turn(w.gem, `<@${HERMES}> d`);   // capped at Hermes
   await w.hermes.bot.step();
   const notices = w.discord.messages.filter((m) => m.content.startsWith("⏸"));

@@ -91,6 +91,35 @@ test("OWN MENTION (#75): named together with others, the bot reads its own menti
   assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["<@111> @Gem @Gem <@222> which of you can check the logs?", "@Gem only me"]);
 });
 
+test("REPLY CONTEXT (#86): a reply names the logged message it answers (person, crew bot, this bot; mentions as @Name, cut); anything not in this channel's log gets a neutral line, nothing fetched; plain messages unchanged", async () => {
+  const HERMES = "444444444444444444";
+  const w = world({ botOpts: { allowedBots: [{ id: HERMES, name: "Hermes" }] } });
+  const reply = (to: string, text: string) => { const m = w.discord.userSays(text); m.message_reference = { message_id: to, channel_id: CH }; return m; };
+  const person = w.discord.userSays(`plan: <@${HERMES}> takes the queue fix,\nGem the docs`, { mention: false });
+  await w.bot.accept(person);
+  const crew = w.discord.userSays(`done with step ${"one ".repeat(200)}`, { mention: false, bot: true, authorId: HERMES, author: "Hermes" });
+  await w.bot.accept(crew);
+  const own = await w.discord.createMessage(CH, { content: "my earlier answer" });
+  await w.bot.accept(own);
+  const stranger = w.discord.userSays("not for you to quote", { mention: false, author: "stranger" });
+  await w.bot.accept(stranger);
+  w.buffer.recordChannelMessage({ id: "1574000000000000001", authorId: HUMAN_ID, authorName: "user1", authorKind: "human", content: "said elsewhere", at: w.now(), channelId: "other-channel" });
+  const calls = () => w.discord.writes.filter((x) => x.kind !== "react").length;
+  const before = calls();
+  for (const m of [reply(person.id, "agreed"), reply(crew.id, "nice"), reply(own.id, "explain that"), reply(stranger.id, "what?"), reply("1574000000000000001", "and that?"), reply("1574999999999999999", "old one")]) await w.bot.accept(m);
+  const forward = w.discord.userSays("fwd"); forward.message_reference = { message_id: person.id, channel_id: CH, type: 1 };
+  await w.bot.accept(forward);
+  await w.say("no reply here");
+  const texts = w.buffer.buffered("gem").map((x) => x.text);
+  assert.equal(texts[0], "[replying to user1: plan: @Hermes takes the queue fix, Gem the docs]\n@Gem agreed");
+  assert.match(texts[1], /^\[replying to Hermes: done with step (one )+.*… \[\+\d+ chars cut\]\]\n@Gem nice$/, "cut like a header line");
+  assert.equal(texts[2], "[replying to Gem: my earlier answer]\n@Gem explain that");
+  for (const [i, t] of [[3, "what?"], [4, "and that?"], [5, "old one"]] as const) assert.equal(texts[i], `[replying to a message not in the local log]\n@Gem ${t}`);
+  assert.ok(!texts.join("\n").includes("not for you to quote") && !texts.join("\n").includes("said elsewhere"), "nothing of an unlisted author or another channel");
+  assert.deepEqual(texts.slice(6), ["@Gem fwd", "@Gem no reply here"], "a forward and a plain message: unchanged");
+  assert.equal(calls(), before, "no Discord call but the acks");
+});
+
 test("BARE MENTION: a person's mention without text is accepted as the explicit bridge note (no invented user text) and sent", async () => {
   const w = world();
   assert.deepEqual(await w.say(""), { accepted: true, inserted: true });

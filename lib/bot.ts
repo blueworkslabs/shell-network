@@ -506,6 +506,16 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { limit: { id: rs.id, inclusive: rs.stage === "wrapup" } };
   }
 
+  // A Discord reply names what it answers (#86), from the local channel log only: the log holds just the allowlisted
+  // people, the crew bots and this bot, in this conversation's channel, so nothing of anyone else is ever quoted and
+  // nothing is fetched. A referenced message the log does not have gets a neutral line; a forward is not a reply.
+  function replyContext(msg: DiscordMessage): string | null {
+    const ref = msg.message_reference;
+    if (!ref || ref.type === 1 || typeof ref.message_id !== "string" || !ref.message_id) return null;
+    const m = /^\d{1,25}$/.test(ref.message_id) ? buffer.channelMessage(ref.message_id) : undefined;
+    if (!m || m.channel_id !== channelId) return "[replying to a message not in the local log]";
+    return `[replying to ${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}]`;
+  }
   // Accept one Discord MESSAGE_CREATE. Returns { accepted, inserted?, reason? }.
   async function accept(msg: DiscordMessage): Promise<AcceptResult> {
     if (msg?.channel_id !== channelId) return { accepted: false, reason: "other channel" };
@@ -541,7 +551,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const saved = inboxDir && msg.id ? await saveInbound({ atts: msg.attachments, messageId: msg.id, inboxDir, fetchFile }) : [];
     for (const [i, s] of saved.entries()) if (s && "error" in s) log.emit("bridge.inbox_not_saved", { bot: name, sourceMessageId: msg.id, index: i, reason: s.error });
     const files = attachmentLines(msg.attachments, saved);
-    const text = [stripped ? named : files.length ? "" : BARE_MENTION_TEXT, ...files].filter(Boolean).join("\n");
+    const text = [replyContext(msg), stripped ? named : files.length ? "" : BARE_MENTION_TEXT, ...files].filter(Boolean).join("\n");
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
     if (crewBot && !talkOnly) {

@@ -35,6 +35,10 @@ schema change before the trial verdict means a fresh DB.
    (no text) counts as "go on": the batch carries an explicit bridge note instead of invented text. A bot's bare
    mention is still dropped. In the text the agent reads, its own mention (user or managed role) appears as its
    name (`@Gem`), so a message that names several bots is visibly addressed to each of them (#75).
+   A Discord reply starts with what it answers, from the local channel log only (#86): `[replying to <author>: <line>]`,
+   cut and with mentions as names like a header line. The log holds only allowlisted people, crew bots and this bot in
+   this channel, so a message the log does not have gets `[replying to a message not in the local log]` and is never
+   fetched or quoted. A forward is not a reply.
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before

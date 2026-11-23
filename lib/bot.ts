@@ -506,9 +506,9 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { limit: { id: rs.id, inclusive: rs.stage === "wrapup" } };
   }
 
-  // A Discord reply names what it answers (#86), from the local channel log only: the log holds just the allowlisted
-  // people, the crew bots and this bot, in this conversation's channel, so nothing of anyone else is ever quoted and
-  // nothing is fetched. A referenced message the log does not have gets a neutral line; a forward is not a reply.
+  // A Discord reply names what it answers (#86), from the local channel log only, and only when its author is one this
+  // bot listens to (its allowlisted people, its crew bots, itself) in this conversation's channel: nothing of anyone
+  // else is ever quoted, and nothing is fetched. A referenced message the log does not have gets a neutral line; a forward is not a reply.
   // Kept in kv `replyCtx:<message id>` until the batch is built: the line goes before the message only when the message
   // it answers is not in view, i.e. not in the same batch, not in its unread header, and not one of this bot's own posts
   // since its previous batch (what it just wrote). Bot-to-bot replies nearly always answer something in view.
@@ -516,7 +516,9 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const ref = msg.message_reference;
     if (!ref || ref.type === 1 || typeof ref.message_id !== "string" || !ref.message_id) return null;
     const m = /^\d{1,25}$/.test(ref.message_id) ? buffer.channelMessage(ref.message_id) : undefined;
-    if (!m || m.channel_id !== channelId) return { ref: ref.message_id, line: "[replying to a message not in the local log]" };
+    // the log is shared by every bot on the buffer: only an author this bot itself listens to is quoted
+    const listed = m && (m.author_id === state.botUserId || (m.author_kind === "bot" ? bots.has(m.author_id) : allowed.has(m.author_id)));
+    if (!m || m.channel_id !== channelId || !listed) return { ref: ref.message_id, line: "[replying to a message not in the local log]" };
     return { ref: ref.message_id, line: `[replying to ${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}]`, ...(m.author_id === state.botUserId ? { own: true as const } : {}) };
   }
   // what the batch being built shows: the channel messages in its header, and the header marker before it (own posts after it are this bot's last turn)

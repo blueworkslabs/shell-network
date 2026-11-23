@@ -48,7 +48,11 @@ export const SILENT_REACTION_EMOJI = "🔇";
 export const HEADER_LINE_MAX = 300;
 export const HEADER_ADDRESSED_LINE_MAX = 2000;
 const OWN_POSTS_MAX = 5;
-const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars cut]` : s);
+const cutLine = (s: string, max: number) => {
+  if (s.length <= max) return s;
+  const cut = safeCut(s, max);
+  return `${s.slice(0, cut)}… [+${s.length - cut} chars cut]`;
+};
 // phase "open" carries the reconcile verdict of the oldest open batch.
 export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new" | "stop" | "closing"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
 export interface ThreadContext {
@@ -1529,41 +1533,83 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       ? `[Discord thread: "${threadContext.threadName}" in #${threadContext.parentName} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`
       : `[Discord channel: #${channelName ?? channelId} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`,
       ...[...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`)];
-    const toEntry = (addressed: boolean) => (m: { id: string; author_name: string; content: string }) =>
-      ({ id: m.id, addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
+    const toEntry = (addressed: boolean) => (m: { id: string; author_name: string; content: string }) => {
+      const prefix = `${m.author_name}: `;
+      const body = named(m.content).replace(/\s+/g, " ").trim();
+      const baseMax = addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX;
+      return { id: m.id, addressed, prefix, body, line: prefix + cutLine(body, baseMax) };
+    };
     const entries = [...win.addressed.map((m) => ({ m, e: toEntry(true)(m) })), ...win.unaddressed.map((m) => ({ m, e: toEntry(false)(m) }))]
       .sort((a, b) => byId(a.m, b.m)).map((x) => x.e);
     const total = win.total;
-    // Both bounds (count, then size) drop the oldest line that does not mention this bot first, the oldest line only when
-    // every line left mentions it: an addressed handoff outlives any number of later unaddressed lines.
+    // Pass 1: both bounds (count, then size) drop the oldest line that does not mention this bot first, the oldest
+    // line only when every line left mentions it: an addressed handoff outlives any number of later unaddressed lines.
     while (entries.length && (entries.length > headerMaxMessages || entries.map((e) => e.line).join("\n").length > headerMaxChars)) {
       const i = entries.findIndex((e) => !e.addressed);
       entries.splice(i >= 0 ? i : 0, 1);
     }
-    const lines = entries.map((e) => e.line);
     headerShown = new Set(entries.map((e) => e.id));
-    // Crossed-message context (#87): if this bot already posted in this channel/thread *after* the oldest queued
-    // Discord message in this batch, surface those newer own posts in a compact supplemental block (trimmed first
-    // so incoming unread lines keep priority in headerMaxChars). Normal sequential turns see nothing added.
+    // Crossed-message context (#87): reserve the own-posts block from leftover budget BEFORE Pass 2 expansion (#95),
+    // so expanding unaddressed lines never starves the crossed-message block.
     let ownLines: string[] = [];
+    let ownCut = false;
     if (state.botUserId) {
       const discordIds = rows.filter((r) => r.source === "discord" && /^\d+$/.test(r.source_message_id)).map((r) => r.source_message_id);
       if (discordIds.length) {
         const oldestBatchId = discordIds.reduce((min, id) => (BigInt(id) < BigInt(min) ? id : min));
-        const usedChars = lines.length ? lines.join("\n").length : 0;
-        const remainingChars = headerMaxChars - usedChars - (lines.length ? 1 : 0);
+        const usedChars = entries.length ? entries.map((e) => e.line).join("\n").length : 0;
+        const remainingChars = headerMaxChars - usedChars - (entries.length ? 1 : 0);
         if (remainingChars > 0) {
-          ownLines = buffer.ownPostsAfter(oldestBatchId, { conversationKey, selfId: state.botUserId, selfName: name, channelId, limit: OWN_POSTS_MAX })
-            .map((m) => `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}`);
-          while (ownLines.length && ownLines.join("\n").length > remainingChars) ownLines.shift();
+          const ownEntries = buffer.ownPostsAfter(oldestBatchId, { conversationKey, selfId: state.botUserId, selfName: name, channelId, limit: OWN_POSTS_MAX })
+            .map((m) => {
+              const body = named(m.content).replace(/\s+/g, " ").trim();
+              return { cut: body.length > HEADER_LINE_MAX, line: `${m.author_name}: ${cutLine(body, HEADER_LINE_MAX)}` };
+            });
+          while (ownEntries.length && ownEntries.map((e) => e.line).join("\n").length > remainingChars) ownEntries.shift();
+          ownLines = ownEntries.map((e) => e.line);
+          ownCut = ownEntries.some((e) => e.cut);
         }
       }
     }
+    // Pass 2 (#95): spend any budget still unused inside headerMaxChars to expand cut unaddressed lines newest-first
+    // (up to HEADER_ADDRESSED_LINE_MAX). The set of messages shown never changes, and total chars never exceed headerMaxChars.
+    if (entries.length) {
+      const usedByEntries = entries.map((e) => e.line).join("\n").length;
+      const usedByOwn = ownLines.length ? ownLines.join("\n").length : 0;
+      let remaining = headerMaxChars - usedByEntries - (ownLines.length ? 1 + usedByOwn : 0);
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const e = entries[i];
+        if (e.addressed || e.body.length <= HEADER_LINE_MAX) continue;
+        const cap = Math.min(e.body.length, HEADER_ADDRESSED_LINE_MAX);
+        const full = e.prefix + cutLine(e.body, cap);
+        const fullDelta = full.length - e.line.length;
+        if (fullDelta <= remaining) {
+          e.line = full;
+          remaining -= fullDelta;
+          continue;
+        }
+        if (remaining <= 0) continue;
+        const targetLen = e.line.length + remaining;
+        for (let m = Math.min(cap - 1, HEADER_LINE_MAX + remaining + 4); m > HEADER_LINE_MAX; m--) {
+          const cand = e.prefix + cutLine(e.body, m);
+          if (cand.length <= targetLen) {
+            if (cand.length > e.line.length) {
+              remaining -= cand.length - e.line.length;
+              e.line = cand;
+            }
+            break;
+          }
+        }
+      }
+    }
+    const lines = entries.map((e) => e.line);
     const ownBlock = ownLines.length ? ["[Your own posts sent after the queued message(s) below:]", ...ownLines] : [];
-    if (!lines.length && !ownBlock.length) return fresh + threadIntro + hint.join("\n") + "\n";
-    if (!lines.length) return fresh + threadIntro + [...hint, ...ownBlock, "[New messages for you:]"].join("\n") + "\n";
     const left = total - lines.length;
-    return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, ...ownBlock, "[New messages for you:]"].join("\n") + "\n";
+    const hasCut = entries.some((e) => e.line !== e.prefix + e.body) || left > 0 || ownCut;
+    const readCue = hasCut ? ["[Some earlier messages were cut or left out; use `discord_read` for full text.]"] : [];
+    if (!lines.length && !ownBlock.length && !readCue.length) return fresh + threadIntro + hint.join("\n") + "\n";
+    if (!lines.length) return fresh + threadIntro + [...hint, ...ownBlock, ...readCue, "[New messages for you:]"].join("\n") + "\n";
+    return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...readCue, ...hint, ...ownBlock, "[New messages for you:]"].join("\n") + "\n";
   }
 
   async function closeStep(): Promise<StepResult> {

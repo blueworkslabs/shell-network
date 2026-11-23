@@ -141,7 +141,7 @@ test("UNREAD HEADER: what the bot missed since its last turn, without its own po
   assert.ok(!head.includes("hermes, what do you think") && !head.includes("aside"), "only what came after its last batch");
 });
 
-test("UNREAD HEADER: size cap drops the oldest lines and cuts long lines at 300 chars with a visible marker", async () => {
+test("UNREAD HEADER: size cap drops the oldest lines, cuts long lines with a visible marker, and expands newest into leftover budget", async () => {
   const w = crew({ cap: 0, headerMaxMessages: 20, headerMaxChars: 700 });
   await w.person("start", GEM);
   await w.turn(w.gem, "ok");
@@ -150,8 +150,9 @@ test("UNREAD HEADER: size cap drops the oldest lines and cuts long lines at 300 
   const g = await w.turn(w.gem, "ok");
   const lines = g.sent.split("[New messages for you:]")[0].split("\n").filter((l) => l.startsWith("user1: "));
   assert.equal(lines.length, 2);
-  const marker = `… [+${500 - HEADER_LINE_MAX} chars cut]`;
-  assert.ok(lines.every((l) => l === `user1: ${l[7].repeat(HEADER_LINE_MAX)}${marker}`), lines.join("\n"));
+  assert.ok(lines.join("\n").length <= 700, `within headerMaxChars: ${lines.join("\n").length}`);
+  assert.equal(lines[0], `user1: ${"2".repeat(HEADER_LINE_MAX)}… [+${500 - HEADER_LINE_MAX} chars cut]`);
+  assert.ok(lines[1].startsWith(`user1: ${"3".repeat(HEADER_LINE_MAX)}`) && lines[1].includes("chars cut]"), lines[1]);
   assert.deepEqual(lines.map((l) => l[7]), ["2", "3"]);
 });
 
@@ -175,19 +176,19 @@ const capEpisode = async (w: ReturnType<typeof crew>, handoff: string) => {
 };
 const headOf = (sent: string) => sent.split("[New messages for you:]")[0];
 
-test("UNREAD HEADER: a capped handoff that mentions the bot arrives whole (up to 2000 chars, marked beyond); other lines stay cut at 300", async () => {
+test("UNREAD HEADER: a capped handoff that mentions the bot arrives whole (up to 2000 chars, marked beyond); unaddressed lines expand when budget permits and stay at 300 when full", async () => {
   const w = crew({ cap: 2, headerMaxChars: 8000 });
   const handoff = `h${"h".repeat(1499)}`;
   await capEpisode(w, handoff);
   const over = w.discord.userSays(`<@${HERMES}> ${"o".repeat(2500)}`, { mention: false, bot: true, authorId: GEM, author: "Gem" });
   assert.equal((await w.hermes.bot.accept(over)).reason, "exchange cap");
-  await w.person("z".repeat(500), null); // names nobody
+  await w.person("z".repeat(500), null); // names nobody, but fits in leftover budget
   await w.person("", HERMES);
   const head = headOf((await w.turn(w.hermes, "on it")).sent);
   assert.ok(head.includes(`Gem: @Hermes ${handoff}\n`), "the 1500-char handoff is complete and unmarked");
   const cutOver = `@Hermes ${"o".repeat(2500)}`.slice(0, HEADER_ADDRESSED_LINE_MAX);
   assert.ok(head.includes(`Gem: ${cutOver}… [+${8 + 2500 - HEADER_ADDRESSED_LINE_MAX} chars cut]\n`), "over 2000: cut and marked");
-  assert.ok(head.includes(`user1: ${"z".repeat(HEADER_LINE_MAX)}… [+200 chars cut]\n`), "a line that names nobody stays at 300");
+  assert.ok(head.includes(`user1: ${"z".repeat(500)}\n`), "unaddressed line expands to full 500 when budget permits");
 });
 
 test("UNREAD HEADER size cap: lines that do not mention the bot are dropped first, even when newer; the default cap is 4000", async () => {

@@ -60,7 +60,11 @@ schema change before the trial verdict means a fresh DB.
    remaining `headerMaxChars` budget (incoming unread messages keep priority, and own posts are trimmed oldest-first).
    Un-echoed confirmed outbox posts (and applied `discord_edit` updates) are merged into that read directly from `outbox`
    without writing them early into `channel_message`, so crossed-message wakes see them immediately while `channelWindow`
-   and `headerSince` advance only on gateway-delivered messages (#87).
+   and `headerSince` advance only on gateway-delivered messages (#87). After Pass 1 selection and reserving the own-posts
+   block, any remaining `headerMaxChars` budget is spent expanding cut unaddressed lines from newest to oldest (up to
+   2000 characters each, without splitting UTF-16 surrogate pairs), so the set of messages shown never changes and the
+   4000-character limit still holds; whenever any line stays cut or messages were left out, a short cue notes that full
+   text is available via `discord_read` (#95).
 4. **Send.** The batch is sent as `t3_thread_send` with mode `queue`. Steering is never used. The t3 adapter
    (`lib/t3.ts`) reaches MCP only through `lib/allowlist.ts`.
 5. **Reconcile** (`lib/reconcile.ts`, pure). This step compares the batch with the MCP thread read, the WS projection

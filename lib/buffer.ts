@@ -662,6 +662,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         if (n >= parts) db.prepare("UPDATE relay SET posted_at = ? WHERE id = ? AND posted_at IS NULL").run(now(), relayId);
       });
     },
+    relayPostedParts: (relayId: number): number[] => all<{ part: number }>("SELECT part FROM relay_part WHERE relay_id = ? ORDER BY part", relayId).map((r) => r.part),
     // A channel message the bridge already recorded as one of its posts (outbox; and the pre-outbox records: reply
     // part, relay part, notice, alert or its follow-up): never evidence for a different post's recovery.
     isRecordedPost: (channelMessageId: string): boolean => one<{ n: number }>(`SELECT EXISTS (SELECT 1 FROM outbox WHERE channel_message_id = ?1) OR

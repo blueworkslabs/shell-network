@@ -1,7 +1,12 @@
 // Smart reply splitting (#85): node --test tests/splitreply.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { splitReply } from "../lib/bot.ts";
+import { join } from "node:path";
+import { makeBot, splitReply } from "../lib/bot.ts";
+import { conversationKeyFor } from "../lib/bots.ts";
+import { memoryLog } from "../lib/log.ts";
+import { fakeDiscord, fakeT3, HUMAN_ID } from "./fakes.ts";
+import { openTempBuffer, tempDir } from "./tmp.ts";
 
 test("SPLIT REPLY: short messages (<= 1900, plain or with code) stay unchanged; empty falls back", () => {
   assert.deepEqual(splitReply(""), ["(finished without a text reply)"]);
@@ -96,4 +101,89 @@ test("SPLIT REPLY: avoids orphan opening fence at end of part and handles unbrok
   for (const part of hugeParts) assert.ok(part.length <= 1900);
   assert.ok(hugeParts[0].startsWith("```txt\n") && hugeParts[0].endsWith("\n```"));
   assert.ok(hugeParts[1].startsWith("```txt\n") && hugeParts[1].endsWith("\n```"));
+});
+
+test("SPLIT REPLY: never isolates a bare bot mention, preserves inline code spans, and never splits UTF-16 emoji surrogate pairs", () => {
+  // Long handoff: mention + unbroken 1900-char token must keep body text attached to the mention
+  const handoff = `<@444444444444444444> ${"x".repeat(1900)}`;
+  const hParts = splitReply(handoff);
+  assert.equal(hParts.length, 2);
+  assert.ok(hParts[0].startsWith("<@444444444444444444> xxx"), "part 0 keeps body with the mention");
+  assert.equal(hParts.join(""), handoff);
+
+  // Inline backtick span (both single and double backticks): split before the span instead of on a space inside it
+  const prefix = `${"word ".repeat(376).trim()} `; // 1880 chars
+  const inlineSpan = "`alpha beta gamma delta epsilon`"; // 32 chars -> crosses 1900 boundary
+  const inlineParts = splitReply(`${prefix}${inlineSpan} tail`);
+  assert.equal(inlineParts.length, 2);
+  assert.ok(!inlineParts[0].includes("`"), "inline code span moved whole to part 2");
+  assert.ok(inlineParts[1].startsWith(`${inlineSpan} tail`));
+
+  const dblSpan = "``foo `bar` baz qux quux corge``";
+  const dblParts = splitReply(`${prefix}${dblSpan}`);
+  assert.equal(dblParts.length, 2);
+  assert.ok(!dblParts[0].includes("`"));
+  assert.equal(dblParts[1], dblSpan);
+
+  // UTF-16 surrogate pair boundary: hard cut at 1900 lands right between high and low surrogate of 🎉
+  const emojiText = `${"a".repeat(1899)}${"🎉".repeat(50)}`;
+  const emojiParts = splitReply(emojiText);
+  assert.equal(emojiParts.length, 2);
+  for (const part of emojiParts) {
+    assert.ok(part.length <= 1900);
+    assert.equal(part.isWellFormed(), true, "no lone UTF-16 surrogate");
+  }
+  assert.equal(emojiParts[0].length, 1899, "backed up 1 code unit to avoid splitting the emoji");
+  assert.equal(emojiParts.join(""), emojiText);
+});
+
+test("SPLIT REPLY upgrade safety: partially persisted pre-upgrade replies and relays finish on their original fixed split plan", async () => {
+  const CH = "100000000000000001", BOT = "333333333333333333";
+  const path = join(tempDir("split-upgrade-"), "buffer.db");
+  let clock = 1_792_500_000_000;
+  const now = () => clock;
+  const t3 = fakeT3();
+  const discord = fakeDiscord({ channelId: CH, botUserId: BOT, now });
+  const log = memoryLog();
+  const buffer = openTempBuffer(path, { now });
+  const key = conversationKeyFor("gem", CH);
+  const bot = makeBot({
+    name: "Gem", conversationKey: key, channelId: CH, botUserId: BOT, allowedAuthors: [HUMAN_ID],
+    projectId: "proj-gem", modelSelection: { instanceId: "crewGemAntigravity", model: "m" },
+    buffer, t3, discord, log, now, session: () => "s1",
+  });
+  bot.initWatermark(clock - 60_000);
+
+  // 1) Reply with a paragraph break at char 1200 (new splitter would cut at 1200; legacy splitter cut at 1900)
+  const fullReply = `${"A".repeat(1200)}\n\n${"B".repeat(1200)}`;
+  const m = discord.userSays("long reply before upgrade");
+  await bot.accept(m);
+  await bot.step();
+  const tid = buffer.kvGet(`${key}:threadId`)!;
+  const runId = t3.threads.get(tid)!.runs.at(-1)!.runId;
+  t3.complete(tid, runId, fullReply);
+  // Seed legacy part 0 already posted (1900 chars, no `split: 2` metadata) before upgrade restart
+  const batchId = buffer.openBatches(key)[0].id;
+  buffer.setStatus(batchId, "delivered");
+  const legacyPart0 = fullReply.slice(0, 1900);
+  const e0 = buffer.enqueue(key, { key: `reply:${batchId}:0`, content: legacyPart0, nonce: `b${batchId}p0`, replyTo: m.id, meta: { parts: 2 } });
+  buffer.outboxPosted(e0.id, "990000000000000001", () => buffer.recordReplyPart(batchId, 0, 2, "990000000000000001"));
+
+  await bot.step();
+  await bot.step();
+  const postedReply1 = discord.botPosts(CH).at(-1)!.content;
+  assert.equal(postedReply1, fullReply.slice(1900), "reply part 1 continues cleanly from legacy offset 1900 with zero overlap");
+
+  // 2) Same upgrade safety for a partially persisted legacy relay
+  const fullRelay = `${"C".repeat(1200)}\n\n${"D".repeat(1200)}`;
+  const wake = t3.wake(tid);
+  t3.complete(tid, wake.runId, fullRelay);
+  const relayRow = buffer.addRelay({ conversationKey: key, threadId: tid, runId: wake.runId, ordinal: wake.ordinal, origin: "notification" });
+  const r0 = buffer.enqueue(key, { key: `relay:${relayRow.id}:0`, content: fullRelay.slice(0, 1900), nonce: `r${relayRow.id}p0`, meta: { parts: 2 } });
+  buffer.outboxPosted(r0.id, "990000000000000002", () => buffer.recordRelayPart(relayRow.id, 0, 2, "990000000000000002"));
+
+  await bot.step();
+  await bot.step();
+  const postedRelay1 = discord.botPosts(CH).at(-1)!.content;
+  assert.equal(postedRelay1, fullRelay.slice(1900), "relay part 1 continues cleanly from legacy offset 1900 with zero overlap");
 });

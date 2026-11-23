@@ -91,6 +91,69 @@ test("OWN MENTION (#75): named together with others, the bot reads its own menti
   assert.deepEqual(w.buffer.buffered("gem").map((x) => x.text), ["<@111> @Gem @Gem <@222> which of you can check the logs?", "@Gem only me"]);
 });
 
+const HERMES_ID = "444444444444444444";
+function replyWorld() {
+  const w = world({ botOpts: { allowedBots: [{ id: HERMES_ID, name: "Hermes" }] } });
+  const reply = (to: string, text: string, opts: Parameters<FakeDiscord["userSays"]>[1] = {}) => { const m = w.discord.userSays(text, opts); m.message_reference = { message_id: to, channel_id: CH }; return m; };
+  // one turn: what is buffered goes out as one batch, its run finishes; returns the text t3 got
+  const turn = async () => { await w.bot.step(); const text = w.runs().at(-1)!.text; w.t3.complete(w.thread(), lastRun(w), "ok"); await settle(w); return text; };
+  return { w, reply, turn };
+}
+
+test("REPLY CONTEXT (#86): a reply to a logged message out of view names it (person, crew bot, this bot; mentions as @Name, cut); anything not in this channel's log or by an author this bot does not listen to (shared log) gets a neutral line, nothing fetched; forwards and plain messages unchanged", async () => {
+  const { w, reply, turn } = replyWorld();
+  const person = w.discord.userSays(`plan: <@${HERMES_ID}> takes the queue fix,\nGem the docs`, { mention: false });
+  await w.bot.accept(person);
+  const crew = w.discord.userSays(`done with step ${"one ".repeat(200)}`, { mention: false, bot: true, authorId: HERMES_ID, author: "Hermes" });
+  await w.bot.accept(crew);
+  const stranger = w.discord.userSays("not for you to quote", { mention: false, author: "stranger" });
+  await w.bot.accept(stranger);
+  w.buffer.recordChannelMessage({ id: "1574000000000000001", authorId: HUMAN_ID, authorName: "user1", authorKind: "human", content: "said elsewhere", at: w.now(), channelId: "other-channel" });
+  // logged by another bot's bridge on the shared buffer: authors this bot does not listen to
+  const foreign = [w.discord.userSays("listed for another bot only", { mention: false, author: "someone", authorId: "555555555555555555" }),
+    w.discord.userSays("a bot this one does not know", { mention: false, bot: true, author: "OtherBot", authorId: "666666666666666666" })];
+  for (const m of foreign) w.buffer.recordChannelMessage({ id: m.id, authorId: m.author.id, authorName: m.author.username!, authorKind: m.author.bot ? "bot" : "human", content: m.content, at: w.now(), channelId: CH });
+  await w.say("first");
+  await turn(); // the messages above are in this turn's header: out of view from now on
+  const own = w.discord.botPosts().at(-1)!;
+  await w.bot.accept(own);
+  await w.say("second");
+  await turn(); // and this bot's own reply is older than its previous batch now
+  const calls = () => w.discord.writes.filter((x) => x.kind !== "react").length;
+  const before = calls();
+  for (const m of [reply(person.id, "agreed"), reply(crew.id, "nice"), reply(own.id, "explain that"), reply(stranger.id, "what?"), reply("1574000000000000001", "and that?"), reply(foreign[0].id, "him?"), reply(foreign[1].id, "it?"), reply("1574999999999999999", "old one")]) await w.bot.accept(m);
+  const forward = w.discord.userSays("fwd"); forward.message_reference = { message_id: person.id, channel_id: CH, type: 1 };
+  await w.bot.accept(forward);
+  await w.say("no reply here");
+  const sent = await turn();
+  const body = sent.slice(sent.indexOf("[New messages for you:]") >= 0 ? sent.indexOf("[New messages for you:]") : 0);
+  assert.match(body, /user1: \[replying to user1: plan: @Hermes takes the queue fix, Gem the docs\]\n@Gem agreed/);
+  assert.match(body, /user1: \[replying to Hermes: done with step (one )+.*… \[\+\d+ chars cut\]\]\n@Gem nice/, "cut like a header line");
+  assert.match(body, /user1: \[replying to Gem: ok\]\n@Gem explain that/);
+  for (const t of ["what?", "and that?", "him?", "it?", "old one"]) assert.ok(body.includes(`user1: [replying to a message not in the local log]\n@Gem ${t}`), t);
+  for (const secret of ["not for you to quote", "said elsewhere", "listed for another bot only", "a bot this one does not know"]) assert.ok(!sent.includes(secret), `nothing of an unlisted author or another channel: ${secret}`);
+  assert.match(body, /user1: @Gem fwd\n/, "a forward: unchanged");
+  assert.match(body, /user1: @Gem no reply here$/, "a plain message: unchanged");
+  assert.equal(calls(), before + 1, "no Discord call but the acks and the turn's reply");
+});
+
+test("REPLY CONTEXT (#86) in view: no quote when the answered message is in the same batch, in its header, or this bot's own post from its last turn", async () => {
+  const { w, reply, turn } = replyWorld();
+  await w.say("kick off");
+  await turn();
+  const own = w.discord.botPosts().at(-1)!;
+  await w.bot.accept(own);
+  const header = w.discord.userSays("an unaddressed note", { mention: false });
+  await w.bot.accept(header);
+  const inBatch = w.discord.userSays("first question");
+  await w.bot.accept(inBatch);
+  for (const m of [reply(inBatch.id, "to the batch"), reply(header.id, "to the header"), reply(own.id, "to my last answer")]) await w.bot.accept(m);
+  const sent = await turn();
+  assert.match(sent, /user1: an unaddressed note/, "control: the note is in the header");
+  assert.ok(!sent.includes("[replying to"), sent);
+  for (const t of ["to the batch", "to the header", "to my last answer"]) assert.ok(sent.includes(`user1: @Gem ${t}`), t);
+});
+
 test("BARE MENTION: a person's mention without text is accepted as the explicit bridge note (no invented user text) and sent", async () => {
   const w = world();
   assert.deepEqual(await w.say(""), { accepted: true, inserted: true });

@@ -643,6 +643,31 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { limit: { id: rs.id, inclusive: rs.stage === "wrapup" } };
   }
 
+  // A Discord reply names what it answers (#86), from the local channel log only, and only when its author is one this
+  // bot listens to (its allowlisted people, its crew bots, itself) in this conversation's channel: nothing of anyone
+  // else is ever quoted, and nothing is fetched. A referenced message the log does not have gets a neutral line; a forward is not a reply.
+  // Kept in kv `replyCtx:<message id>` until the batch is built: the line goes before the message only when the message
+  // it answers is not in view, i.e. not in the same batch, not in its unread header, and not one of this bot's own posts
+  // since its previous batch (what it just wrote). Bot-to-bot replies nearly always answer something in view.
+  function replyContext(msg: DiscordMessage): { ref: string; line: string; own?: true } | null {
+    const ref = msg.message_reference;
+    if (!ref || ref.type === 1 || typeof ref.message_id !== "string" || !ref.message_id) return null;
+    const m = /^\d{1,25}$/.test(ref.message_id) ? buffer.channelMessage(ref.message_id) : undefined;
+    // the log is shared by every bot on the buffer: only an author this bot itself listens to is quoted
+    const listed = m && (m.author_id === state.botUserId || (m.author_kind === "bot" ? bots.has(m.author_id) : allowed.has(m.author_id)));
+    if (!m || m.channel_id !== channelId || !listed) return { ref: ref.message_id, line: "[replying to a message not in the local log]" };
+    return { ref: ref.message_id, line: `[replying to ${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}]`, ...(m.author_id === state.botUserId ? { own: true as const } : {}) };
+  }
+  // what the batch being built shows: the channel messages in its header, and the header marker before it (own posts after it are this bot's last turn)
+  let headerShown = new Set<string>(), headerFrom: string | null = null;
+  function withReplyContext(r: InboundRow, batchIds: Set<string>): string {
+    const k = K(`replyCtx:${r.source_message_id}`), raw = buffer.kvGet(k);
+    if (raw === null) return r.text;
+    buffer.kvDelete(k);
+    const c = JSON.parse(raw) as { ref: string; line: string; own?: true };
+    const recentOwn = c.own === true && headerFrom !== null && byId({ id: c.ref }, { id: headerFrom }) > 0;
+    return batchIds.has(c.ref) || headerShown.has(c.ref) || recentOwn ? r.text : `${c.line}\n${r.text}`;
+  }
   // Accept one Discord MESSAGE_CREATE. Returns { accepted, inserted?, reason? }.
   async function accept(msg: DiscordMessage): Promise<AcceptResult> {
     if (msg?.channel_id !== channelId) return { accepted: false, reason: "other channel" };
@@ -679,6 +704,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     for (const [i, s] of saved.entries()) if (s && "error" in s) log.emit("bridge.inbox_not_saved", { bot: name, sourceMessageId: msg.id, index: i, reason: s.error });
     const files = attachmentLines(msg.attachments, saved);
     const text = [stripped ? named : files.length ? "" : BARE_MENTION_TEXT, ...files].filter(Boolean).join("\n");
+    const reply = replyContext(msg);
+    if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
     if (crewBot && !talkOnly) {
@@ -689,6 +716,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${b.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
         log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: b.count, cap: exchangeCap });
         removeSaved(saved);
+        if (msg.id) buffer.kvDelete(K(`replyCtx:${msg.id}`));
         return { accepted: false, reason: "exchange cap", wake: true };
       }
       r = b;
@@ -1474,6 +1502,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   const named = (text: string) => text.replace(/<@!?(\d+)>/g, (all, id: string) => (id === state.botUserId ? `@${name}` : bots.has(id) ? `@${bots.get(id)}` : all));
   function unreadHeader(rows: InboundRow[], until?: BatchLimit): string {
     const since = buffer.kvGet(K("headerSince"));
+    headerFrom = since;
     // Bounded read: at most `headerMaxMessages` lines can be shown, and lines are dropped oldest unaddressed first, then
     // oldest addressed (below), so only the newest `headerMaxMessages` of each kind can ever be shown; the rest is counted.
     const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId, until });
@@ -1495,8 +1524,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       ? `[Discord thread: "${threadContext.threadName}" in #${threadContext.parentName} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`
       : `[Discord channel: #${channelName ?? channelId} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`,
       ...[...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`)];
-    const toEntry = (addressed: boolean) => (m: { author_name: string; content: string }) =>
-      ({ addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
+    const toEntry = (addressed: boolean) => (m: { id: string; author_name: string; content: string }) =>
+      ({ id: m.id, addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
     const entries = [...win.addressed.map((m) => ({ m, e: toEntry(true)(m) })), ...win.unaddressed.map((m) => ({ m, e: toEntry(false)(m) }))]
       .sort((a, b) => byId(a.m, b.m)).map((x) => x.e);
     const total = win.total;
@@ -1507,6 +1536,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       entries.splice(i >= 0 ? i : 0, 1);
     }
     const lines = entries.map((e) => e.line);
+    headerShown = new Set(entries.map((e) => e.id));
     if (!lines.length) return fresh + threadIntro + hint.join("\n") + "\n";
     const left = total - lines.length;
     return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
@@ -1664,7 +1694,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!gateOpen()) return { phase: "catching-up" };
     const busy = isBusy(read);
     if (busy || !buffer.buffered(conversationKey, reset.limit).length) return { phase: busy ? "busy" : "idle" };
-    const b = buffer.createBatch(conversationKey, (rows) => unreadHeader(rows, reset.limit), reset.limit)!;
+    let inBatch = new Set<string>();
+    const b = buffer.createBatch(conversationKey, (rows) => { inBatch = new Set(rows.map((r) => r.source_message_id)); return unreadHeader(rows, reset.limit); }, reset.limit, (r) => withReplyContext(r, inBatch))!;
     await sendBatch(threadId, b);
     await typing();
     return { phase: "sent", batchId: b.id };

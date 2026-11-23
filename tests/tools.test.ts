@@ -98,6 +98,18 @@ test("TOOL READ: the channel log, newest `limit` (max 50) before `before`, oldes
   for (const limit of [0, 51, 2.5, "3"]) assert.throws(() => t.read({ channel: CH, limit }), /limit/, String(limit));
 });
 
+test("TOOL READ (#93): with the people its bridge published, only they, the crew and this bot are read; a config without them (older bridge) filters nothing", () => {
+  const { b, t, say } = setup();
+  const STRANGER = "500000000000000001", OTHER_BOT = "600000000000000001";
+  const ids = [say(HUMAN, "human", "from the user"), say(STRANGER, "human", "listed by another bot only"), say(HERMES, "bot", "from the crew"), say(OTHER_BOT, "bot", "a bot this one does not know"), say(ME, "bot", "my own post")];
+  const read = () => (t.read({ channel: CH }).structuredContent as { messages: { content: string }[] }).messages.map((m) => m.content);
+  assert.equal(read().length, ids.length, "control: no people published, nothing filtered (as before)");
+  b.setToolConfig(conversationKeyFor("gem", CH), { channelId: CH, botUserId: ME, crew: [{ id: HERMES, name: "Hermes" }], exchangeCap: 2, people: [HUMAN] });
+  assert.deepEqual(read(), ["from the user", "from the crew", "my own post"]);
+  b.setToolConfig(conversationKeyFor("gem", CH), { channelId: CH, botUserId: ME, crew: [], exchangeCap: 2, people: [] });
+  assert.deepEqual(read(), ["my own post"], "nobody listed: only this bot");
+});
+
 test("TOOL THREAD: queues a thread from a message of the channel log; sends into it are allowed only once the bridge has created it, and never with a reply target", () => {
   const { b, t, say, out } = setup();
   const m = say(HUMAN, "human", "topic starter");

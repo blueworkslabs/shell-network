@@ -35,7 +35,7 @@ export const READ_MAX = 50;
 // unsent edits of one message (by ref or by message id) the tool lets wait; the bridge sends only the latest of them
 export const EDIT_QUEUE_MAX = 5;
 
-interface Config { channel_id: string; bot_user_id: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchange_cap: number }
+interface Config { channel_id: string; bot_user_id: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchange_cap: number; people: string[] | null }
 const after = (col: string) => `(length(${col}) > length(?) OR (length(${col}) = length(?) AND ${col} > ?))`;
 const names = (content: string, id: string) => content.includes(`<@${id}>`) || content.includes(`<@!${id}>`);
 
@@ -46,8 +46,9 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
   const one = <T>(sql: string, ...a: (string | number | null)[]) => db.prepare(sql).get(...a) as T | undefined;
   const mine = "substr(conversation_key, 1, length(?1) + 1) = ?1 || '.'"; // this bot's conversations
   const configOf = (key: string): Config | null => {
-    const c = one<{ channel_id: string; bot_user_id: string; crew: string; exchange_cap: number }>("SELECT channel_id, bot_user_id, crew, exchange_cap FROM tool_config WHERE conversation_key = ?", key);
-    return c ? { ...c, crew: JSON.parse(c.crew) as Config["crew"] } : null;
+    // SELECT *: `people` is missing on a DB the bridge has not opened since #93; then it reads as not published
+    const c = one<{ channel_id: string; bot_user_id: string; crew: string; exchange_cap: number; people?: string | null }>("SELECT * FROM tool_config WHERE conversation_key = ?", key);
+    return c ? { channel_id: c.channel_id, bot_user_id: c.bot_user_id, exchange_cap: c.exchange_cap, crew: JSON.parse(c.crew) as Config["crew"], people: typeof c.people === "string" ? (JSON.parse(c.people) as string[]) : null } : null;
   };
   const channels = () => (db.prepare(`SELECT channel_id FROM tool_config WHERE ${mine} ORDER BY channel_id`).all(bot) as { channel_id: string }[]).map((r) => r.channel_id);
   // The conversation a call's channel belongs to: one of the bot's channels, or (threadOk: sends) a tool thread it created there.
@@ -196,17 +197,21 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
   }
 
   // Read-only: the bridge's channel log (allowlisted people, allowed crew bots, this bot), newest `limit` before
-  // `before` (or the newest), oldest first. Only the channel; threads are not in the log.
+  // `before` (or the newest), oldest first. Only the channel; threads are not in the log. The log is shared by every
+  // bot on the buffer: only messages by this bot, its crew and the people its bridge published are returned (#93);
+  // a config without `people` (a bridge from before) filters nothing, as before.
   function read(a: Record<string, unknown>): ToolResult {
     const channel = str(a.channel, "channel");
-    resolve(channel);
+    const { c } = resolve(channel);
     const limit = a.limit === undefined ? 20 : a.limit;
     if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > READ_MAX) throw new ToolError(`limit: an integer 1-${READ_MAX}`);
     const before = a.before === undefined || a.before === null ? null : str(a.before, "before");
     if (before !== null && !SNOWFLAKE.test(before)) throw new ToolError("before: a message id");
     const lt = "(length(id) < length(?) OR (length(id) = length(?) AND id < ?))";
-    const rows = (db.prepare(`SELECT id, author_id, author_name, author_kind, content, at FROM channel_message WHERE channel_id = ?${before ? ` AND ${lt}` : ""} ORDER BY length(id) DESC, id DESC LIMIT ?`)
-      .all(channel, ...(before ? [before, before, before] : []), limit) as { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number }[]).reverse();
+    // bound one by one: the tool's connection may not read json_each (lib/tooldb.ts)
+    const authors = c.people === null ? null : [...new Set([c.bot_user_id, ...c.crew.map((b) => b.id), ...c.people].filter((id) => typeof id === "string"))];
+    const rows = (db.prepare(`SELECT id, author_id, author_name, author_kind, content, at FROM channel_message WHERE channel_id = ?${authors ? ` AND author_id IN (${authors.map(() => "?").join(", ") || "NULL"})` : ""}${before ? ` AND ${lt}` : ""} ORDER BY length(id) DESC, id DESC LIMIT ?`)
+      .all(channel, ...(authors ?? []), ...(before ? [before, before, before] : []), limit) as { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number }[]).reverse();
     const out = { channel, messages: rows.map((r) => ({ id: r.id, author: r.author_name, authorId: r.author_id, kind: r.author_kind, content: r.content, at: new Date(r.at).toISOString() })) };
     return { content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out };
   }

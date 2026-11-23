@@ -116,12 +116,92 @@ export function withoutLocalImages(text: unknown): string {
 }
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
 export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(?:^|\r?\n)[ \t]*NO_REPLY\s*$/, "");
-const splitReply = (text: unknown): string[] => {
+type CodeFence = { marker: string; reopen: string };
+const FENCE_OPEN = /^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)$/;
+function updateFence(line: string, open: CodeFence | null): CodeFence | null {
+  const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
+  if (!open) {
+    const m = FENCE_OPEN.exec(clean);
+    if (!m) return null;
+    const marker = m[1], info = m[2].trimEnd();
+    if (marker[0] === "`" && info.includes("`")) return null;
+    return { marker, reopen: `${marker}${info}` };
+  }
+  const ch = open.marker[0];
+  const closeRe = new RegExp(`^[ \\t]{0,3}${ch}{${open.marker.length},}[ \\t]*$`);
+  return closeRe.test(clean) ? null : open;
+}
+function fenceAtEnd(text: string, initial: CodeFence | null): CodeFence | null {
+  let open = initial;
+  for (const line of text.split("\n")) open = updateFence(line, open);
+  return open;
+}
+function pickSplit(rest: string, limit: number, open: CodeFence | null): { cut: number; next: number } {
+  const win = rest.slice(0, limit);
+  // Prefer paragraph break outside an open fence, then line break, then space, then hard cut.
+  const para = win.lastIndexOf("\n\n");
+  if (para > 0 && rest.slice(0, para).trim().length > 0 && fenceAtEnd(rest.slice(0, para), open) === null) {
+    return { cut: para, next: para + 2 };
+  }
+  const nl = win.lastIndexOf("\n");
+  if (nl > 0 && rest.slice(0, nl).trim().length > 0) {
+    // Avoid splitting immediately after a leading opening fence line (would emit an empty code block).
+    const onlyOpeningFence = !open && fenceAtEnd(rest.slice(0, nl), null) !== null && rest.slice(0, nl).lastIndexOf("\n") === -1;
+    if (!onlyOpeningFence) return { cut: nl, next: nl + 1 };
+  }
+  const sp = win.lastIndexOf(" ");
+  const firstNl = rest.indexOf("\n");
+  const inOpeningFenceInfo = !open && firstNl > 0 && sp < firstNl && updateFence(rest.slice(0, firstNl), null) !== null;
+  if (sp > 0 && !inOpeningFenceInfo && rest.slice(0, sp).trim().length > 0) return { cut: sp, next: sp + 1 };
+  return { cut: limit, next: limit };
+}
+// Split a Discord reply into parts of at most `max` characters (default PART = 1900, under Discord's 2000 limit).
+// Short messages stay unchanged; longer ones prefer paragraph, line, then space boundaries and close/reopen fenced
+// code blocks cleanly across part boundaries (#85).
+export function splitReply(text: unknown, max = PART): string[] {
   const t = String(text ?? "").trim() || "(finished without a text reply)";
+  if (t.length <= max) return [t];
   const parts: string[] = [];
-  for (let i = 0; i < t.length; i += PART) parts.push(t.slice(i, i + PART));
+  let rest = t;
+  let open: CodeFence | null = null;
+  while (rest.length > 0) {
+    const safeOpen = open && open.marker.length * 2 + 4 < max
+      ? (open.reopen.length + open.marker.length + 3 < max ? open : { marker: open.marker, reopen: open.marker })
+      : null;
+    const prefix = safeOpen ? `${safeOpen.reopen}\n` : "";
+    if (prefix.length + rest.length <= max) {
+      parts.push(prefix + rest);
+      break;
+    }
+    let limit = Math.max(1, max - prefix.length);
+    let cut = limit, next = limit;
+    let endFence: CodeFence | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      ({ cut, next } = pickSplit(rest, limit, safeOpen));
+      endFence = fenceAtEnd(rest.slice(0, cut), safeOpen);
+      // If a split lands immediately after an opening fence line (no code lines yet), move that fence line to the next part.
+      if (endFence && safeOpen === null) {
+        const lastNl = rest.slice(0, cut).lastIndexOf("\n");
+        if (lastNl > 0 && fenceAtEnd(rest.slice(0, lastNl), null) === null && rest.slice(0, lastNl).trim().length > 0) {
+          cut = lastNl;
+          next = lastNl + 1;
+          endFence = null;
+        }
+      }
+      const closeLen = endFence && endFence.marker.length * 2 + 4 < max ? endFence.marker.length + 1 : 0;
+      if (prefix.length + cut + closeLen <= max) break;
+      limit = Math.max(1, max - prefix.length - closeLen);
+    }
+    const head = rest.slice(0, cut);
+    const usableEnd = endFence && endFence.marker.length * 2 + 4 < max ? endFence : null;
+    const close = usableEnd ? `\n${usableEnd.marker}` : "";
+    parts.push(prefix + head + close);
+    open = usableEnd;
+    rest = rest.slice(next);
+    if (!open && !rest.trim()) break;
+  }
   return parts;
-};
+}
 const byId = (a: { id: string }, b: { id: string }) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
 const PAGE = 100;
 const DISCORD_EPOCH = 1420070400000n;

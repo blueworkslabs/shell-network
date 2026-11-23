@@ -11,7 +11,7 @@ import { crewFile } from "./crew-fixture.ts";
 
 const CH = "shell-network";
 
-function twoBots() {
+function twoBots({ gemAuthors = [HUMAN_ID] }: { gemAuthors?: string[] } = {}) {
   const path = join(tempDir("multibot-"), "buffer.db");
   let clock = 1_792_500_000_000;
   const now = () => clock;
@@ -19,15 +19,15 @@ function twoBots() {
   const discord = fakeDiscord({ channelId: CH, botUserId: "gem-user", now });
   const t3 = fakeT3();
   const log = memoryLog();
-  const mk = (key: "gem" | "hermes", userId: string, buffer = openTempBuffer(path, { now })) => {
+  const mk = (key: "gem" | "hermes", userId: string, buffer = openTempBuffer(path, { now }), allowedAuthors = [HUMAN_ID]) => {
     const cfg = bridgeConfig({ BRIDGE_BOT: key, BRIDGE_CREW_FILE: crewFile() }).bot;
     const port = { ...discord, createMessage: async (ch: string, p: Parameters<typeof discord.createMessage>[1]) => { const m = await discord.createMessage(ch, p); m.author = { id: userId, username: cfg.name, bot: true }; return m; } };
-    const bot = makeBot({ name: cfg.name, conversationKey: cfg.key, channelId: CH, botUserId: userId, allowedAuthors: [HUMAN_ID], projectId: `proj-${key}`,
+    const bot = makeBot({ name: cfg.name, conversationKey: cfg.key, channelId: CH, botUserId: userId, allowedAuthors, projectId: `proj-${key}`,
       modelSelection: { instanceId: cfg.instanceId, model: cfg.model }, buffer, t3, discord: port, log, now, session: () => "s1" });
     bot.initWatermark(clock);
     return { bot, buffer, cfg };
   };
-  const gem = mk("gem", "gem-user");
+  const gem = mk("gem", "gem-user", undefined, gemAuthors);
   const hermes = mk("hermes", "hermes-user");
   const say = (text: string, to: string) => {
     const m = discord.userSays(text);
@@ -35,7 +35,7 @@ function twoBots() {
     m.mentions = [{ id: to }];
     return m;
   };
-  return { gem, hermes, discord, t3, log, say, tick: (ms: number) => (clock += ms), path };
+  return { gem, hermes, discord, t3, log, say, mk, tick: (ms: number) => (clock += ms), path };
 }
 
 test("TWO BOTS, ONE DB: each bridge takes only mentions of its own bot, into its own conversation, thread and project", async () => {
@@ -55,6 +55,19 @@ test("TWO BOTS, ONE DB: each bridge takes only mentions of its own bot, into its
   assert.deepEqual(sends.map((s) => s.threadId), [gemThread, hermesThread]);
   assert.ok(sends[0].clientRequestId!.startsWith("bridge-gem-") && sends[1].clientRequestId!.startsWith("bridge-hermes-"));
   assert.deepEqual(w.gem.buffer.botThreads().map((b) => b.bot), ["gem", "hermes"], "the watchdog sees both bots' threads");
+});
+
+test("SHARED LOG HEADER (#90): each bot's unread header shows and counts only the people it listens to itself; one only another bot allows stays out", async () => {
+  const OTHER = "777777777777777777";
+  const w = twoBots({ gemAuthors: [HUMAN_ID, OTHER] });
+  const aside = w.discord.userSays("only Gem listens to me", { mention: false, author: "other", authorId: OTHER });
+  const note = w.discord.userSays("a note for everyone", { mention: false });
+  for (const m of [aside, note]) { await w.gem.bot.accept(m); await w.hermes.bot.accept(m); }
+  for (const [to, bot] of [["gem-user", w.gem.bot], ["hermes-user", w.hermes.bot]] as const) { const m = w.say("what's new?", to); await w.gem.bot.accept(m); await w.hermes.bot.accept(m); await bot.step(); }
+  const [toGem, toHermes] = w.t3.sends().map((x) => x.message!);
+  assert.match(toGem, /\[Channel since your last turn, 2 messages, oldest first:\]\nother: only Gem listens to me\nuser1: a note for everyone/, "Gem allows both");
+  assert.match(toHermes, /\[Channel since your last turn, 2 messages, oldest first:\]\nuser1: a note for everyone\nuser1: <@gem-user> what's new\?\n/, "control: the shared author is there");
+  assert.ok(!toHermes.includes("only Gem listens to me"), "Hermes does not listen to that author: not shown, not counted");
 });
 
 test("TWO BOTS: a stuck Hermes batch alerts as Hermes and blocks only Hermes; Gem keeps flowing", async () => {

@@ -551,17 +551,6 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         ? one<{ state: OutboxRow["state"] }>("SELECT state FROM outbox WHERE substr(conversation_key, 1, length(?1)) = ?1 AND key = ?2 LIMIT 1", botPrefix, ref)
         : one<{ state: OutboxRow["state"] }>("SELECT state FROM outbox WHERE conversation_key = ?1 AND key = ?2 LIMIT 1", conversationKey, ref)
       )?.state ?? null,
-    outboxStateByRequest: ({ botPrefix, conversationKey }: { botPrefix: string | null; conversationKey: string }, op: string, idemKey: string): OutboxRow["state"] | null =>
-      (botPrefix
-        ? one<{ state: OutboxRow["state"] }>(
-            "SELECT o.state FROM tool_request r JOIN outbox o ON o.id = r.outbox_id WHERE substr(r.conversation_key, 1, length(?1)) = ?1 AND r.op = ?2 AND r.idem_key = ?3 ORDER BY o.id DESC LIMIT 1",
-            botPrefix, op, idemKey,
-          )
-        : one<{ state: OutboxRow["state"] }>(
-            "SELECT o.state FROM tool_request r JOIN outbox o ON o.id = r.outbox_id WHERE r.conversation_key = ?1 AND r.op = ?2 AND r.idem_key = ?3 ORDER BY o.id DESC LIMIT 1",
-            conversationKey, op, idemKey,
-          )
-      )?.state ?? null,
     // The newest post in the bot's channel, or (threadId) in one of its tool threads: entries posted into a
     // thread carry meta { channel: <thread id>, thread: 1 }; everything else is a channel post.
     lastOutboxPost: (conversationKey: string, threadId: string | null = null): string | null => one<{ id: string }>(`SELECT channel_message_id id FROM outbox WHERE conversation_key = ?1

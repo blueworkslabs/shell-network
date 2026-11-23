@@ -275,20 +275,23 @@ test("SILENT FEEDBACK: suppression follows the run's own tool output across chan
   assert.deepEqual(discord.botPosts(CH).map((p) => p.content), ["from another run", SILENT_NOTE_TEXT], "unrelated run activity does not suppress botA's silent note");
   assert.equal(discord.botPosts(CH)[1].message_reference?.message_id, m2.id);
 
-  // 3) Failed tool call, replay of an earlier call, and a dropped outbox entry do NOT suppress silent feedback
-  const m3 = discord.userSays("failed/dropped/replayed calls", { channel: CH });
+  // 3) Failed tool call, replay of an earlier call, dropped outbox entry, and output-less call sharing an idempotency_key
+  //    with an unrelated post in channel B do NOT suppress silent feedback
+  const m3 = discord.userSays("failed/dropped/replayed/outputless calls", { channel: CH });
   await botA.accept(m3);
   await steps(1);
   const droppedSend = tools.send({ channel: CH, content: "will be dropped", idempotency_key: "drop-1" });
   const droppedRow = buffer.outboxEntry(conversationKeyFor("gem", CH), (droppedSend.structuredContent as { ref: string }).ref)!;
   buffer.outboxDrop(droppedRow.id);
   const replay = tools.send({ channel: CH_B, content: "posted in channel B", idempotency_key: "cross-1" });
+  tools.send({ channel: CH_B, content: "unrelated B post with shared key", idempotency_key: "shared-idem-key" });
   t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "failed", idempotency_key: "fail-1" }, status: "failed", output: "Error: refused" });
   t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH_B, content: "posted in channel B", idempotency_key: "cross-1" }, output: JSON.stringify(replay.structuredContent) });
   t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "will be dropped", idempotency_key: "drop-1" }, output: JSON.stringify(droppedSend.structuredContent) });
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "no output recorded", idempotency_key: "shared-idem-key" } });
   t3.complete(tidOf(CH), runOf(CH), "NO_REPLY");
   await steps(2);
-  assert.equal(discord.botPosts(CH).at(-1)!.content, SILENT_NOTE_TEXT, "failed, replayed, and dropped tool entries do not suppress silent feedback");
+  assert.equal(discord.botPosts(CH).at(-1)!.content, SILENT_NOTE_TEXT, "failed, replayed, dropped, and output-less tool calls do not suppress silent feedback");
   assert.equal(discord.botPosts(CH).at(-1)!.message_reference?.message_id, m3.id);
 });
 

@@ -1066,28 +1066,21 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (item.status === "failed" || item.status === "cancelled" || item.status === "error") continue;
       const text = typeof item.text === "string" ? item.text : "";
       const obj = tryParseJson(text);
-      const rawName = (typeof obj?.toolName === "string" ? obj.toolName
-        : typeof obj?.name === "string" ? obj.name
-        : typeof obj?.tool === "string" ? obj.tool
-        : /"toolName"\s*:\s*"([^"]+)"/.exec(text)?.[1]) ?? "";
-      const match = DISCORD_POST_TOOL.exec(rawName);
-      if (!match) continue;
-      const op = match[1];
-      if (obj?.isError === true || (obj?.output && typeof obj.output === "object" && (obj.output as { isError?: unknown }).isError === true)) continue;
-      const outObj = obj ? extractToolOutput(obj.output) : null;
+      if (!obj) continue;
+      const rawName = (typeof obj.toolName === "string" ? obj.toolName
+        : typeof obj.name === "string" ? obj.name
+        : typeof obj.tool === "string" ? obj.tool : "");
+      if (!DISCORD_POST_TOOL.test(rawName)) continue;
+      if (obj.isError === true || (obj.output && typeof obj.output === "object" && (obj.output as { isError?: unknown }).isError === true)) continue;
+      const outObj = extractToolOutput(obj.output);
       if (outObj?.replay === true || outObj?.status === "rejected by the bridge") continue;
       const ref = typeof outObj?.ref === "string" ? outObj.ref : null;
+      if (!ref) continue; // require the tool result's unique ref; never guess by conversation-scoped idempotency_key
       const outStatus = typeof outObj?.status === "string" ? outObj.status : null;
-      const inputObj = obj?.input && typeof obj.input === "object" && !Array.isArray(obj.input) ? (obj.input as Record<string, unknown>) : null;
-      const idemKey = (typeof inputObj?.idempotency_key === "string" ? inputObj.idempotency_key : null)
-        ?? (obj === null ? /"idempotency_key"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? null : null);
-      const hasOutput = obj !== null && obj.output !== undefined && item.textTruncated !== true;
-      if (hasOutput && ref === null) continue;
-      let dbState = ref ? buffer.outboxStateByRef(botScope, ref) : null;
-      if (dbState === null && !hasOutput && idemKey) dbState = buffer.outboxStateByRequest(botScope, op, idemKey);
+      const dbState = buffer.outboxStateByRef(botScope, ref);
       if (dbState === "dropped") continue;
       if (dbState !== null) return true;
-      if (ref !== null && (outStatus === "queued" || outStatus === "posted" || outStatus === "done")) return true;
+      if (outStatus === "queued" || outStatus === "posted" || outStatus === "done") return true;
     }
     return false;
   }

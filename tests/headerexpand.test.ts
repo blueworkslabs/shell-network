@@ -223,6 +223,29 @@ test("HEADER EXPAND (#95): crossed-message own-posts block (#87) reserves its bu
   await wTight.steps(1);
   const tightLine = wTight.t3.sends()[1].message!.split("\n").find((l) => l.startsWith("user1: "))!;
   assert.equal(hasLoneSurrogate(tightLine), false, "exact 300-char boundary backs up before surrogate pair");
+
+  // Pass 1 selection invariant with straddling emoji at exact 300-char cutoff:
+  // Raw 300-char cut of each 500-char message is `user1: ` (7) + 300 + `… [+200 chars cut]` (18) = 325 chars.
+  // Two lines raw = 325 + 1 + 325 = 651 > 650, so Pass 1 MUST evict the older line (even though safeCut is 324 + 1 + 324 = 649).
+  const wStraddle = world({ headerMaxChars: 650 });
+  await wStraddle.bot.accept(wStraddle.discord.userSays("start"));
+  await wStraddle.steps(1);
+  wStraddle.finish("ok");
+  await wStraddle.steps(2);
+  wStraddle.advance(1000);
+  await wStraddle.bot.accept(wStraddle.discord.userSays(`OLD:${"a".repeat(295)}🚀${"x".repeat(199)}`, { mention: false }));
+  wStraddle.advance(1000);
+  await wStraddle.bot.accept(wStraddle.discord.userSays(`NEW:${"b".repeat(295)}🚀${"y".repeat(199)}`, { mention: false }));
+  wStraddle.advance(1000);
+  await wStraddle.bot.accept(wStraddle.discord.userSays("wake"));
+  await wStraddle.steps(1);
+  const straddleHead = wStraddle.t3.sends()[1].message!.split("[New messages for you:]")[0];
+  const straddleLines = straddleHead.split("\n").filter((l) => l.startsWith("user1: "));
+  assert.equal(straddleLines.length, 1, "Pass 1 evicts older message using original raw 300-char lengths");
+  assert.ok(straddleLines[0].startsWith("user1: NEW:"), "newest message kept");
+  assert.ok(straddleHead.includes("1 left out"), "evicted older message counted as left out");
+  assert.ok(straddleLines[0].length <= 650, "expanded kept line still fits within headerMaxChars");
+  assert.equal(hasLoneSurrogate(straddleLines[0]), false, "kept line still avoids lone surrogates");
 });
 
 function hasLoneSurrogate(s: string): boolean {

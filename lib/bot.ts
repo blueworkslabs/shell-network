@@ -1537,14 +1537,17 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const prefix = `${m.author_name}: `;
       const body = named(m.content).replace(/\s+/g, " ").trim();
       const baseMax = addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX;
-      return { id: m.id, addressed, prefix, body, line: prefix + cutLine(body, baseMax) };
+      // Pass 1 selection uses the exact pre-#95 raw cut length so a 1-char safeCut backup on a straddling emoji
+      // never changes which messages Pass 1 keeps or evicts (safeCut length is always <= raw length).
+      const pass1Len = prefix.length + (body.length > baseMax ? baseMax + `… [+${body.length - baseMax} chars cut]`.length : body.length);
+      return { id: m.id, addressed, prefix, body, pass1Len, line: prefix + cutLine(body, baseMax) };
     };
     const entries = [...win.addressed.map((m) => ({ m, e: toEntry(true)(m) })), ...win.unaddressed.map((m) => ({ m, e: toEntry(false)(m) }))]
       .sort((a, b) => byId(a.m, b.m)).map((x) => x.e);
     const total = win.total;
     // Pass 1: both bounds (count, then size) drop the oldest line that does not mention this bot first, the oldest
     // line only when every line left mentions it: an addressed handoff outlives any number of later unaddressed lines.
-    while (entries.length && (entries.length > headerMaxMessages || entries.map((e) => e.line).join("\n").length > headerMaxChars)) {
+    while (entries.length && (entries.length > headerMaxMessages || entries.reduce((s, e) => s + e.pass1Len, 0) + entries.length - 1 > headerMaxChars)) {
       const i = entries.findIndex((e) => !e.addressed);
       entries.splice(i >= 0 ? i : 0, 1);
     }

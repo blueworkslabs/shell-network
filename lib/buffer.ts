@@ -382,11 +382,21 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // never advances ahead of delayed gateway intake) (#87).
     ownPostsAfter(afterId: string, { conversationKey, selfId, selfName = "", channelId = "", limit }: { conversationKey?: string; selfId: string; selfName?: string; channelId?: string; limit: number }) {
       type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
+      const editOf = (id: string) => conversationKey
+        ? one<{ content: string }>(
+            "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? ORDER BY id DESC LIMIT 1",
+            conversationKey, id,
+          )?.content ?? null
+        : null;
       const byMsg = new Map<string, Row>();
       for (const r of all<Row>(
         `SELECT * FROM channel_message WHERE ${after("id")} AND channel_id = ? AND author_id = ? ORDER BY length(id) DESC, id DESC LIMIT ?`,
         afterId, afterId, afterId, channelId, selfId, limit,
-      )) byMsg.set(r.id, r);
+      )) {
+        const edited = editOf(r.id);
+        const att = r.content.match(/ \[attachment: [^\]]+\]$/)?.[0] ?? "";
+        byMsg.set(r.id, edited !== null ? { ...r, content: edited + (att && !edited.endsWith(att) ? att : "") } : r);
+      }
       if (conversationKey) {
         type OutRow = { key: string; content: string; meta: string; channel_message_id: string; created_at: number; posted_at: number | null };
         for (const r of all<OutRow>(
@@ -398,10 +408,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
           conversationKey, afterId, afterId, afterId, limit,
         )) {
           if (byMsg.has(r.channel_message_id)) continue;
-          let content = one<{ content: string }>(
-            "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? ORDER BY id DESC LIMIT 1",
-            conversationKey, r.channel_message_id,
-          )?.content ?? r.content;
+          let content = editOf(r.channel_message_id) ?? r.content;
           if (r.key.startsWith("tool:")) {
             const meta = JSON.parse(r.meta) as { files?: { name?: string }[] };
             const names = Array.isArray(meta.files) ? meta.files.map((f) => f?.name).filter((n): n is string => Boolean(n)) : [];

@@ -305,3 +305,49 @@ test("CROSSED POSTS (#87): delayed intake before gateway echo is never skipped b
     "gateway echo deduplicates cleanly with outbox row",
   );
 });
+
+test("CROSSED POSTS (#87): peer-first gateway echo after a confirmed discord_edit still shows the edited text in crossed-message context and repairs channel_message on sender echo", async () => {
+  const w = world();
+  const hermesKey = conversationKeyFor("hermes", CH);
+  const hermes = makeBot({
+    name: "Hermes", conversationKey: hermesKey, channelId: CH, channelName: "shell-network",
+    botUserId: HERMES, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: BOT, name: "Gem" }],
+    projectId: "proj-hermes", modelSelection: { instanceId: "crewHermes", model: "m" },
+    buffer: w.buffer, t3: w.t3, discord: w.discord, log: w.log, now: () => 1_792_500_000_000, session: () => "s1",
+  });
+  hermes.initWatermark(1_792_500_000_000 - 60_000);
+  await hermes.step();
+
+  // Turn 1 starts for Gem, then a crossed human mention arrives while turn 1 runs
+  await w.bot.accept(w.discord.userSays("turn 1"));
+  await w.steps(1);
+  w.advance(1000);
+  const queued = w.discord.userSays("crossed mention");
+  await w.bot.accept(queued);
+
+  // Gem posts via discord_send and then edits it BEFORE any gateway echo arrives
+  w.advance(1000);
+  const tools = w.tools();
+  const sent = tools.send({ channel: CH, content: "original draft text", idempotency_key: "peer-s1" });
+  const ref = (sent.structuredContent as { ref: string }).ref;
+  await w.steps(2);
+  const posted = w.discord.botPosts(CH)[0];
+  tools.edit({ channel: CH, ref, content: "final edited text", idempotency_key: "peer-e1" });
+  await w.steps(2);
+
+  // Peer bridge (Hermes) receives the original pre-edit gateway echo FIRST and logs it to shared channel_message
+  await hermes.accept({ ...posted, content: "original draft text" });
+  assert.equal(w.buffer.channelMessage(posted.id)?.content, "original draft text", "control: peer logged pre-edit echo");
+
+  // Gem's crossed-message wake (even BEFORE Gem's own echo arrives!) must show the confirmed edited text
+  w.finish("NO_REPLY");
+  await w.steps(2);
+  const batch2 = w.t3.sends().filter((s) => s.threadId === w.thread())[1].message!;
+  assert.match(batch2, /\[Your own posts sent after the queued message\(s\) below:\]/);
+  assert.match(batch2, /Gem: final edited text/, "ownPostsAfter applies confirmed edit even over peer-logged channel_message row");
+  assert.doesNotMatch(batch2, /original draft text/, "pre-edit text must not appear in crossed-message context");
+
+  // When Gem's own gateway echo arrives afterwards, it repairs the shared channel_message row with the confirmed edit
+  await w.bot.accept({ ...posted, content: "original draft text" });
+  assert.equal(w.buffer.channelMessage(posted.id)?.content, "final edited text", "sender echo repairs peer-logged row to latest confirmed edit");
+});

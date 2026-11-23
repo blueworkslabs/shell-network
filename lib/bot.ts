@@ -519,8 +519,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     // Channel log for the unread header: the allowlisted people, the allowed crew bots and this bot itself only.
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
       const edited = self ? buffer.latestPostedEdit(conversationKey, msg.id) : null;
+      const content = (edited ?? String(msg.content ?? "")) + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : "");
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content: (edited ?? String(msg.content ?? "")) + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : ""), at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+      // If a peer bridge already logged the pre-edit echo into the shared channel_message table, repair it with our latest confirmed edit.
+      if (edited !== null) buffer.editChannelMessage(msg.id, authorId, content);
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };

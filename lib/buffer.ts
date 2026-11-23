@@ -371,10 +371,11 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       const last = one<{ id: string }>(`SELECT id FROM channel_message WHERE ${after} AND channel_id = ?4 ORDER BY length(id) DESC, id DESC LIMIT 1`, afterId ?? "", null, null, channelId);
       return { addressed, unaddressed, total, newestId: last?.id ?? null };
     },
-    // Latest confirmed discord_edit text for a message posted by this conversation (boundary holds the resolved message id).
+    // Latest confirmed discord_edit text for a message posted by this conversation: only PATCHes that Discord actually
+    // confirmed (meta.confirmed = 1), never superseded or refused/dropped edit rows.
     latestPostedEdit(conversationKey: string, messageId: string): string | null {
       const row = one<{ content: string }>(
-        "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? ORDER BY id DESC LIMIT 1",
+        "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? AND COALESCE(json_extract(meta, '$.confirmed'), 0) = 1 ORDER BY id DESC LIMIT 1",
         conversationKey, messageId,
       );
       return row?.content ?? null;
@@ -387,7 +388,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
       const editOf = (id: string) => conversationKey
         ? one<{ content: string }>(
-            "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? ORDER BY id DESC LIMIT 1",
+            "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? AND COALESCE(json_extract(meta, '$.confirmed'), 0) = 1 ORDER BY id DESC LIMIT 1",
             conversationKey, id,
           )?.content ?? null
         : null;
@@ -674,6 +675,10 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // Done without a message of its own (a tool reaction): posted, no channel message id, so it is never taken
     // as the newest post or as evidence for another post's recovery.
     outboxApplied: (id: number): void => { db.prepare("UPDATE outbox SET state = 'posted', posted_at = ? WHERE id = ? AND state IN ('pending','posting')").run(now(), id); },
+    // A discord_edit whose PATCH Discord actually confirmed (distinguished from superseded edits that never ran).
+    outboxEditConfirmed: (id: number, messageId: string): void => {
+      db.prepare("UPDATE outbox SET state = 'posted', boundary = ?, posted_at = ?, meta = json_set(meta, '$.confirmed', 1) WHERE id = ? AND state IN ('pending','posting')").run(messageId, now(), id);
+    },
 
     // ---- the bot's Discord tool ----
     setToolConfig(conversationKey: string, c: { channelId: string; botUserId: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap: number }): void {

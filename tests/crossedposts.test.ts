@@ -351,3 +351,46 @@ test("CROSSED POSTS (#87): peer-first gateway echo after a confirmed discord_edi
   await w.bot.accept({ ...posted, content: "original draft text" });
   assert.equal(w.buffer.channelMessage(posted.id)?.content, "final edited text", "sender echo repairs peer-logged row to latest confirmed edit");
 });
+
+test("CROSSED POSTS (#87): an edit that hits 500 and is superseded by an edit that hits 403 is never treated as confirmed", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("turn 1"));
+  await w.steps(1);
+  w.advance(1000);
+  await w.bot.accept(w.discord.userSays("crossed mention"));
+
+  // Bot posts original text via tool
+  w.advance(1000);
+  const tools = w.tools();
+  const sent = tools.send({ channel: CH, content: "original published text", idempotency_key: "sup-s1" });
+  const ref = (sent.structuredContent as { ref: string }).ref;
+  await w.steps(2);
+  const posted = w.discord.botPosts(CH)[0];
+
+  // Edit 1 is queued and hits a transient 500 on PATCH (leaves it `posting` with boundary = posted.id)
+  tools.edit({ channel: CH, ref, content: "unconfirmed 500 edit", idempotency_key: "sup-e1" });
+  const realEdit = w.discord.editMessage.bind(w.discord);
+  let mode: "500" | "403" = "500";
+  w.discord.editMessage = async (...args) => {
+    if (mode === "500") throw Object.assign(new Error("discord 500"), { status: 500 });
+    if (mode === "403") throw Object.assign(new Error("discord 403"), { status: 403 });
+    return realEdit(...args);
+  };
+  await assert.rejects(() => w.bot.step(), /discord 500/);
+
+  // Edit 2 is queued while edit 1 is `posting`; edit 1 gets superseded, then edit 2 is refused with 403 until dropped
+  mode = "403";
+  tools.edit({ channel: CH, ref, content: "refused 403 edit", idempotency_key: "sup-e2" });
+  await w.steps(4);
+
+  // Neither edit was applied by Discord: crossed-message context AND late gateway echo must keep original text
+  w.finish("NO_REPLY");
+  await w.steps(2);
+  const batch2 = w.t3.sends().filter((s) => s.threadId === w.thread())[1].message!;
+  assert.match(batch2, /Gem: original published text/, "original text stays in crossed-message context");
+  assert.doesNotMatch(batch2, /unconfirmed 500 edit/, "superseded edit after 500 must not override original text");
+  assert.doesNotMatch(batch2, /refused 403 edit/, "dropped 403 edit must not override original text");
+
+  await w.bot.accept({ ...posted, content: "original published text" });
+  assert.equal(w.buffer.channelMessage(posted.id)?.content, "original published text", "gateway echo is not overwritten by superseded edit");
+});

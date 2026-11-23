@@ -1027,7 +1027,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: repeated (or superseded) next step
       return countRefusal(h, status) >= REFUSE_LIMIT; // Discord refused it: counted, and dropped at the limit so the queue moves on
     }
-    buffer.atomically(() => { buffer.outboxApplied(h.id); if (state.botUserId) buffer.editChannelMessage(messageId, state.botUserId, h.content); });
+    buffer.atomically(() => { buffer.outboxEditConfirmed(h.id, messageId); if (state.botUserId) buffer.editChannelMessage(messageId, state.botUserId, h.content); });
     log.emit("bridge.tool_edited", { bot: name, key: h.key, messageId, ...(h.state === "posting" ? { recovered: true } : {}) });
     return true;
   }

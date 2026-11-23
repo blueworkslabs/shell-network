@@ -335,9 +335,9 @@ a timing SLA. No bridge code change was required.
 
 ## Log volume
 
-The bridge polls its thread every step. Those reads (`bridge-read`) are logged only when they fail (`call.error`) or are
-slow (`call.end` at or over 2 seconds, with its duration); a fast, successful poll writes nothing (#62). Every other MCP
-call is logged as before.
+The bridge polls its thread every step, and its queue while a batch is open. Those reads (`bridge-read`,
+`bridge-queue`) are logged only when they fail (`call.error`) or are slow (`call.end` at or over 2 seconds, with its
+duration); a fast, successful poll writes nothing (#62, #84). Every other MCP call is logged as before.
 
 ## Code layout
 

@@ -75,6 +75,7 @@ runs once per process start; arbitrary shared roles are not included.
 Optional settings:
 
 - `BRIDGE_EXCHANGE_CAP`: the bot-to-bot cap (default 2; 0 turns bot-to-bot off).
+- `BRIDGE_SILENT_FEEDBACK`: visible feedback when a person directly mentions a bot and its run finishes with `NO_REPLY` without posting anything (`note` default, `reaction`, or `off`).
 - `BRIDGE_TICK_MS`: the step interval.
 
 The full list of settings is in the header of each entrypoint:

@@ -8,14 +8,14 @@ import { makeBot, withoutLocalImages } from "../lib/bot.ts";
 import { memoryLog } from "../lib/log.ts";
 import { openToolDb } from "../lib/tooldb.ts";
 import { makeTools } from "../lib/tools.ts";
-import { conversationKeyFor } from "../lib/bots.ts";
+import { conversationKeyFor, type SilentFeedback } from "../lib/bots.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir, track } from "./tmp.ts";
 
 const CH = "shell-network";
 const BOT = "333333333333333333", HERMES = "444444444444444444";
 
-function world({ nonceWindow = false, allowedBots = [{ id: HERMES, name: "Hermes" }] }: { nonceWindow?: boolean; allowedBots?: { id: string; name: string; talkOnly?: boolean }[] } = {}) {
+function world({ nonceWindow = false, allowedBots = [{ id: HERMES, name: "Hermes" }], silentFeedback = "note" }: { nonceWindow?: boolean; allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; silentFeedback?: SilentFeedback } = {}) {
   const path = join(tempDir("toolpost-"), "buffer.db");
   let clock = 1_792_500_000_000;
   const now = () => clock;
@@ -39,7 +39,7 @@ function world({ nonceWindow = false, allowedBots = [{ id: HERMES, name: "Hermes
       t3.crash.buffer = w.buffer;
       discord.crash.buffer = w.buffer;
       w.bot = makeBot({ name: "Gem", conversationKey: conversationKeyFor("gem", CH), channelId: CH, botUserId: BOT, allowedAuthors: [HUMAN_ID], projectId: "proj-gem",
-        modelSelection: { instanceId: "crewGemClaude", model: "m" }, buffer: w.buffer, t3, discord, log, now, session: () => "s1", allowedBots });
+        modelSelection: { instanceId: "crewGemClaude", model: "m" }, buffer: w.buffer, t3, discord, log, now, session: () => "s1", allowedBots, silentFeedback });
       return w;
     },
     restart() { try { w.buffer.close(); } catch {} return w.start(); },
@@ -223,8 +223,8 @@ test("TOOL ORDER: a tool send queued behind an unsettled head waits for it (one 
   assert.deepEqual(order, ["first", "second"]);
 });
 
-test("NO_REPLY: a batch whose final text is exactly NO_REPLY posts nothing and does not block the next batch; a relayed NO_REPLY posts nothing", async () => {
-  const w = world();
+test("NO_REPLY: a batch whose final text is exactly NO_REPLY posts nothing (when silentFeedback=off) and does not block the next batch; a relayed NO_REPLY posts nothing", async () => {
+  const w = world({ silentFeedback: "off" });
   await w.bot.accept(w.discord.userSays("do it with the tool"));
   await w.steps(1);
   const run = () => w.t3.threads.get(w.thread())!.runs.at(-1)!.runId;
@@ -245,8 +245,8 @@ test("NO_REPLY: a batch whose final text is exactly NO_REPLY posts nothing and d
   assert.equal(w.discord.botPosts().at(-1)!.content, "NO_REPLY, but here is more", "control: only an exact NO_REPLY is dropped");
 });
 
-test("LOCAL IMAGES (#79): NO_REPLY plus a local image posts nothing; text plus local images posts the text only; a web image stays; relays alike", async () => {
-  const w = world();
+test("LOCAL IMAGES (#79): NO_REPLY plus a local image posts nothing (when silentFeedback=off); text plus local images posts the text only; a web image stays; relays alike", async () => {
+  const w = world({ silentFeedback: "off" });
   const run = () => w.t3.threads.get(w.thread())!.runs.at(-1)!.runId;
   const turn = async (final: string) => { await w.bot.accept(w.discord.userSays("make a picture")); await w.steps(1); w.t3.complete(w.thread(), run(), final); await w.steps(2); };
   await turn("NO_REPLY\n\n![golden wing](/home/agent/work/golden-wing.png)");

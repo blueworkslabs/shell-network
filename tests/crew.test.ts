@@ -17,6 +17,19 @@ test("crew file selects identity, includes talk-only members, and keeps cap sett
   assert.equal(c.exchangeCap, 2);
   assert.equal(config(exampleCrew, { BRIDGE_EXCHANGE_CAP: "0" }).exchangeCap, 0);
   for (const cap of ["-1", "two"]) assert.throws(() => config(exampleCrew, { BRIDGE_EXCHANGE_CAP: cap }), /BRIDGE_EXCHANGE_CAP/);
+  assert.equal(c.silentFeedback, "note");
+  for (const mode of ["note", "reaction", "off"] as const) assert.equal(config(exampleCrew, { BRIDGE_SILENT_FEEDBACK: mode }).silentFeedback, mode);
+  for (const bad of ["", "ping", "true", "NOTE"]) assert.throws(() => config(exampleCrew, { BRIDGE_SILENT_FEEDBACK: bad }), /BRIDGE_SILENT_FEEDBACK/);
+});
+
+test("startup refuses invalid BRIDGE_SILENT_FEEDBACK before opening the database or reading secrets", () => {
+  const result = spawnSync(process.execPath, ["bin/bridge.ts"], {
+    env: { PATH: process.env.PATH, BRIDGE_BOT: "gem", BRIDGE_CREW_FILE: crewFile(), BRIDGE_SILENT_FEEDBACK: "invalid" },
+    encoding: "utf8", timeout: 20_000,
+  });
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /BRIDGE_SILENT_FEEDBACK/);
+  assert.doesNotMatch(result.stderr, /missing BRIDGE_DB|secret-file/);
 });
 
 test("crew file carries optional provider model options unchanged", () => {

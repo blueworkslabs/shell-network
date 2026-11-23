@@ -118,6 +118,7 @@ export type RunStatus = "preparing" | "queued" | "starting" | "running" | "waiti
 export interface ReadItem {
   type: string;
   runId?: string;
+  status?: string;
   messageId?: string;
   text?: string;
   textTruncated?: boolean;

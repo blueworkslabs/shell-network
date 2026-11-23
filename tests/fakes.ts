@@ -30,6 +30,7 @@ export interface FakeT3 {
   readArchived(args: { threadId: string; view: "messages"; limit: number; afterPosition?: number; itemId?: string; textOffset?: number }): Promise<unknown>;
   archiveReadError: string | null; // test control: every readArchived fails with this message until cleared
   complete(threadId: string, runId: string, text: string | null): void;
+  toolCall(threadId: string, runId: string, call: { toolName: string; input?: Record<string, unknown>; output?: unknown; status?: string; type?: string; isError?: boolean }): void;
   fail(threadId: string, runId: string, opts?: { holdQueue?: boolean }): void;
   resume(threadId: string): void; // t3's queue.resume: clears queueHeld on every queued run, then starts the next
   // a run no bridge send started: a Monitor/background wake (input item `notification`, no message id) or a
@@ -160,6 +161,11 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       r.status = "completed";
       if (text !== null) t.items.push({ type: "assistant_message", runId, text, textTruncated: false, nextTextOffset: null });
       promote(t);
+    },
+    toolCall(threadId, runId, { toolName, input, output, status = "completed", type = "dynamic_tool", isError }) {
+      const t = th(threadId);
+      const body: Record<string, unknown> = { toolName, ...(input !== undefined ? { input } : {}), ...(output !== undefined ? { output } : {}), ...(isError !== undefined ? { isError } : {}) };
+      t.items.push({ type, runId, status, text: JSON.stringify(body), textTruncated: false, nextTextOffset: null });
     },
     fail(threadId, runId, { holdQueue = false } = {}) {
       const t = th(threadId);

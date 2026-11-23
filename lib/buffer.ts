@@ -546,6 +546,33 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     },
     atomically: <T>(fn: () => T): T => tx(fn),
     outboxEntry: (conversationKey: string, key: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND key = ?", conversationKey, key),
+    outboxStateByRef: ({ botPrefix, conversationKey }: { botPrefix: string | null; conversationKey: string }, ref: string): OutboxRow["state"] | null =>
+      (botPrefix
+        ? one<{ state: OutboxRow["state"] }>("SELECT state FROM outbox WHERE substr(conversation_key, 1, length(?1)) = ?1 AND key = ?2 LIMIT 1", botPrefix, ref)
+        : one<{ state: OutboxRow["state"] }>("SELECT state FROM outbox WHERE conversation_key = ?1 AND key = ?2 LIMIT 1", conversationKey, ref)
+      )?.state ?? null,
+    // Look up a tool call's outbox state scoped strictly to the target channel (either `<bot>.<target>` or a legacy
+    // discord_thread owned by this bot whose meta.channel is `<target>`), never across unrelated channels.
+    outboxStateByTargetRequest: (
+      { botPrefix, conversationKey }: { botPrefix: string | null; conversationKey: string },
+      targetChannel: string, op: string, idemKey: string,
+    ): OutboxRow["state"] | null =>
+      (botPrefix
+        ? one<{ state: OutboxRow["state"] }>(
+            `SELECT o.state FROM tool_request r JOIN outbox o ON o.id = r.outbox_id
+             WHERE r.op = ?3 AND r.idem_key = ?4
+               AND (r.conversation_key = (?1 || ?2)
+                 OR (substr(r.conversation_key, 1, length(?1)) = ?1 AND json_extract(o.meta, '$.thread') = 1 AND json_extract(o.meta, '$.channel') = ?2))
+             ORDER BY o.id DESC LIMIT 1`,
+            botPrefix, targetChannel, op, idemKey,
+          )
+        : one<{ state: OutboxRow["state"] }>(
+            `SELECT o.state FROM tool_request r JOIN outbox o ON o.id = r.outbox_id
+             WHERE r.conversation_key = ?1 AND r.op = ?3 AND r.idem_key = ?4 AND json_extract(o.meta, '$.channel') = ?2
+             ORDER BY o.id DESC LIMIT 1`,
+            conversationKey, targetChannel, op, idemKey,
+          )
+      )?.state ?? null,
     // The newest post in the bot's channel, or (threadId) in one of its tool threads: entries posted into a
     // thread carry meta { channel: <thread id>, thread: 1 }; everything else is a channel post.
     lastOutboxPost: (conversationKey: string, threadId: string | null = null): string | null => one<{ id: string }>(`SELECT channel_message_id id FROM outbox WHERE conversation_key = ?1

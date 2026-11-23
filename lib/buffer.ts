@@ -376,8 +376,9 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
 
     // Coalesce every buffered message of a conversation into one prepared batch (atomic). Refuses while the
     // conversation still has an unfinished batch, so batches reach t3 strictly in order. Returns null if empty.
-    // header: optional text put before the coalesced messages (the unread-channel header).
-    createBatch(conversationKey: string, header: (rows: InboundRow[]) => string = () => "", limit?: BatchLimit): (BatchRow & { inboundIds: number[] }) | null {
+    // header: optional text put before the coalesced messages (the unread-channel header); textOf: each message's text as
+    // sent (called after header, in the same transaction).
+    createBatch(conversationKey: string, header: (rows: InboundRow[]) => string = () => "", limit?: BatchLimit, textOf: (r: InboundRow) => string = (r) => r.text): (BatchRow & { inboundIds: number[] }) | null {
       return tx(() => {
         const open = all<Pick<BatchRow, "id" | "status">>(`SELECT id, status FROM batch WHERE conversation_key = ? AND ${OPEN_SQL}`, conversationKey);
         if (open.length) throw new Error(`createBatch: batch ${open[0].id} (${open[0].status}) is still open for ${conversationKey}`);
@@ -386,7 +387,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         const prefix = requestPrefix(); // before the new batch exists, so it does not count as open
         const t = now();
         const ins = db.prepare("INSERT INTO batch (conversation_key, client_request_id, text, created_at, status_since, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-          .run(conversationKey, `pending-${t}-${rows[0].id}`, header(rows) + coalesce(rows), t, t, t);
+          .run(conversationKey, `pending-${t}-${rows[0].id}`, header(rows) + coalesce(rows.map((r) => ({ ...r, text: textOf(r) }))), t, t, t);
         const id = Number(ins.lastInsertRowid);
         db.prepare("UPDATE batch SET client_request_id = ? WHERE id = ?").run(prefix ? `bridge-${conversationKey}-${prefix}-${id}` : `bridge-${conversationKey}-${id}`, id);
         const mark = db.prepare("UPDATE inbound SET state = 'batched', batch_id = ? WHERE id = ? AND state = 'buffered'");

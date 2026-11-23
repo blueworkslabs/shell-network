@@ -38,7 +38,9 @@ schema change before the trial verdict means a fresh DB.
    A Discord reply starts with what it answers, from the local channel log only (#86): `[replying to <author>: <line>]`,
    cut and with mentions as names like a header line. The log holds only allowlisted people, crew bots and this bot in
    this channel, so a message the log does not have gets `[replying to a message not in the local log]` and is never
-   fetched or quoted. A forward is not a reply.
+   fetched or quoted. A forward is not a reply. The line is added when the batch is built, and only when the answered
+   message is out of view: not in the same batch, not in its unread header, and not one of this bot's own posts since
+   its previous batch. Bot-to-bot replies, which nearly always answer something in view, stay as they were.
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before

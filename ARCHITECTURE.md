@@ -55,6 +55,12 @@ schema change before the trial verdict means a fresh DB.
    rest keep their order. The read is bounded in SQL: only the newest 20 messages that mention the bot and the newest
    20 that don't are loaded, plus a count for "N left out", however long the unread log is. The channel log is shared by every bot
    on the buffer, so the header shows and counts only messages by people and crew bots this bot listens to itself (#90).
+   When the bot has already posted in the same channel or thread after the oldest queued Discord message in the batch
+   (crossed messages), up to 5 of those own newer posts are appended in a separate informational block inside the
+   remaining `headerMaxChars` budget (incoming unread messages keep priority, and own posts are trimmed oldest-first).
+   Un-echoed confirmed outbox posts (and applied `discord_edit` updates) are merged into that read directly from `outbox`
+   without writing them early into `channel_message`, so crossed-message wakes see them immediately while `channelWindow`
+   and `headerSince` advance only on gateway-delivered messages (#87).
 4. **Send.** The batch is sent as `t3_thread_send` with mode `queue`. Steering is never used. The t3 adapter
    (`lib/t3.ts`) reaches MCP only through `lib/allowlist.ts`.
 5. **Reconcile** (`lib/reconcile.ts`, pure). This step compares the batch with the MCP thread read, the WS projection

@@ -47,6 +47,7 @@ export const SILENT_REACTION_EMOJI = "🔇";
 // (e.g. a handoff the exchange cap held back) get Discord's whole message length, so a resumed bot reads them in full.
 export const HEADER_LINE_MAX = 300;
 export const HEADER_ADDRESSED_LINE_MAX = 2000;
+const OWN_POSTS_MAX = 5;
 const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars cut]` : s);
 // phase "open" carries the reconcile verdict of the oldest open batch.
 export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new" | "stop" | "closing"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
@@ -679,8 +680,12 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const talkOnly = crewBot && allowedBots.some((b) => b.id === authorId && b.talkOnly);
     // Channel log for the unread header: the allowlisted people, the allowed crew bots and this bot itself only.
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
+      const edited = self ? buffer.latestPostedEdit(conversationKey, msg.id) : null;
+      const content = (edited ?? String(msg.content ?? "")) + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : "");
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content: String(msg.content ?? "") + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : ""), at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+      // If a peer bridge already logged the pre-edit echo into the shared channel_message table, repair it with our latest confirmed edit.
+      if (edited !== null) buffer.editChannelMessage(msg.id, authorId, content);
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
@@ -1022,7 +1027,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       if (status === undefined || !REFUSED.has(status)) throw e; // 5xx, network, timeout: repeated (or superseded) next step
       return countRefusal(h, status) >= REFUSE_LIMIT; // Discord refused it: counted, and dropped at the limit so the queue moves on
     }
-    buffer.atomically(() => { buffer.outboxApplied(h.id); if (state.botUserId) buffer.editChannelMessage(messageId, state.botUserId, h.content); });
+    buffer.atomically(() => { buffer.outboxEditConfirmed(h.id, messageId); if (state.botUserId) buffer.editChannelMessage(messageId, state.botUserId, h.content); });
     log.emit("bridge.tool_edited", { bot: name, key: h.key, messageId, ...(h.state === "posting" ? { recovered: true } : {}) });
     return true;
   }
@@ -1537,9 +1542,28 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     }
     const lines = entries.map((e) => e.line);
     headerShown = new Set(entries.map((e) => e.id));
-    if (!lines.length) return fresh + threadIntro + hint.join("\n") + "\n";
+    // Crossed-message context (#87): if this bot already posted in this channel/thread *after* the oldest queued
+    // Discord message in this batch, surface those newer own posts in a compact supplemental block (trimmed first
+    // so incoming unread lines keep priority in headerMaxChars). Normal sequential turns see nothing added.
+    let ownLines: string[] = [];
+    if (state.botUserId) {
+      const discordIds = rows.filter((r) => r.source === "discord" && /^\d+$/.test(r.source_message_id)).map((r) => r.source_message_id);
+      if (discordIds.length) {
+        const oldestBatchId = discordIds.reduce((min, id) => (BigInt(id) < BigInt(min) ? id : min));
+        const usedChars = lines.length ? lines.join("\n").length : 0;
+        const remainingChars = headerMaxChars - usedChars - (lines.length ? 1 : 0);
+        if (remainingChars > 0) {
+          ownLines = buffer.ownPostsAfter(oldestBatchId, { conversationKey, selfId: state.botUserId, selfName: name, channelId, limit: OWN_POSTS_MAX })
+            .map((m) => `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}`);
+          while (ownLines.length && ownLines.join("\n").length > remainingChars) ownLines.shift();
+        }
+      }
+    }
+    const ownBlock = ownLines.length ? ["[Your own posts sent after the queued message(s) below:]", ...ownLines] : [];
+    if (!lines.length && !ownBlock.length) return fresh + threadIntro + hint.join("\n") + "\n";
+    if (!lines.length) return fresh + threadIntro + [...hint, ...ownBlock, "[New messages for you:]"].join("\n") + "\n";
     const left = total - lines.length;
-    return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
+    return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, ...ownBlock, "[New messages for you:]"].join("\n") + "\n";
   }
 
   async function closeStep(): Promise<StepResult> {

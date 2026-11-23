@@ -181,7 +181,7 @@ test("ACCEPT burst: 10 messages during a running turn -> exactly one follow-up t
   assert.equal(w.runs().length, 2, "exactly one follow-up turn");
   const follow = w.t3.sends()[1].message!;
   for (const m of burst) assert.ok(follow.includes(`[discord:${m.id}]`), `follow-up carries ${m.id}`);
-  assert.match(follow, /^\[Discord channel: [^\n]*\]\n10 messages arrived/);
+  assert.match(follow, /^\[Discord channel: [^\n]*\]\n\[Your own posts sent after the queued message\(s\) below:\]\nGem: first done\n\[New messages for you:\]\n10 messages arrived/);
   w.t3.complete(w.thread(), lastRun(w), "all ten handled");
   await settle(w);
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["first done", "all ten handled"]);

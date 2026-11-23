@@ -1035,22 +1035,74 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { status: "unknown" };
   }
 
+  // Whether `runId` itself produced a non-dropped Discord posting tool call (send, edit, react, thread) in any of this
+  // bot's allowed channels. Driven by the run's own t3 activity items and cross-checked against the bridge outbox so
+  // cross-channel posts suppress silence while unrelated concurrent runs or failed/dropped calls do not (#82).
+  const DISCORD_POST_TOOL = /(?:^|__|\.|\/)discord_(send|edit|react|thread)$/;
+  const botScope = (() => { const dot = conversationKey.indexOf("."); return { botPrefix: dot > 0 ? conversationKey.slice(0, dot + 1) : null, conversationKey }; })();
+  const tryParseJson = (v: unknown): Record<string, unknown> | null => {
+    if (typeof v !== "string") return null;
+    try { const p = JSON.parse(v); return p && typeof p === "object" && !Array.isArray(p) ? (p as Record<string, unknown>) : null; } catch { return null; }
+  };
+  const extractToolOutput = (output: unknown): Record<string, unknown> | null => {
+    if (typeof output === "string") return tryParseJson(output);
+    if (!output || typeof output !== "object" || Array.isArray(output)) return null;
+    const o = output as Record<string, unknown>;
+    if (typeof o.content === "string") return tryParseJson(o.content) ?? o;
+    if (Array.isArray(o.content)) {
+      for (const part of o.content) {
+        if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+          const parsed = tryParseJson((part as { text: string }).text);
+          if (parsed) return parsed;
+        }
+      }
+    }
+    return o;
+  };
+  function runPostedViaTool(runId: string, read: ThreadRead): boolean {
+    for (const item of read.items ?? []) {
+      if (item.runId !== runId) continue;
+      if (item.type !== "dynamic_tool" && item.type !== "mcp_tool_call") continue;
+      if (item.status === "failed" || item.status === "cancelled" || item.status === "error") continue;
+      const text = typeof item.text === "string" ? item.text : "";
+      const obj = tryParseJson(text);
+      const rawName = (typeof obj?.toolName === "string" ? obj.toolName
+        : typeof obj?.name === "string" ? obj.name
+        : typeof obj?.tool === "string" ? obj.tool
+        : /"toolName"\s*:\s*"([^"]+)"/.exec(text)?.[1]) ?? "";
+      const match = DISCORD_POST_TOOL.exec(rawName);
+      if (!match) continue;
+      const op = match[1];
+      if (obj?.isError === true || (obj?.output && typeof obj.output === "object" && (obj.output as { isError?: unknown }).isError === true)) continue;
+      const outObj = obj ? extractToolOutput(obj.output) : null;
+      if (outObj?.replay === true || outObj?.status === "rejected by the bridge") continue;
+      const ref = typeof outObj?.ref === "string" ? outObj.ref : null;
+      const outStatus = typeof outObj?.status === "string" ? outObj.status : null;
+      const inputObj = obj?.input && typeof obj.input === "object" && !Array.isArray(obj.input) ? (obj.input as Record<string, unknown>) : null;
+      const idemKey = (typeof inputObj?.idempotency_key === "string" ? inputObj.idempotency_key : null)
+        ?? (obj === null ? /"idempotency_key"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? null : null);
+      const hasOutput = obj !== null && obj.output !== undefined && item.textTruncated !== true;
+      if (hasOutput && ref === null) continue;
+      let dbState = ref ? buffer.outboxStateByRef(botScope, ref) : null;
+      if (dbState === null && !hasOutput && idemKey) dbState = buffer.outboxStateByRequest(botScope, op, idemKey);
+      if (dbState === "dropped") continue;
+      if (dbState !== null) return true;
+      if (ref !== null && (outStatus === "queued" || outStatus === "posted" || outStatus === "done")) return true;
+    }
+    return false;
+  }
+
   // Target message id for deliberate-silence feedback (#82), or null if it does not apply.
-  function silentFeedbackTarget(b: BatchRow): string | null {
+  function silentFeedbackTarget(b: BatchRow, runId: string, read: ThreadRead): string | null {
     if (silentFeedback === "off") return null;
     const rows = buffer.inboundOf(b.id);
     if (rows.some((r) => r.text === NEW_WRAPUP_TEXT)) return null;
     const hit = rows.find((r) => r.source === "discord" && r.author_kind === "human" && buffer.kvGet(K(`directMention:${r.source_message_id}`)) === "1");
     if (!hit) return null;
-    const start = buffer.kvGet(K(`batchOutboxStart:${b.id}`));
-    const postedViaTool = start !== null
-      ? buffer.hasToolActivityAfter(conversationKey, Number(start))
-      : buffer.hasToolActivitySince(conversationKey, b.created_at);
-    if (postedViaTool) return null;
+    if (runPostedViaTool(runId, read)) return null;
     return hit.source_message_id;
   }
   function cleanupBatchMeta(b: BatchRow): void {
-    buffer.kvDelete(K(`batchOutboxStart:${b.id}`));
     for (const r of buffer.inboundOf(b.id)) buffer.kvDelete(K(`directMention:${r.source_message_id}`));
   }
 
@@ -1065,7 +1117,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const final = withoutLocalImages(last?.text);
     // A final of exactly NO_REPLY: complete, nothing posted unless deliberate-silence feedback applies (#82).
     if (isNoReply(final) && !buffer.postedParts(b.id).length && !buffer.outboxEntry(conversationKey, `reply:${b.id}:0`)) {
-      const target = silentFeedbackTarget(b);
+      const target = silentFeedbackTarget(b, runId, read);
       buffer.atomically(() => {
         buffer.markReplyNone(b.id);
         if (target && silentFeedback === "note") {
@@ -1448,12 +1500,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!gateOpen()) return { phase: "catching-up" };
     const busy = isBusy(read);
     if (busy || !buffer.buffered(conversationKey, reset.limit).length) return { phase: busy ? "busy" : "idle" };
-    const b = buffer.atomically(() => {
-      const start = buffer.lastOutboxId(conversationKey);
-      const created = buffer.createBatch(conversationKey, (rows) => unreadHeader(rows, reset.limit), reset.limit)!;
-      buffer.kvSet(K(`batchOutboxStart:${created.id}`), String(start));
-      return created;
-    });
+    const b = buffer.createBatch(conversationKey, (rows) => unreadHeader(rows, reset.limit), reset.limit)!;
     await sendBatch(threadId, b);
     await typing();
     return { phase: "sent", batchId: b.id };

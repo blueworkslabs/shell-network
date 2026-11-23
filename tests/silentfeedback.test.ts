@@ -70,6 +70,7 @@ function world({
     restart() { try { w.buffer.close(); } catch {} return w.start(); },
     async steps(n = 3) { for (let i = 0; i < n; i++) { await w.bot.step(); clock += 1000; } },
     thread: () => w.buffer.kvGet(`${conversationKeyFor("gem", CH)}:threadId`)!,
+    runId: () => t3.threads.get(w.thread())!.runs.at(-1)!.runId,
     finish: (text: string | null) => {
       const tid = w.thread();
       t3.complete(tid, t3.threads.get(tid)!.runs.at(-1)!.runId, text);
@@ -153,34 +154,50 @@ test("SILENT FEEDBACK (off): person mention + NO_REPLY posts nothing and adds no
   assert.deepEqual(w.discord.reactions.filter((r) => r.messageId === m.id).map((r) => r.emoji), ["👀"]);
 });
 
-test("SILENT FEEDBACK: suppressed when the run posted via discord_send, discord_edit, or discord_react; fires again on a later truly silent turn", async () => {
+test("SILENT FEEDBACK: suppressed when the run posted via discord_send, discord_edit, or discord_react (all provider item shapes); fires again on a later truly silent turn", async () => {
   const w = world({ silentFeedback: "note" });
   const tools = w.tools();
 
-  // Turn 1: agent answers via discord_send, ends with NO_REPLY -> no silent note
+  // Turn 1: agent answers via discord_send (Antigravity string output shape), ends with NO_REPLY -> no silent note
   const m1 = w.discord.userSays("send via tool");
   await w.bot.accept(m1);
   await w.steps(1);
   const sent = tools.send({ channel: CH, content: "answered via tool", idempotency_key: "s1" });
   const ref = (sent.structuredContent as { ref: string }).ref;
+  w.t3.toolCall(w.thread(), w.runId(), {
+    toolName: "discord.discord_send",
+    input: { channel: CH, content: "answered via tool", idempotency_key: "s1" },
+    output: JSON.stringify(sent.structuredContent),
+  });
   w.finish("NO_REPLY");
   await w.steps(2);
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["answered via tool"]);
 
-  // Turn 2: agent answers via discord_edit, ends with NO_REPLY -> no silent note
+  // Turn 2: agent answers via discord_edit (Claude { content: string } output shape), ends with NO_REPLY -> no silent note
   const m2 = w.discord.userSays("edit via tool");
   await w.bot.accept(m2);
   await w.steps(1);
-  tools.edit({ channel: CH, ref, content: "edited via tool", idempotency_key: "e1" });
+  const edited = tools.edit({ channel: CH, ref, content: "edited via tool", idempotency_key: "e1" });
+  w.t3.toolCall(w.thread(), w.runId(), {
+    toolName: "mcp__discord__discord_edit",
+    input: { channel: CH, ref, content: "edited via tool", idempotency_key: "e1" },
+    output: { content: JSON.stringify(edited.structuredContent) },
+  });
   w.finish("NO_REPLY");
   await w.steps(2);
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["edited via tool"]);
 
-  // Turn 3: agent answers via discord_react, ends with NO_REPLY -> no silent note
+  // Turn 3: agent answers via discord_react (Codex mcp_tool_call shape), ends with NO_REPLY -> no silent note
   const m3 = w.discord.userSays("react via tool");
   await w.bot.accept(m3);
   await w.steps(1);
-  tools.react({ channel: CH, message_id: m3.id, emoji: "✅", idempotency_key: "r1" });
+  const reacted = tools.react({ channel: CH, message_id: m3.id, emoji: "✅", idempotency_key: "r1" });
+  w.t3.toolCall(w.thread(), w.runId(), {
+    type: "mcp_tool_call",
+    toolName: "discord_react",
+    input: { channel: CH, message_id: m3.id, emoji: "✅", idempotency_key: "r1" },
+    output: reacted.structuredContent,
+  });
   w.finish("NO_REPLY");
   await w.steps(2);
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["edited via tool"]);
@@ -194,6 +211,85 @@ test("SILENT FEEDBACK: suppressed when the run posted via discord_send, discord_
   await w.steps(2);
   assert.deepEqual(w.discord.botPosts().map((p) => p.content), ["edited via tool", SILENT_NOTE_TEXT]);
   assert.equal(w.discord.botPosts()[1].message_reference?.message_id, m4.id);
+});
+
+test("SILENT FEEDBACK: suppression follows the run's own tool output across channels and ignores unrelated runs, read-only tools, failed calls, replays, and dropped entries", async () => {
+  const CH_B = "100000000000000002";
+  const path = join(tempDir("silent-multi-"), "buffer.db");
+  let clock = 1_792_500_000_000;
+  const now = () => clock;
+  const t3 = fakeT3();
+  const discord = fakeDiscord({ channelId: CH, botUserId: BOT, now });
+  const log = memoryLog();
+  const buffer = openTempBuffer(path, { now });
+  const botA = makeBot({
+    name: "Gem", conversationKey: conversationKeyFor("gem", CH), channelId: CH, channelName: "shell-network", threadLabel: "Gem #shell-network",
+    botUserId: BOT, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }], silentFeedback: "note",
+    projectId: "proj-gem", modelSelection: { instanceId: "crewGemAntigravity", model: "m" },
+    buffer, t3, discord, log, now, session: () => "s1",
+  });
+  const botB = makeBot({
+    name: "Gem", conversationKey: conversationKeyFor("gem", CH_B), channelId: CH_B, channelName: "exact-change", threadLabel: "Gem #exact-change",
+    botUserId: BOT, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }], silentFeedback: "note",
+    projectId: "proj-gem", modelSelection: { instanceId: "crewGemAntigravity", model: "m" },
+    buffer, t3, discord, log, now, session: () => "s1",
+  });
+  botA.initWatermark(clock - 60_000);
+  botB.initWatermark(clock - 60_000);
+  const tools = makeTools(track(openToolDb(path)), "gem", { now });
+  const steps = async (n = 3) => { for (let i = 0; i < n; i++) { await botA.step(); await botB.step(); clock += 1000; } };
+  const tidOf = (ch: string) => buffer.kvGet(`${conversationKeyFor("gem", ch)}:threadId`)!;
+  const runOf = (ch: string) => t3.threads.get(tidOf(ch))!.runs.at(-1)!.runId;
+
+  // 1) Cross-channel post by THIS run: person mentions Gem in CH, run posts via discord_send in CH_B and ends NO_REPLY -> no silent note in CH
+  const m1 = discord.userSays("post the update in exact-change", { channel: CH });
+  await botA.accept(m1);
+  await steps(1);
+  const cross = tools.send({ channel: CH_B, content: "posted in channel B", idempotency_key: "cross-1" });
+  t3.toolCall(tidOf(CH), runOf(CH), {
+    toolName: "discord.discord_send",
+    input: { channel: CH_B, content: "posted in channel B", idempotency_key: "cross-1" },
+    output: JSON.stringify(cross.structuredContent),
+  });
+  t3.complete(tidOf(CH), runOf(CH), "NO_REPLY");
+  await steps(2);
+  assert.deepEqual(discord.botPosts(CH_B).map((p) => p.content), ["posted in channel B"]);
+  assert.deepEqual(discord.botPosts(CH).map((p) => p.content), [], "cross-channel tool post suppresses silent note in source channel");
+
+  // 2) Unrelated activity in CH from ANOTHER run (botB): botA stays silent (only calling discord_read) while botB posts into CH -> botA STILL posts silent note
+  const m2 = discord.userSays("silent turn in A", { channel: CH });
+  const mB = discord.userSays("meanwhile post into A", { channel: CH_B });
+  await botA.accept(m2);
+  await botB.accept(mB);
+  await steps(1);
+  const fromB = tools.send({ channel: CH, content: "from another run", idempotency_key: "from-b-1" });
+  t3.toolCall(tidOf(CH_B), runOf(CH_B), {
+    toolName: "discord.discord_send",
+    input: { channel: CH, content: "from another run", idempotency_key: "from-b-1" },
+    output: JSON.stringify(fromB.structuredContent),
+  });
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_read", input: { channel: CH, limit: 5 }, output: "{}" });
+  t3.complete(tidOf(CH), runOf(CH), "NO_REPLY");
+  t3.complete(tidOf(CH_B), runOf(CH_B), "NO_REPLY");
+  await steps(2);
+  assert.deepEqual(discord.botPosts(CH).map((p) => p.content), ["from another run", SILENT_NOTE_TEXT], "unrelated run activity does not suppress botA's silent note");
+  assert.equal(discord.botPosts(CH)[1].message_reference?.message_id, m2.id);
+
+  // 3) Failed tool call, replay of an earlier call, and a dropped outbox entry do NOT suppress silent feedback
+  const m3 = discord.userSays("failed/dropped/replayed calls", { channel: CH });
+  await botA.accept(m3);
+  await steps(1);
+  const droppedSend = tools.send({ channel: CH, content: "will be dropped", idempotency_key: "drop-1" });
+  const droppedRow = buffer.outboxEntry(conversationKeyFor("gem", CH), (droppedSend.structuredContent as { ref: string }).ref)!;
+  buffer.outboxDrop(droppedRow.id);
+  const replay = tools.send({ channel: CH_B, content: "posted in channel B", idempotency_key: "cross-1" });
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "failed", idempotency_key: "fail-1" }, status: "failed", output: "Error: refused" });
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH_B, content: "posted in channel B", idempotency_key: "cross-1" }, output: JSON.stringify(replay.structuredContent) });
+  t3.toolCall(tidOf(CH), runOf(CH), { toolName: "discord.discord_send", input: { channel: CH, content: "will be dropped", idempotency_key: "drop-1" }, output: JSON.stringify(droppedSend.structuredContent) });
+  t3.complete(tidOf(CH), runOf(CH), "NO_REPLY");
+  await steps(2);
+  assert.equal(discord.botPosts(CH).at(-1)!.content, SILENT_NOTE_TEXT, "failed, replayed, and dropped tool entries do not suppress silent feedback");
+  assert.equal(discord.botPosts(CH).at(-1)!.message_reference?.message_id, m3.id);
 });
 
 test("SILENT FEEDBACK: never fires for bot-to-bot mentions (regular or talk-only), unmentioned batches, relays, or /new wrap-ups", async () => {

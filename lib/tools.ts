@@ -79,7 +79,7 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
       AND json_extract(meta, '$.addressesBot') = 1 AND created_at >= ?1 AND state != 'dropped'
       AND (json_extract(meta, '$.channel') = ?2 OR (json_extract(meta, '$.thread') = 1 AND json_extract(meta, '$.channel') IN
         (SELECT t.reply_to FROM outbox t WHERE substr(t.key, 1, 7) = 'thread:' AND t.state = 'posted' AND json_extract(t.meta, '$.channel') = ?2)))
-      AND (channel_message_id IS NULL OR channel_message_id NOT IN (SELECT id FROM channel_message WHERE channel_id = ?2))`).all(human?.at ?? 0, c.channel_id) as { users: string }[];
+      AND (channel_message_id IS NULL OR channel_message_id NOT IN (SELECT id FROM channel_message))`).all(human?.at ?? 0, c.channel_id) as { users: string }[];
     const reserved = reservations.filter((r) => (JSON.parse(r.users) as string[]).some((id) => bots.includes(id))).length;
     return logged + reserved;
   }

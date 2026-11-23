@@ -368,14 +368,54 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       const last = one<{ id: string }>(`SELECT id FROM channel_message WHERE ${after} AND channel_id = ?4 ORDER BY length(id) DESC, id DESC LIMIT 1`, afterId ?? "", null, null, channelId);
       return { addressed, unaddressed, total, newestId: last?.id ?? null };
     },
+    // Latest confirmed discord_edit text for a message posted by this conversation (boundary holds the resolved message id).
+    latestPostedEdit(conversationKey: string, messageId: string): string | null {
+      const row = one<{ content: string }>(
+        "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? ORDER BY id DESC LIMIT 1",
+        conversationKey, messageId,
+      );
+      return row?.content ?? null;
+    },
     // This bot's own posts in `channelId` strictly after `afterId` (lossless snowflake comparison), newest `limit`
-    // returned oldest-first. Used to surface own posts sent after a queued message arrived (#87).
-    ownPostsAfter(afterId: string, { selfId, channelId = "", limit }: { selfId: string; channelId?: string; limit: number }) {
+    // returned oldest-first. Merges gateway-echoed rows in `channel_message` with confirmed `outbox` posts for
+    // `conversationKey` targeting `channelId` (without writing un-echoed posts into `channel_message`, so `headerSince`
+    // never advances ahead of delayed gateway intake) (#87).
+    ownPostsAfter(afterId: string, { conversationKey, selfId, selfName = "", channelId = "", limit }: { conversationKey?: string; selfId: string; selfName?: string; channelId?: string; limit: number }) {
       type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
-      return all<Row>(
-        `SELECT * FROM channel_message WHERE ${after("id")} AND channel_id = ?4 AND author_id = ?5 ORDER BY length(id) DESC, id DESC LIMIT ?6`,
+      const byMsg = new Map<string, Row>();
+      for (const r of all<Row>(
+        `SELECT * FROM channel_message WHERE ${after("id")} AND channel_id = ? AND author_id = ? ORDER BY length(id) DESC, id DESC LIMIT ?`,
         afterId, afterId, afterId, channelId, selfId, limit,
-      ).reverse();
+      )) byMsg.set(r.id, r);
+      if (conversationKey) {
+        type OutRow = { key: string; content: string; meta: string; channel_message_id: string; created_at: number; posted_at: number | null };
+        for (const r of all<OutRow>(
+          `SELECT key, content, meta, channel_message_id, created_at, posted_at FROM outbox
+           WHERE conversation_key = ? AND state = 'posted' AND channel_message_id IS NOT NULL
+             AND ${after("channel_message_id")}
+             AND NOT (substr(key, 1, 5) = 'tool:' AND COALESCE(json_extract(meta, '$.thread'), 0) = 1)
+           ORDER BY length(channel_message_id) DESC, channel_message_id DESC LIMIT ?`,
+          conversationKey, afterId, afterId, afterId, limit,
+        )) {
+          if (byMsg.has(r.channel_message_id)) continue;
+          let content = one<{ content: string }>(
+            "SELECT content FROM outbox WHERE conversation_key = ? AND substr(key, 1, 5) = 'edit:' AND state = 'posted' AND boundary = ? ORDER BY id DESC LIMIT 1",
+            conversationKey, r.channel_message_id,
+          )?.content ?? r.content;
+          if (r.key.startsWith("tool:")) {
+            const meta = JSON.parse(r.meta) as { files?: { name?: string }[] };
+            const names = Array.isArray(meta.files) ? meta.files.map((f) => f?.name).filter((n): n is string => Boolean(n)) : [];
+            if (names.length) content += ` [attachment: ${names.join(", ")}]`;
+          }
+          byMsg.set(r.channel_message_id, {
+            id: r.channel_message_id, author_id: selfId, author_name: selfName, author_kind: "bot",
+            content, at: r.posted_at ?? r.created_at,
+          });
+        }
+      }
+      return [...byMsg.values()]
+        .sort((a, b) => a.id.length - b.id.length || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .slice(-limit);
     },
 
     // limit: only messages up to a Discord message id (before it, or through it); /new uses it to hold later messages back.

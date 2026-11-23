@@ -90,26 +90,45 @@ test("CROSSED POSTS (#87): gateway echo deduplicates without overwriting a newer
   tools.thread({ channel: CH, message_id: root.id, name: "legacy-th", idempotency_key: "mk-th" });
   await w.steps(2);
 
-  // Bot posts into the channel via tool (mentioning Hermes -> uses 1 of cap 2), then edits it, then gateway echo arrives with old text
+  // Bot posts into the channel via tool (mentioning Hermes -> uses 1 of cap 2), then edits it BEFORE gateway echo arrives
   const s1 = tools.send({ channel: CH, content: `<@${HERMES}> initial text`, idempotency_key: "s1" });
   const ref1 = (s1.structuredContent as { ref: string }).ref;
   await w.steps(2);
   const posted = w.discord.botPosts(CH)[0];
-  assert.equal(w.buffer.channelMessage(posted.id)?.content, `<@${HERMES}> initial text`);
+  assert.equal(w.buffer.channelMessage(posted.id), undefined, "un-echoed own post is not written into channel_message early");
+  assert.deepEqual(
+    w.buffer.ownPostsAfter(root.id, { conversationKey: w.key, selfId: BOT, selfName: "Gem", channelId: CH, limit: 5 }).map((m) => m.content),
+    [`<@${HERMES}> initial text`],
+    "ownPostsAfter still sees confirmed un-echoed post immediately",
+  );
 
   tools.edit({ channel: CH, ref: ref1, content: `<@${HERMES}> edited text`, idempotency_key: "e1" });
   await w.steps(2);
-  assert.equal(w.buffer.channelMessage(posted.id)?.content, `<@${HERMES}> edited text`);
+  assert.deepEqual(
+    w.buffer.ownPostsAfter(root.id, { conversationKey: w.key, selfId: BOT, selfName: "Gem", channelId: CH, limit: 5 }).map((m) => m.content),
+    [`<@${HERMES}> edited text`],
+    "ownPostsAfter reflects applied discord_edit before gateway echo",
+  );
 
-  // Late gateway echo with original pre-edit text must NOT overwrite the newer edit
+  // Late gateway echo with original pre-edit text must NOT overwrite the newer edit, and deduplicates cleanly
   await w.bot.accept({ ...posted, content: `<@${HERMES}> initial text` });
-  assert.equal(w.buffer.channelMessage(posted.id)?.content, `<@${HERMES}> edited text`, "echo does not overwrite edit");
+  assert.equal(w.buffer.channelMessage(posted.id)?.content, `<@${HERMES}> edited text`, "echo preserves newer edit");
+  assert.equal(
+    w.buffer.ownPostsAfter(root.id, { conversationKey: w.key, selfId: BOT, selfName: "Gem", channelId: CH, limit: 5 }).length,
+    1,
+    "echo deduplicates with confirmed outbox row",
+  );
 
-  // Second bot-addressed send goes into the legacy tool thread (recorded under thread id, still counts toward parent cap!)
+  // Second bot-addressed send goes into the legacy tool thread (excluded from parent ownPostsAfter, still counts toward parent cap!)
   tools.send({ channel: root.id, content: `<@${HERMES}> thread handoff`, idempotency_key: "s2" });
   await w.steps(2);
   const thPost = w.discord.botPosts(root.id)[0];
-  assert.equal(w.buffer.channelMessage(thPost.id)?.channel_id, root.id, "recorded under actual thread destination");
+  assert.equal(w.buffer.channelMessage(thPost.id), undefined, "legacy thread post does not enter parent channel_message");
+  assert.equal(
+    w.buffer.ownPostsAfter(root.id, { conversationKey: w.key, selfId: BOT, selfName: "Gem", channelId: CH, limit: 5 }).some((m) => m.id === thPost.id),
+    false,
+    "legacy thread post does not leak into parent ownPostsAfter",
+  );
 
   // Cap (2) is now full: a 3rd bot-addressed send must be refused (neither double-counted nor under-counted!)
   assert.throws(() => tools.send({ channel: CH, content: `<@${HERMES}> third handoff`, idempotency_key: "s3" }), /exchange cap reached/);
@@ -204,4 +223,85 @@ test("CROSSED POSTS (#87): isolated per Discord thread and visible during /new d
   const parentT3 = buffer.kvGet(`${conversationKeyFor("gem", CH)}:threadId`)!;
   const parentSend = t3.sends().find((s) => s.threadId === parentT3)!.message!;
   assert.doesNotMatch(parentSend, /thread reply posted during drain/);
+});
+
+test("CROSSED POSTS (#87): delayed intake before gateway echo is never skipped by headerSince (for this bot or another bot sharing the DB)", async () => {
+  const w = world();
+  // Second bot (Hermes) sharing the exact same buffer DB and channel
+  const hermesKey = conversationKeyFor("hermes", CH);
+  const hermes = makeBot({
+    name: "Hermes", conversationKey: hermesKey, channelId: CH, channelName: "shell-network",
+    botUserId: HERMES, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: BOT, name: "Gem" }],
+    projectId: "proj-hermes", modelSelection: { instanceId: "crewHermes", model: "m" },
+    buffer: w.buffer, t3: w.t3, discord: w.discord, log: w.log, now: () => 1_792_500_000_000, session: () => "s1",
+  });
+  hermes.initWatermark(1_792_500_000_000 - 60_000);
+  await hermes.step(); // complete initial catch-up before messages arrive
+
+  // Turn 1 starts for Gem
+  await w.bot.accept(w.discord.userSays("first request"));
+  await w.steps(1);
+
+  // While turn 1 runs, human queues a mention for Gem (and an older mention for Hermes)
+  w.advance(1000);
+  const queued = w.discord.userSays("queued while turn 1 runs");
+  await w.bot.accept(queued);
+  w.advance(1000);
+  const hermesFirst = { ...w.discord.userSays(`<@${HERMES}> hermes check`, { mention: false }), mentions: [{ id: HERMES }] };
+
+  // Another human message is created on Discord BEFORE Gem's reply, but its gateway delivery is delayed!
+  w.advance(1000);
+  const delayed = w.discord.userSays("delayed unaddressed context", { mention: false });
+
+  // Turn 1 finishes and posts its reply (snowflake > delayed.id), NO gateway echo delivered yet
+  w.advance(1000);
+  w.finish("early reply before echo");
+  await w.steps(2); // delivers + posts reply, then builds batch 2 for `queued`
+
+  const reply = w.discord.botPosts(CH)[0];
+  assert.ok(BigInt(reply.id) > BigInt(delayed.id), "reply snowflake is strictly newer than delayed message");
+  const batch2 = w.t3.sends().filter((s) => s.threadId === w.thread())[1].message!;
+  assert.match(batch2, /\[Your own posts sent after the queued message\(s\) below:\]/);
+  assert.match(batch2, /Gem: early reply before echo/);
+  // Critical invariant: headerSince did NOT jump ahead to reply.id!
+  assert.equal(w.buffer.kvGet(`${w.key}:headerSince`), queued.id, "early own post must not advance headerSince before gateway echo");
+
+  // Hermes also takes a turn on `hermesFirst` (older than `delayed`) while Gem's reply is un-echoed:
+  // Hermes's headerSince must stay at hermesFirst.id (not jump to Gem's un-echoed reply.id)
+  await hermes.accept(hermesFirst);
+  await hermes.step();
+  assert.equal(w.buffer.kvGet(`${hermesKey}:headerSince`), hermesFirst.id, "other bot headerSince must not advance from un-echoed own post");
+  const hermesThread = w.buffer.kvGet(`${hermesKey}:threadId`)!;
+  w.t3.complete(hermesThread, w.t3.threads.get(hermesThread)!.runs.at(-1)!.runId, "hermes ok");
+  await hermes.step();
+  await hermes.step();
+
+  // Finish Gem's batch 2
+  w.advance(1000);
+  w.finish("batch 2 done");
+  await w.steps(2);
+
+  // Now the delayed message finally arrives over the gateway (with its older snowflake < reply.id)
+  await w.bot.accept(delayed);
+  await hermes.accept(delayed);
+
+  // Next turn for BOTH Gem and Hermes must see `delayed` in their unread header (NOT skipped!)
+  w.advance(1000);
+  await w.bot.accept(w.discord.userSays("turn 3 after delayed intake"));
+  await w.steps(1);
+  const batch3 = w.t3.sends().filter((s) => s.threadId === w.thread())[2].message!;
+  assert.match(batch3, /delayed unaddressed context/, "delayed incoming message was not skipped by Gem headerSince");
+  await hermes.accept({ ...w.discord.userSays(`<@${HERMES}> hermes after delayed`, { mention: false }), mentions: [{ id: HERMES }] });
+  await hermes.step();
+  const hermesBatch2 = w.t3.sends().filter((s) => s.threadId === hermesThread)[1].message!;
+  assert.match(hermesBatch2, /delayed unaddressed context/, "delayed incoming message was not skipped by Hermes headerSince");
+
+  // And once the gateway echo of `reply` actually arrives later, it enters channel_message and advances headerSince normally
+  await w.bot.accept(reply);
+  assert.equal(w.buffer.channelMessage(reply.id)?.content, "early reply before echo");
+  assert.equal(
+    w.buffer.ownPostsAfter(queued.id, { conversationKey: w.key, selfId: BOT, selfName: "Gem", channelId: CH, limit: 5 }).filter((m) => m.id === reply.id).length,
+    1,
+    "gateway echo deduplicates cleanly with outbox row",
+  );
 });

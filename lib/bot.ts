@@ -518,8 +518,9 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const talkOnly = crewBot && allowedBots.some((b) => b.id === authorId && b.talkOnly);
     // Channel log for the unread header: the allowlisted people, the allowed crew bots and this bot itself only.
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
+      const edited = self ? buffer.latestPostedEdit(conversationKey, msg.id) : null;
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content: String(msg.content ?? "") + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : ""), at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+        content: (edited ?? String(msg.content ?? "")) + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : ""), at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
@@ -916,7 +917,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         const r = await searchOwnPost(K(`outboxSearch:${h.id}`), h.boundary!, h.content, replyTo, target, toolFiles(h).map((f) => f.name));
         if (r.status === "unknown") { log.emit("bridge.outbox_search_incomplete", { bot: name, key: h.key }); return false; }
         if (r.status === "found") {
-          buffer.outboxPosted(h.id, r.message.id, () => { onPosted(h, r.message.id); recordOwnPost(h, r.message, target); });
+          buffer.outboxPosted(h.id, r.message.id, () => onPosted(h, r.message.id));
           unstage(h);
           log.emit(postedEvent(h, true), { bot: name, key: h.key, channelMessageId: r.message.id, recovered: true });
           continue;
@@ -955,22 +956,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         unstage(h);
         continue;
       }
-      buffer.outboxPosted(h.id, m.id, () => { onPosted(h, m.id); recordOwnPost(h, m, target); });
+      buffer.outboxPosted(h.id, m.id, () => onPosted(h, m.id));
       unstage(h);
       log.emit(postedEvent(h, false), { bot: name, key: h.key, channelMessageId: m.id });
     }
-  }
-  // Record confirmed own sends into channel_message under their actual Discord message and channel/thread id so a
-  // crossed-message wake sees them immediately (before the gateway echo arrives); INSERT OR IGNORE deduplicates echoes
-  // without overwriting newer edits (#87).
-  function recordOwnPost(h: OutboxRow, m: DiscordMessage, target: string): void {
-    if (!state.botUserId || !m.id) return;
-    const atts = attachmentNames(m.attachments);
-    const content = String(m.content ?? h.content) + (atts.length ? ` [attachment: ${atts.join(", ")}]` : "");
-    buffer.recordChannelMessage({
-      id: m.id, authorId: state.botUserId, authorName: name, authorKind: "bot", content,
-      at: Date.parse(m.timestamp as string) || now(), channelId: m.channel_id ?? target,
-    });
   }
 
   // Discord refused the request: nothing was created (or changed). Back to pending with the refusal counted, and after
@@ -1377,7 +1366,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         const usedChars = lines.length ? lines.join("\n").length : 0;
         const remainingChars = headerMaxChars - usedChars - (lines.length ? 1 : 0);
         if (remainingChars > 0) {
-          ownLines = buffer.ownPostsAfter(oldestBatchId, { selfId: state.botUserId, channelId, limit: OWN_POSTS_MAX })
+          ownLines = buffer.ownPostsAfter(oldestBatchId, { conversationKey, selfId: state.botUserId, selfName: name, channelId, limit: OWN_POSTS_MAX })
             .map((m) => `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}`);
           while (ownLines.length && ownLines.join("\n").length > remainingChars) ownLines.shift();
         }

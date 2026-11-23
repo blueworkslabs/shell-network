@@ -49,9 +49,10 @@ schema change before the trial verdict means a fresh DB.
    20 that don't are loaded, plus a count for "N left out", however long the unread log is. When the bot has already
    posted in the same channel or thread after the oldest queued Discord message in the batch (crossed messages), up to
    5 of those own newer posts are appended in a separate informational block inside the remaining `headerMaxChars`
-   budget (incoming unread messages keep priority, and own posts are trimmed oldest-first). Confirmed outbox sends are
-   recorded in `channel_message` under their actual Discord destination immediately on post (deduplicating with the
-   later gateway echo without overwriting edits) so they are visible even before the gateway echo arrives (#87).
+   budget (incoming unread messages keep priority, and own posts are trimmed oldest-first). Un-echoed confirmed outbox
+   posts (and applied `discord_edit` updates) are merged into that read directly from `outbox` without writing them
+   early into `channel_message`, so crossed-message wakes see them immediately while `channelWindow` and `headerSince`
+   advance only on gateway-delivered messages (#87).
 4. **Send.** The batch is sent as `t3_thread_send` with mode `queue`. Steering is never used. The t3 adapter
    (`lib/t3.ts`) reaches MCP only through `lib/allowlist.ts`.
 5. **Reconcile** (`lib/reconcile.ts`, pure). This step compares the batch with the MCP thread read, the WS projection

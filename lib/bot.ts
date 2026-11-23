@@ -116,12 +116,149 @@ export function withoutLocalImages(text: unknown): string {
 }
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
 export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(?:^|\r?\n)[ \t]*NO_REPLY\s*$/, "");
-const splitReply = (text: unknown): string[] => {
+type CodeFence = { marker: string; reopen: string };
+const FENCE_OPEN = /^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)$/;
+// Never split a reply so a part contains only Discord mentions/whitespace (e.g. a bare bot handoff mention).
+const hasBody = (s: string): boolean => s.replace(/<@[!&]?\d+>/g, "").trim().length > 0;
+// Never cut between a UTF-16 high surrogate (0xD800..0xDBFF) and low surrogate (0xDC00..0xDFFF).
+function safeCut(s: string, idx: number): number {
+  if (idx <= 1 || idx >= s.length) return idx;
+  const prev = s.charCodeAt(idx - 1), cur = s.charCodeAt(idx);
+  return prev >= 0xd800 && prev <= 0xdbff && cur >= 0xdc00 && cur <= 0xdfff ? idx - 1 : idx;
+}
+function updateFence(line: string, open: CodeFence | null): CodeFence | null {
+  const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
+  if (!open) {
+    const m = FENCE_OPEN.exec(clean);
+    if (!m) return null;
+    const marker = m[1], info = m[2].trimEnd();
+    if (marker[0] === "`" && info.includes("`")) return null;
+    return { marker, reopen: `${marker}${info}` };
+  }
+  const ch = open.marker[0];
+  const closeRe = new RegExp(`^[ \\t]{0,3}${ch}{${open.marker.length},}[ \\t]*$`);
+  return closeRe.test(clean) ? null : open;
+}
+function fenceAtEnd(text: string, initial: CodeFence | null): CodeFence | null {
+  let open = initial;
+  for (const line of text.split("\n")) open = updateFence(line, open);
+  return open;
+}
+// Inline backtick code spans `[start, end)` on non-fenced lines within `text`, used to avoid splitting mid-span
+// when the whole span fits in the next part.
+function inlineCodeSpans(text: string, initial: CodeFence | null): [number, number][] {
+  const spans: [number, number][] = [];
+  let open = initial, offset = 0;
+  for (const line of text.split("\n")) {
+    const wasOpen = open;
+    open = updateFence(line, open);
+    if (!wasOpen && !open) {
+      let i = 0;
+      while (i < line.length) {
+        if (line[i] !== "`") { i++; continue; }
+        let run = 1;
+        while (i + run < line.length && line[i + run] === "`") run++;
+        let j = i + run, found = -1;
+        while (j < line.length) {
+          if (line[j] !== "`") { j++; continue; }
+          let closeRun = 1;
+          while (j + closeRun < line.length && line[j + closeRun] === "`") closeRun++;
+          if (closeRun === run) { found = j + closeRun; break; }
+          j += closeRun;
+        }
+        if (found !== -1) { spans.push([offset + i, offset + found]); i = found; }
+        else i += run;
+      }
+    }
+    offset += line.length + 1;
+  }
+  return spans;
+}
+function pickSplit(rest: string, limit: number, max: number, open: CodeFence | null): { cut: number; next: number } {
+  const win = rest.slice(0, limit);
+  // Prefer paragraph break outside an open fence, then line break, then space (outside fitting inline code spans), then hard cut.
+  for (let pos = win.length; pos > 0;) {
+    const para = win.lastIndexOf("\n\n", pos - 1);
+    if (para <= 0) break;
+    const head = rest.slice(0, para);
+    if (hasBody(head) && fenceAtEnd(head, open) === null) return { cut: para, next: para + 2 };
+    pos = para;
+  }
+  for (let pos = win.length; pos > 0;) {
+    const nl = win.lastIndexOf("\n", pos - 1);
+    if (nl <= 0) break;
+    const head = rest.slice(0, nl);
+    // Avoid splitting immediately after a leading opening fence line (would emit an empty code block) or leaving only mentions.
+    const onlyOpeningFence = !open && fenceAtEnd(head, null) !== null && head.lastIndexOf("\n") === -1;
+    if (!onlyOpeningFence && hasBody(head)) return { cut: nl, next: nl + 1 };
+    pos = nl;
+  }
+  const firstNl = rest.indexOf("\n");
+  const hasOpeningFence = !open && firstNl > 0 && updateFence(rest.slice(0, firstNl), null) !== null;
+  const spans = inlineCodeSpans(rest.slice(0, Math.min(rest.length, limit + max)), open);
+  for (let sp = win.lastIndexOf(" "); sp > 0; sp = win.lastIndexOf(" ", sp - 1)) {
+    if (hasOpeningFence && sp < firstNl) break;
+    if (!hasBody(rest.slice(0, sp))) break;
+    if (spans.some(([a, b]) => a < sp && sp < b && b - a <= max)) continue;
+    return { cut: sp, next: sp + 1 };
+  }
+  const hard = safeCut(rest, limit);
+  return { cut: hard, next: hard };
+}
+// Legacy fixed-offset splitter kept solely to finish partially persisted pre-upgrade replies/relays without overlap.
+function splitFixed(text: unknown, max = PART): string[] {
   const t = String(text ?? "").trim() || "(finished without a text reply)";
   const parts: string[] = [];
-  for (let i = 0; i < t.length; i += PART) parts.push(t.slice(i, i + PART));
+  for (let i = 0; i < t.length; i += max) parts.push(t.slice(i, i + max));
   return parts;
-};
+}
+// Split a Discord reply into parts of at most `max` characters (default PART = 1900, under Discord's 2000 limit).
+// Short messages stay unchanged; longer ones prefer paragraph, line, then space boundaries, preserve inline code
+// spans and UTF-16 surrogate pairs, never isolate bare mentions, and close/reopen fenced code blocks (#85).
+export function splitReply(text: unknown, max = PART): string[] {
+  const t = String(text ?? "").trim() || "(finished without a text reply)";
+  if (t.length <= max) return [t];
+  const parts: string[] = [];
+  let rest = t;
+  let open: CodeFence | null = null;
+  while (rest.length > 0) {
+    const safeOpen = open && open.marker.length * 2 + 4 < max
+      ? (open.reopen.length + open.marker.length + 3 < max ? open : { marker: open.marker, reopen: open.marker })
+      : null;
+    const prefix = safeOpen ? `${safeOpen.reopen}\n` : "";
+    if (prefix.length + rest.length <= max) {
+      parts.push(prefix + rest);
+      break;
+    }
+    let limit = Math.max(1, max - prefix.length);
+    let cut = limit, next = limit;
+    let endFence: CodeFence | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      ({ cut, next } = pickSplit(rest, limit, max, safeOpen));
+      endFence = fenceAtEnd(rest.slice(0, cut), safeOpen);
+      // If a split lands immediately after an opening fence line (no code lines yet), move that fence line to the next part.
+      if (endFence && safeOpen === null) {
+        const lastNl = rest.slice(0, cut).lastIndexOf("\n");
+        if (lastNl > 0 && fenceAtEnd(rest.slice(0, lastNl), null) === null && hasBody(rest.slice(0, lastNl))) {
+          cut = lastNl;
+          next = lastNl + 1;
+          endFence = null;
+        }
+      }
+      const closeLen = endFence && endFence.marker.length * 2 + 4 < max ? endFence.marker.length + 1 : 0;
+      if (prefix.length + cut + closeLen <= max) break;
+      limit = Math.max(1, max - prefix.length - closeLen);
+    }
+    const head = rest.slice(0, cut);
+    const usableEnd = endFence && endFence.marker.length * 2 + 4 < max ? endFence : null;
+    const close = usableEnd ? `\n${usableEnd.marker}` : "";
+    parts.push(prefix + head + close);
+    open = usableEnd;
+    rest = rest.slice(next);
+    if (!open && !rest.trim()) break;
+  }
+  return parts;
+}
 const byId = (a: { id: string }, b: { id: string }) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
 const PAGE = 100;
 const DISCORD_EPOCH = 1420070400000n;
@@ -1140,16 +1277,24 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       log.emit(target ? "bridge.reply_silent_feedback" : "bridge.reply_none", { bot: name, batchId: b.id, ...(target ? { mode: silentFeedback } : {}) });
       return true;
     }
-    const parts = splitReply(withoutNoReply(final));
+    const existing0 = buffer.outboxEntry(conversationKey, `reply:${b.id}:0`);
+    const posted = buffer.postedParts(b.id);
+    const legacySplit = (existing0 !== undefined || posted.length > 0)
+      && (existing0 ? (JSON.parse(existing0.meta) as { split?: number }).split !== 2 : true);
+    const clean = withoutNoReply(final);
+    const parts = legacySplit ? splitFixed(clean) : splitReply(clean);
     const first = buffer.inboundOf(b.id)[0];
     if (!first) throw new Error(`batch ${b.id} has no inbound rows`);
-    const done = new Set(buffer.postedParts(b.id).map((p) => p.part));
-    for (let i = 0; i < parts.length; i++) {
-      if (done.has(i) || buffer.outboxEntry(conversationKey, `reply:${b.id}:${i}`)) continue;
-      buffer.enqueue(conversationKey, { key: `reply:${b.id}:${i}`, content: parts[i], nonce: `b${b.id}p${i}`,
-        replyTo: i === 0 && first.source === "discord" ? first.source_message_id : null, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
-    }
-    cleanupBatchMeta(b);
+    const done = new Set(posted.map((p) => p.part));
+    buffer.atomically(() => {
+      for (let i = 0; i < parts.length; i++) {
+        if (done.has(i) || buffer.outboxEntry(conversationKey, `reply:${b.id}:${i}`)) continue;
+        buffer.enqueue(conversationKey, { key: `reply:${b.id}:${i}`, content: parts[i], nonce: `b${b.id}p${i}`,
+          replyTo: i === 0 && first.source === "discord" ? first.source_message_id : null, users: mentionsIn(parts[i]),
+          meta: { parts: parts.length, ...(legacySplit ? {} : { split: 2 }) } });
+      }
+      cleanupBatchMeta(b);
+    });
     return true;
   }
 
@@ -1306,10 +1451,19 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       log.emit("bridge.relay_empty", { bot: name, relayId: row.id, ordinal: c.ordinal, ...(isNoReply(final) ? { noReply: true } : {}) });
       return true;
     }
-    const parts = splitReply(text);
-    for (let i = 0; i < parts.length; i++) {
-      buffer.enqueue(conversationKey, { key: `relay:${row.id}:${i}`, content: parts[i], nonce: `r${row.id}p${i}`, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
-    }
+    const existing0 = buffer.outboxEntry(conversationKey, `relay:${row.id}:0`);
+    const posted = buffer.relayPostedParts(row.id);
+    const legacySplit = (existing0 !== undefined || posted.length > 0)
+      && (existing0 ? (JSON.parse(existing0.meta) as { split?: number }).split !== 2 : true);
+    const parts = legacySplit ? splitFixed(text) : splitReply(text);
+    const done = new Set(posted);
+    buffer.atomically(() => {
+      for (let i = 0; i < parts.length; i++) {
+        if (done.has(i) || buffer.outboxEntry(conversationKey, `relay:${row.id}:${i}`)) continue;
+        buffer.enqueue(conversationKey, { key: `relay:${row.id}:${i}`, content: parts[i], nonce: `r${row.id}p${i}`,
+          users: mentionsIn(parts[i]), meta: { parts: parts.length, ...(legacySplit ? {} : { split: 2 }) } });
+      }
+    });
     return true;
   }
 

@@ -353,11 +353,14 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // newest message id after `afterId` of any author. Only these can survive a header of at most `limit` lines, so the
     // read stays bounded however long the unread log is.
     // until: only messages before (or through) a message id, so a batch cut at a `/new` shows nothing from after it.
-    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit, channelId = "", until }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number; channelId?: string; until?: BatchLimit }) {
+    // authors: when given, only messages by these ids are shown and counted (the log is shared by every bot on the
+    // buffer; each bot sees only the people and crew bots it listens to itself, #90). The marker (newestId) still covers all.
+    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit, channelId = "", until, authors }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number; channelId?: string; until?: BatchLimit; authors?: readonly string[] }) {
       if (until && !/^\d+$/.test(until.id)) throw new Error("channelWindow: until must be a Discord message id");
       const upTo = until ? ` AND (length(id) < ${until.id.length} OR (length(id) = ${until.id.length} AND id ${until.inclusive ? "<=" : "<"} '${until.id}'))` : "";
       const after = (afterId === null ? "1" : "(length(id) > length(?1) OR (length(id) = length(?1) AND id > ?1))") + upTo;
-      const base = `${after} AND channel_id = ?4 AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))`;
+      const listed = authors ? ` AND author_id IN (SELECT value FROM json_each('${JSON.stringify(authors.filter((a) => /^\d+$/.test(a)))}'))` : "";
+      const base = `${after} AND channel_id = ?4 AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))${listed}`;
       const mention = "(instr(content, '<@' || ?5 || '>') > 0 OR instr(content, '<@!' || ?5 || '>') > 0)";
       const params = [afterId ?? "", selfId, JSON.stringify(excludeIds), channelId, addressedId ?? ""] as SQLInputValue[];
       type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };

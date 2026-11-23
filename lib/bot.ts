@@ -1505,7 +1505,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     headerFrom = since;
     // Bounded read: at most `headerMaxMessages` lines can be shown, and lines are dropped oldest unaddressed first, then
     // oldest addressed (below), so only the newest `headerMaxMessages` of each kind can ever be shown; the rest is counted.
-    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId, until });
+    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId, until, authors: [...allowed].filter((a): a is string => typeof a === "string").concat([...bots.keys()]) });
     const newest = [...(win.newestId ? [win.newestId] : []), ...rows.map((r) => r.source_message_id)].sort((a, b) => byId({ id: a }, { id: b })).at(-1);
     if (newest) buffer.kvSet(K("headerSince"), newest);
     // which channel this conversation is (the Discord tool needs it on every call), then how to address the crew

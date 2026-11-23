@@ -7,6 +7,8 @@ import { bridgeConfig } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
 import { fakeT3, fakeDiscord, HUMAN_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
+import { DatabaseSync } from "node:sqlite";
+import { openBuffer } from "../lib/buffer.ts";
 import { crewFile } from "./crew-fixture.ts";
 
 const CH = "shell-network";
@@ -68,6 +70,26 @@ test("SHARED LOG HEADER (#90): each bot's unread header shows and counts only th
   assert.match(toGem, /\[Channel since your last turn, 2 messages, oldest first:\]\nother: only Gem listens to me\nuser1: a note for everyone/, "Gem allows both");
   assert.match(toHermes, /\[Channel since your last turn, 2 messages, oldest first:\]\nuser1: a note for everyone\nuser1: <@gem-user> what's new\?\n/, "control: the shared author is there");
   assert.ok(!toHermes.includes("only Gem listens to me"), "Hermes does not listen to that author: not shown, not counted");
+});
+
+test("SHARED LOG READ (#93): each bridge publishes the people it listens to for its Discord tool (which then reads only them, tests/tools.test.ts)", () => {
+  const OTHER = "777777777777777777";
+  const w = twoBots({ gemAuthors: [HUMAN_ID, OTHER] });
+  const people = (key: string) => JSON.parse((w.gem.buffer.db.prepare("SELECT people FROM tool_config WHERE conversation_key = ?").get(key) as { people: string }).people);
+  assert.deepEqual([people(w.gem.cfg.key), people(w.hermes.cfg.key)], [[HUMAN_ID, OTHER], [HUMAN_ID]]);
+});
+
+test("SCHEMA (#93): a buffer created before tool_config had `people` gets the column in place; its rows read as not published", () => {
+  const path = join(tempDir("schema-"), "buffer.db");
+  const old = new DatabaseSync(path);
+  old.exec("CREATE TABLE tool_config (conversation_key TEXT PRIMARY KEY, channel_id TEXT NOT NULL, bot_user_id TEXT NOT NULL, crew TEXT NOT NULL, exchange_cap INTEGER NOT NULL, updated_at INTEGER NOT NULL)");
+  old.prepare("INSERT INTO tool_config VALUES ('gem.1', '1', '2', '[]', 2, 0)").run();
+  old.close();
+  const b = openBuffer(path);
+  const row = b.db.prepare("SELECT * FROM tool_config").get() as { people: string | null };
+  assert.equal(row.people, null);
+  b.close();
+  openBuffer(path).close(); // opening again does not add it twice
 });
 
 test("TWO BOTS: a stuck Hermes batch alerts as Hermes and blocks only Hermes; Gem keeps flowing", async () => {

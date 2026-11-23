@@ -117,12 +117,149 @@ export function withoutLocalImages(text: unknown): string {
 }
 // A reply that ends with the sentinel after real text ("...the answer.\n\nNO_REPLY"): the answer is posted, the sentinel is not.
 export const withoutNoReply = (text: unknown): string => String(text ?? "").replace(/(?:^|\r?\n)[ \t]*NO_REPLY\s*$/, "");
-const splitReply = (text: unknown): string[] => {
+type CodeFence = { marker: string; reopen: string };
+const FENCE_OPEN = /^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)$/;
+// Never split a reply so a part contains only Discord mentions/whitespace (e.g. a bare bot handoff mention).
+const hasBody = (s: string): boolean => s.replace(/<@[!&]?\d+>/g, "").trim().length > 0;
+// Never cut between a UTF-16 high surrogate (0xD800..0xDBFF) and low surrogate (0xDC00..0xDFFF).
+function safeCut(s: string, idx: number): number {
+  if (idx <= 1 || idx >= s.length) return idx;
+  const prev = s.charCodeAt(idx - 1), cur = s.charCodeAt(idx);
+  return prev >= 0xd800 && prev <= 0xdbff && cur >= 0xdc00 && cur <= 0xdfff ? idx - 1 : idx;
+}
+function updateFence(line: string, open: CodeFence | null): CodeFence | null {
+  const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
+  if (!open) {
+    const m = FENCE_OPEN.exec(clean);
+    if (!m) return null;
+    const marker = m[1], info = m[2].trimEnd();
+    if (marker[0] === "`" && info.includes("`")) return null;
+    return { marker, reopen: `${marker}${info}` };
+  }
+  const ch = open.marker[0];
+  const closeRe = new RegExp(`^[ \\t]{0,3}${ch}{${open.marker.length},}[ \\t]*$`);
+  return closeRe.test(clean) ? null : open;
+}
+function fenceAtEnd(text: string, initial: CodeFence | null): CodeFence | null {
+  let open = initial;
+  for (const line of text.split("\n")) open = updateFence(line, open);
+  return open;
+}
+// Inline backtick code spans `[start, end)` on non-fenced lines within `text`, used to avoid splitting mid-span
+// when the whole span fits in the next part.
+function inlineCodeSpans(text: string, initial: CodeFence | null): [number, number][] {
+  const spans: [number, number][] = [];
+  let open = initial, offset = 0;
+  for (const line of text.split("\n")) {
+    const wasOpen = open;
+    open = updateFence(line, open);
+    if (!wasOpen && !open) {
+      let i = 0;
+      while (i < line.length) {
+        if (line[i] !== "`") { i++; continue; }
+        let run = 1;
+        while (i + run < line.length && line[i + run] === "`") run++;
+        let j = i + run, found = -1;
+        while (j < line.length) {
+          if (line[j] !== "`") { j++; continue; }
+          let closeRun = 1;
+          while (j + closeRun < line.length && line[j + closeRun] === "`") closeRun++;
+          if (closeRun === run) { found = j + closeRun; break; }
+          j += closeRun;
+        }
+        if (found !== -1) { spans.push([offset + i, offset + found]); i = found; }
+        else i += run;
+      }
+    }
+    offset += line.length + 1;
+  }
+  return spans;
+}
+function pickSplit(rest: string, limit: number, max: number, open: CodeFence | null): { cut: number; next: number } {
+  const win = rest.slice(0, limit);
+  // Prefer paragraph break outside an open fence, then line break, then space (outside fitting inline code spans), then hard cut.
+  for (let pos = win.length; pos > 0;) {
+    const para = win.lastIndexOf("\n\n", pos - 1);
+    if (para <= 0) break;
+    const head = rest.slice(0, para);
+    if (hasBody(head) && fenceAtEnd(head, open) === null) return { cut: para, next: para + 2 };
+    pos = para;
+  }
+  for (let pos = win.length; pos > 0;) {
+    const nl = win.lastIndexOf("\n", pos - 1);
+    if (nl <= 0) break;
+    const head = rest.slice(0, nl);
+    // Avoid splitting immediately after a leading opening fence line (would emit an empty code block) or leaving only mentions.
+    const onlyOpeningFence = !open && fenceAtEnd(head, null) !== null && head.lastIndexOf("\n") === -1;
+    if (!onlyOpeningFence && hasBody(head)) return { cut: nl, next: nl + 1 };
+    pos = nl;
+  }
+  const firstNl = rest.indexOf("\n");
+  const hasOpeningFence = !open && firstNl > 0 && updateFence(rest.slice(0, firstNl), null) !== null;
+  const spans = inlineCodeSpans(rest.slice(0, Math.min(rest.length, limit + max)), open);
+  for (let sp = win.lastIndexOf(" "); sp > 0; sp = win.lastIndexOf(" ", sp - 1)) {
+    if (hasOpeningFence && sp < firstNl) break;
+    if (!hasBody(rest.slice(0, sp))) break;
+    if (spans.some(([a, b]) => a < sp && sp < b && b - a <= max)) continue;
+    return { cut: sp, next: sp + 1 };
+  }
+  const hard = safeCut(rest, limit);
+  return { cut: hard, next: hard };
+}
+// Legacy fixed-offset splitter kept solely to finish partially persisted pre-upgrade replies/relays without overlap.
+function splitFixed(text: unknown, max = PART): string[] {
   const t = String(text ?? "").trim() || "(finished without a text reply)";
   const parts: string[] = [];
-  for (let i = 0; i < t.length; i += PART) parts.push(t.slice(i, i + PART));
+  for (let i = 0; i < t.length; i += max) parts.push(t.slice(i, i + max));
   return parts;
-};
+}
+// Split a Discord reply into parts of at most `max` characters (default PART = 1900, under Discord's 2000 limit).
+// Short messages stay unchanged; longer ones prefer paragraph, line, then space boundaries, preserve inline code
+// spans and UTF-16 surrogate pairs, never isolate bare mentions, and close/reopen fenced code blocks (#85).
+export function splitReply(text: unknown, max = PART): string[] {
+  const t = String(text ?? "").trim() || "(finished without a text reply)";
+  if (t.length <= max) return [t];
+  const parts: string[] = [];
+  let rest = t;
+  let open: CodeFence | null = null;
+  while (rest.length > 0) {
+    const safeOpen = open && open.marker.length * 2 + 4 < max
+      ? (open.reopen.length + open.marker.length + 3 < max ? open : { marker: open.marker, reopen: open.marker })
+      : null;
+    const prefix = safeOpen ? `${safeOpen.reopen}\n` : "";
+    if (prefix.length + rest.length <= max) {
+      parts.push(prefix + rest);
+      break;
+    }
+    let limit = Math.max(1, max - prefix.length);
+    let cut = limit, next = limit;
+    let endFence: CodeFence | null = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      ({ cut, next } = pickSplit(rest, limit, max, safeOpen));
+      endFence = fenceAtEnd(rest.slice(0, cut), safeOpen);
+      // If a split lands immediately after an opening fence line (no code lines yet), move that fence line to the next part.
+      if (endFence && safeOpen === null) {
+        const lastNl = rest.slice(0, cut).lastIndexOf("\n");
+        if (lastNl > 0 && fenceAtEnd(rest.slice(0, lastNl), null) === null && hasBody(rest.slice(0, lastNl))) {
+          cut = lastNl;
+          next = lastNl + 1;
+          endFence = null;
+        }
+      }
+      const closeLen = endFence && endFence.marker.length * 2 + 4 < max ? endFence.marker.length + 1 : 0;
+      if (prefix.length + cut + closeLen <= max) break;
+      limit = Math.max(1, max - prefix.length - closeLen);
+    }
+    const head = rest.slice(0, cut);
+    const usableEnd = endFence && endFence.marker.length * 2 + 4 < max ? endFence : null;
+    const close = usableEnd ? `\n${usableEnd.marker}` : "";
+    parts.push(prefix + head + close);
+    open = usableEnd;
+    rest = rest.slice(next);
+    if (!open && !rest.trim()) break;
+  }
+  return parts;
+}
 const byId = (a: { id: string }, b: { id: string }) => (BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0);
 const PAGE = 100;
 const DISCORD_EPOCH = 1420070400000n;
@@ -507,6 +644,31 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { limit: { id: rs.id, inclusive: rs.stage === "wrapup" } };
   }
 
+  // A Discord reply names what it answers (#86), from the local channel log only, and only when its author is one this
+  // bot listens to (its allowlisted people, its crew bots, itself) in this conversation's channel: nothing of anyone
+  // else is ever quoted, and nothing is fetched. A referenced message the log does not have gets a neutral line; a forward is not a reply.
+  // Kept in kv `replyCtx:<message id>` until the batch is built: the line goes before the message only when the message
+  // it answers is not in view, i.e. not in the same batch, not in its unread header, and not one of this bot's own posts
+  // since its previous batch (what it just wrote). Bot-to-bot replies nearly always answer something in view.
+  function replyContext(msg: DiscordMessage): { ref: string; line: string; own?: true } | null {
+    const ref = msg.message_reference;
+    if (!ref || ref.type === 1 || typeof ref.message_id !== "string" || !ref.message_id) return null;
+    const m = /^\d{1,25}$/.test(ref.message_id) ? buffer.channelMessage(ref.message_id) : undefined;
+    // the log is shared by every bot on the buffer: only an author this bot itself listens to is quoted
+    const listed = m && (m.author_id === state.botUserId || (m.author_kind === "bot" ? bots.has(m.author_id) : allowed.has(m.author_id)));
+    if (!m || m.channel_id !== channelId || !listed) return { ref: ref.message_id, line: "[replying to a message not in the local log]" };
+    return { ref: ref.message_id, line: `[replying to ${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}]`, ...(m.author_id === state.botUserId ? { own: true as const } : {}) };
+  }
+  // what the batch being built shows: the channel messages in its header, and the header marker before it (own posts after it are this bot's last turn)
+  let headerShown = new Set<string>(), headerFrom: string | null = null;
+  function withReplyContext(r: InboundRow, batchIds: Set<string>): string {
+    const k = K(`replyCtx:${r.source_message_id}`), raw = buffer.kvGet(k);
+    if (raw === null) return r.text;
+    buffer.kvDelete(k);
+    const c = JSON.parse(raw) as { ref: string; line: string; own?: true };
+    const recentOwn = c.own === true && headerFrom !== null && byId({ id: c.ref }, { id: headerFrom }) > 0;
+    return batchIds.has(c.ref) || headerShown.has(c.ref) || recentOwn ? r.text : `${c.line}\n${r.text}`;
+  }
   // Accept one Discord MESSAGE_CREATE. Returns { accepted, inserted?, reason? }.
   async function accept(msg: DiscordMessage): Promise<AcceptResult> {
     if (msg?.channel_id !== channelId) return { accepted: false, reason: "other channel" };
@@ -547,6 +709,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     for (const [i, s] of saved.entries()) if (s && "error" in s) log.emit("bridge.inbox_not_saved", { bot: name, sourceMessageId: msg.id, index: i, reason: s.error });
     const files = attachmentLines(msg.attachments, saved);
     const text = [stripped ? named : files.length ? "" : BARE_MENTION_TEXT, ...files].filter(Boolean).join("\n");
+    const reply = replyContext(msg);
+    if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
     let r: { inserted: boolean; id: number };
     if (crewBot && !talkOnly) {
@@ -557,6 +721,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${b.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
         log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: b.count, cap: exchangeCap });
         removeSaved(saved);
+        if (msg.id) buffer.kvDelete(K(`replyCtx:${msg.id}`));
         return { accepted: false, reason: "exchange cap", wake: true };
       }
       r = b;
@@ -1145,16 +1310,24 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       log.emit(target ? "bridge.reply_silent_feedback" : "bridge.reply_none", { bot: name, batchId: b.id, ...(target ? { mode: silentFeedback } : {}) });
       return true;
     }
-    const parts = splitReply(withoutNoReply(final));
+    const existing0 = buffer.outboxEntry(conversationKey, `reply:${b.id}:0`);
+    const posted = buffer.postedParts(b.id);
+    const legacySplit = (existing0 !== undefined || posted.length > 0)
+      && (existing0 ? (JSON.parse(existing0.meta) as { split?: number }).split !== 2 : true);
+    const clean = withoutNoReply(final);
+    const parts = legacySplit ? splitFixed(clean) : splitReply(clean);
     const first = buffer.inboundOf(b.id)[0];
     if (!first) throw new Error(`batch ${b.id} has no inbound rows`);
-    const done = new Set(buffer.postedParts(b.id).map((p) => p.part));
-    for (let i = 0; i < parts.length; i++) {
-      if (done.has(i) || buffer.outboxEntry(conversationKey, `reply:${b.id}:${i}`)) continue;
-      buffer.enqueue(conversationKey, { key: `reply:${b.id}:${i}`, content: parts[i], nonce: `b${b.id}p${i}`,
-        replyTo: i === 0 && first.source === "discord" ? first.source_message_id : null, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
-    }
-    cleanupBatchMeta(b);
+    const done = new Set(posted.map((p) => p.part));
+    buffer.atomically(() => {
+      for (let i = 0; i < parts.length; i++) {
+        if (done.has(i) || buffer.outboxEntry(conversationKey, `reply:${b.id}:${i}`)) continue;
+        buffer.enqueue(conversationKey, { key: `reply:${b.id}:${i}`, content: parts[i], nonce: `b${b.id}p${i}`,
+          replyTo: i === 0 && first.source === "discord" ? first.source_message_id : null, users: mentionsIn(parts[i]),
+          meta: { parts: parts.length, ...(legacySplit ? {} : { split: 2 }) } });
+      }
+      cleanupBatchMeta(b);
+    });
     return true;
   }
 
@@ -1311,10 +1484,19 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       log.emit("bridge.relay_empty", { bot: name, relayId: row.id, ordinal: c.ordinal, ...(isNoReply(final) ? { noReply: true } : {}) });
       return true;
     }
-    const parts = splitReply(text);
-    for (let i = 0; i < parts.length; i++) {
-      buffer.enqueue(conversationKey, { key: `relay:${row.id}:${i}`, content: parts[i], nonce: `r${row.id}p${i}`, users: mentionsIn(parts[i]), meta: { parts: parts.length } });
-    }
+    const existing0 = buffer.outboxEntry(conversationKey, `relay:${row.id}:0`);
+    const posted = buffer.relayPostedParts(row.id);
+    const legacySplit = (existing0 !== undefined || posted.length > 0)
+      && (existing0 ? (JSON.parse(existing0.meta) as { split?: number }).split !== 2 : true);
+    const parts = legacySplit ? splitFixed(text) : splitReply(text);
+    const done = new Set(posted);
+    buffer.atomically(() => {
+      for (let i = 0; i < parts.length; i++) {
+        if (done.has(i) || buffer.outboxEntry(conversationKey, `relay:${row.id}:${i}`)) continue;
+        buffer.enqueue(conversationKey, { key: `relay:${row.id}:${i}`, content: parts[i], nonce: `r${row.id}p${i}`,
+          users: mentionsIn(parts[i]), meta: { parts: parts.length, ...(legacySplit ? {} : { split: 2 }) } });
+      }
+    });
     return true;
   }
 
@@ -1325,9 +1507,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   const named = (text: string) => text.replace(/<@!?(\d+)>/g, (all, id: string) => (id === state.botUserId ? `@${name}` : bots.has(id) ? `@${bots.get(id)}` : all));
   function unreadHeader(rows: InboundRow[], until?: BatchLimit): string {
     const since = buffer.kvGet(K("headerSince"));
+    headerFrom = since;
     // Bounded read: at most `headerMaxMessages` lines can be shown, and lines are dropped oldest unaddressed first, then
     // oldest addressed (below), so only the newest `headerMaxMessages` of each kind can ever be shown; the rest is counted.
-    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId, until });
+    const win = buffer.channelWindow(since, { selfId: state.botUserId, excludeIds: rows.map((r) => r.source_message_id), addressedId: state.botUserId, limit: headerMaxMessages, channelId, until, authors: [...allowed].filter((a): a is string => typeof a === "string").concat([...bots.keys()]) });
     const newest = [...(win.newestId ? [win.newestId] : []), ...rows.map((r) => r.source_message_id)].sort((a, b) => byId({ id: a }, { id: b })).at(-1);
     if (newest) buffer.kvSet(K("headerSince"), newest);
     // which channel this conversation is (the Discord tool needs it on every call), then how to address the crew
@@ -1346,8 +1529,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       ? `[Discord thread: "${threadContext.threadName}" in #${threadContext.parentName} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`
       : `[Discord channel: #${channelName ?? channelId} (id ${channelId}); pass this id as \`channel\` to the Discord tools.]`,
       ...[...bots].map(([id, n]) => `[To address ${n}, write <@${id}>.]`)];
-    const toEntry = (addressed: boolean) => (m: { author_name: string; content: string }) =>
-      ({ addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
+    const toEntry = (addressed: boolean) => (m: { id: string; author_name: string; content: string }) =>
+      ({ id: m.id, addressed, line: `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), addressed ? HEADER_ADDRESSED_LINE_MAX : HEADER_LINE_MAX)}` });
     const entries = [...win.addressed.map((m) => ({ m, e: toEntry(true)(m) })), ...win.unaddressed.map((m) => ({ m, e: toEntry(false)(m) }))]
       .sort((a, b) => byId(a.m, b.m)).map((x) => x.e);
     const total = win.total;
@@ -1358,6 +1541,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       entries.splice(i >= 0 ? i : 0, 1);
     }
     const lines = entries.map((e) => e.line);
+    headerShown = new Set(entries.map((e) => e.id));
     // Crossed-message context (#87): if this bot already posted in this channel/thread *after* the oldest queued
     // Discord message in this batch, surface those newer own posts in a compact supplemental block (trimmed first
     // so incoming unread lines keep priority in headerMaxChars). Normal sequential turns see nothing added.
@@ -1534,7 +1718,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (!gateOpen()) return { phase: "catching-up" };
     const busy = isBusy(read);
     if (busy || !buffer.buffered(conversationKey, reset.limit).length) return { phase: busy ? "busy" : "idle" };
-    const b = buffer.createBatch(conversationKey, (rows) => unreadHeader(rows, reset.limit), reset.limit)!;
+    let inBatch = new Set<string>();
+    const b = buffer.createBatch(conversationKey, (rows) => { inBatch = new Set(rows.map((r) => r.source_message_id)); return unreadHeader(rows, reset.limit); }, reset.limit, (r) => withReplyContext(r, inBatch))!;
     await sendBatch(threadId, b);
     await typing();
     return { phase: "sent", batchId: b.id };

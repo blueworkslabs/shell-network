@@ -353,11 +353,14 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // newest message id after `afterId` of any author. Only these can survive a header of at most `limit` lines, so the
     // read stays bounded however long the unread log is.
     // until: only messages before (or through) a message id, so a batch cut at a `/new` shows nothing from after it.
-    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit, channelId = "", until }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number; channelId?: string; until?: BatchLimit }) {
+    // authors: when given, only messages by these ids are shown and counted (the log is shared by every bot on the
+    // buffer; each bot sees only the people and crew bots it listens to itself, #90). The marker (newestId) still covers all.
+    channelWindow(afterId: string | null, { selfId, excludeIds, addressedId, limit, channelId = "", until, authors }: { selfId: string | null; excludeIds: readonly string[]; addressedId: string | null; limit: number; channelId?: string; until?: BatchLimit; authors?: readonly string[] }) {
       if (until && !/^\d+$/.test(until.id)) throw new Error("channelWindow: until must be a Discord message id");
       const upTo = until ? ` AND (length(id) < ${until.id.length} OR (length(id) = ${until.id.length} AND id ${until.inclusive ? "<=" : "<"} '${until.id}'))` : "";
       const after = (afterId === null ? "1" : "(length(id) > length(?1) OR (length(id) = length(?1) AND id > ?1))") + upTo;
-      const base = `${after} AND channel_id = ?4 AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))`;
+      const listed = authors ? ` AND author_id IN (SELECT value FROM json_each('${JSON.stringify(authors.filter((a) => /^\d+$/.test(a)))}'))` : "";
+      const base = `${after} AND channel_id = ?4 AND author_id IS NOT ?2 AND id NOT IN (SELECT value FROM json_each(?3))${listed}`;
       const mention = "(instr(content, '<@' || ?5 || '>') > 0 OR instr(content, '<@!' || ?5 || '>') > 0)";
       const params = [afterId ?? "", selfId, JSON.stringify(excludeIds), channelId, addressedId ?? ""] as SQLInputValue[];
       type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
@@ -432,8 +435,9 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
 
     // Coalesce every buffered message of a conversation into one prepared batch (atomic). Refuses while the
     // conversation still has an unfinished batch, so batches reach t3 strictly in order. Returns null if empty.
-    // header: optional text put before the coalesced messages (the unread-channel header).
-    createBatch(conversationKey: string, header: (rows: InboundRow[]) => string = () => "", limit?: BatchLimit): (BatchRow & { inboundIds: number[] }) | null {
+    // header: optional text put before the coalesced messages (the unread-channel header); textOf: each message's text as
+    // sent (called after header, in the same transaction).
+    createBatch(conversationKey: string, header: (rows: InboundRow[]) => string = () => "", limit?: BatchLimit, textOf: (r: InboundRow) => string = (r) => r.text): (BatchRow & { inboundIds: number[] }) | null {
       return tx(() => {
         const open = all<Pick<BatchRow, "id" | "status">>(`SELECT id, status FROM batch WHERE conversation_key = ? AND ${OPEN_SQL}`, conversationKey);
         if (open.length) throw new Error(`createBatch: batch ${open[0].id} (${open[0].status}) is still open for ${conversationKey}`);
@@ -442,7 +446,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         const prefix = requestPrefix(); // before the new batch exists, so it does not count as open
         const t = now();
         const ins = db.prepare("INSERT INTO batch (conversation_key, client_request_id, text, created_at, status_since, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-          .run(conversationKey, `pending-${t}-${rows[0].id}`, header(rows) + coalesce(rows), t, t, t);
+          .run(conversationKey, `pending-${t}-${rows[0].id}`, header(rows) + coalesce(rows.map((r) => ({ ...r, text: textOf(r) }))), t, t, t);
         const id = Number(ins.lastInsertRowid);
         db.prepare("UPDATE batch SET client_request_id = ? WHERE id = ?").run(prefix ? `bridge-${conversationKey}-${prefix}-${id}` : `bridge-${conversationKey}-${id}`, id);
         const mark = db.prepare("UPDATE inbound SET state = 'batched', batch_id = ? WHERE id = ? AND state = 'buffered'");
@@ -718,6 +722,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         if (n >= parts) db.prepare("UPDATE relay SET posted_at = ? WHERE id = ? AND posted_at IS NULL").run(now(), relayId);
       });
     },
+    relayPostedParts: (relayId: number): number[] => all<{ part: number }>("SELECT part FROM relay_part WHERE relay_id = ? ORDER BY part", relayId).map((r) => r.part),
     // A channel message the bridge already recorded as one of its posts (outbox; and the pre-outbox records: reply
     // part, relay part, notice, alert or its follow-up): never evidence for a different post's recovery.
     isRecordedPost: (channelMessageId: string): boolean => one<{ n: number }>(`SELECT EXISTS (SELECT 1 FROM outbox WHERE channel_message_id = ?1) OR

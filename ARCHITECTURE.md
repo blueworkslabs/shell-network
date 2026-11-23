@@ -35,6 +35,13 @@ schema change before the trial verdict means a fresh DB.
    (no text) counts as "go on": the batch carries an explicit bridge note instead of invented text. A bot's bare
    mention is still dropped. In the text the agent reads, its own mention (user or managed role) appears as its
    name (`@Gem`), so a message that names several bots is visibly addressed to each of them (#75).
+   A Discord reply starts with what it answers, from the local channel log only (#86): `[replying to <author>: <line>]`,
+   cut and with mentions as names like a header line. Only a message of this channel by an author this bot listens to
+   (its allowlisted people, its crew bots, itself) is quoted; the log is shared by every bot on the buffer, so anything
+   else, like a message the log does not have, gets `[replying to a message not in the local log]` and is never
+   fetched or quoted. A forward is not a reply. The line is added when the batch is built, and only when the answered
+   message is out of view: not in the same batch, not in its unread header, and not one of this bot's own posts since
+   its previous batch. Bot-to-bot replies, which nearly always answer something in view, stay as they were.
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before
@@ -46,13 +53,14 @@ schema change before the trial verdict means a fresh DB.
    marker; messages that mention the bot go in whole, up to 2000 characters. The header holds at most 20 lines and
    4000 characters; under either limit, lines that don't mention the bot are dropped first (oldest first), and the
    rest keep their order. The read is bounded in SQL: only the newest 20 messages that mention the bot and the newest
-   20 that don't are loaded, plus a count for "N left out", however long the unread log is. When the bot has already
-   posted in the same channel or thread after the oldest queued Discord message in the batch (crossed messages), up to
-   5 of those own newer posts are appended in a separate informational block inside the remaining `headerMaxChars`
-   budget (incoming unread messages keep priority, and own posts are trimmed oldest-first). Un-echoed confirmed outbox
-   posts (and applied `discord_edit` updates) are merged into that read directly from `outbox` without writing them
-   early into `channel_message`, so crossed-message wakes see them immediately while `channelWindow` and `headerSince`
-   advance only on gateway-delivered messages (#87).
+   20 that don't are loaded, plus a count for "N left out", however long the unread log is. The channel log is shared by every bot
+   on the buffer, so the header shows and counts only messages by people and crew bots this bot listens to itself (#90).
+   When the bot has already posted in the same channel or thread after the oldest queued Discord message in the batch
+   (crossed messages), up to 5 of those own newer posts are appended in a separate informational block inside the
+   remaining `headerMaxChars` budget (incoming unread messages keep priority, and own posts are trimmed oldest-first).
+   Un-echoed confirmed outbox posts (and applied `discord_edit` updates) are merged into that read directly from `outbox`
+   without writing them early into `channel_message`, so crossed-message wakes see them immediately while `channelWindow`
+   and `headerSince` advance only on gateway-delivered messages (#87).
 4. **Send.** The batch is sent as `t3_thread_send` with mode `queue`. Steering is never used. The t3 adapter
    (`lib/t3.ts`) reaches MCP only through `lib/allowlist.ts`.
 5. **Reconcile** (`lib/reconcile.ts`, pure). This step compares the batch with the MCP thread read, the WS projection
@@ -215,7 +223,8 @@ the tool's sends, edits, reactions and threads.
   bot, the same content, a position after the boundary, the same reply target, and a message not already recorded for
   another entry. Nothing behind an unsettled head is posted.
 - Posts carry a nonce with `enforce_nonce`. REST runs with `retries: 0`, so there is no hidden repeat of a timed-out
-  POST. Replies are split into parts of at most 1900 characters.
+  POST. Replies longer than 1900 characters are split into parts of at most 1900 characters at paragraph, line, or
+  space boundaries, closing and reopening fenced code blocks across part boundaries (#85).
 - The default for mentions is none. Allowed bots can be pinged by name (`allowed_mentions.users`), and replied users
   are never pinged.
 - A final text of exactly `NO_REPLY` posts nothing when the run already answered through a Discord posting tool (`discord_send`, `discord_edit`, `discord_react`, `discord_thread`, verified per run from t3's activity items and the bridge outbox across any of this bot's allowed channels) or for bot-to-bot mentions, relays, `/new` wrap-ups and unmentioned batches. When a person directly mentioned the bot (user or managed role) and the run posted nothing at all before finishing with `NO_REPLY`, `BRIDGE_SILENT_FEEDBACK` makes deliberate silence visible (#82): `note` (default) replies to the triggering message with `(chose not to reply)` without pings (`allowed_mentions` empty, `replied_user: false`), `reaction` adds a second reaction (`🔇`), and `off` posts nothing; both modes go through the outbox with a fixed per-batch key so they fire at most once across restarts and do not affect the exchange cap. A final that ends with a standalone `NO_REPLY` line after real text posts the text without that control line, removed before splitting into Discord messages. Inline references to `NO_REPLY` remain unchanged. Before these checks, Markdown images of local paths (`![x](/path)`, `![x](<...>)`, `file:`) are removed from the final, since Discord cannot show them; so `NO_REPLY` plus such an image counts as `NO_REPLY` (#79). Images with an `https://` link, anything inside code (fenced or inline, any backtick run) and escaped `\![...]` stay; a final without a local image is not changed at all, and with one only the image goes (with its line, if nothing else was on it).
@@ -341,9 +350,9 @@ a timing SLA. No bridge code change was required.
 
 ## Log volume
 
-The bridge polls its thread every step. Those reads (`bridge-read`) are logged only when they fail (`call.error`) or are
-slow (`call.end` at or over 2 seconds, with its duration); a fast, successful poll writes nothing (#62). Every other MCP
-call is logged as before.
+The bridge polls its thread every step, and its queue while a batch is open. Those reads (`bridge-read`,
+`bridge-queue`) are logged only when they fail (`call.error`) or are slow (`call.end` at or over 2 seconds, with its
+duration); a fast, successful poll writes nothing (#62, #84). Every other MCP call is logged as before.
 
 ## Code layout
 

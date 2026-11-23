@@ -368,6 +368,15 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       const last = one<{ id: string }>(`SELECT id FROM channel_message WHERE ${after} AND channel_id = ?4 ORDER BY length(id) DESC, id DESC LIMIT 1`, afterId ?? "", null, null, channelId);
       return { addressed, unaddressed, total, newestId: last?.id ?? null };
     },
+    // This bot's own posts in `channelId` strictly after `afterId` (lossless snowflake comparison), newest `limit`
+    // returned oldest-first. Used to surface own posts sent after a queued message arrived (#87).
+    ownPostsAfter(afterId: string, { selfId, channelId = "", limit }: { selfId: string; channelId?: string; limit: number }) {
+      type Row = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
+      return all<Row>(
+        `SELECT * FROM channel_message WHERE ${after("id")} AND channel_id = ?4 AND author_id = ?5 ORDER BY length(id) DESC, id DESC LIMIT ?6`,
+        afterId, afterId, afterId, channelId, selfId, limit,
+      ).reverse();
+    },
 
     // limit: only messages up to a Discord message id (before it, or through it); /new uses it to hold later messages back.
     buffered(conversationKey: string, limit?: BatchLimit): InboundRow[] {

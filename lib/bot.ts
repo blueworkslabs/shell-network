@@ -47,6 +47,7 @@ export const SILENT_REACTION_EMOJI = "🔇";
 // (e.g. a handoff the exchange cap held back) get Discord's whole message length, so a resumed bot reads them in full.
 export const HEADER_LINE_MAX = 300;
 export const HEADER_ADDRESSED_LINE_MAX = 2000;
+const OWN_POSTS_MAX = 5;
 const cutLine = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars cut]` : s);
 // phase "open" carries the reconcile verdict of the oldest open batch.
 export type StepResult = { phase: "open" | "sent" | "catching-up" | "busy" | "idle" | "new" | "stop" | "closing"; batchId?: number } & Partial<Omit<Verdict, "batchId">>;
@@ -915,7 +916,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         const r = await searchOwnPost(K(`outboxSearch:${h.id}`), h.boundary!, h.content, replyTo, target, toolFiles(h).map((f) => f.name));
         if (r.status === "unknown") { log.emit("bridge.outbox_search_incomplete", { bot: name, key: h.key }); return false; }
         if (r.status === "found") {
-          buffer.outboxPosted(h.id, r.message.id, () => onPosted(h, r.message.id));
+          buffer.outboxPosted(h.id, r.message.id, () => { onPosted(h, r.message.id); recordOwnPost(h, r.message, target); });
           unstage(h);
           log.emit(postedEvent(h, true), { bot: name, key: h.key, channelMessageId: r.message.id, recovered: true });
           continue;
@@ -954,10 +955,22 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         unstage(h);
         continue;
       }
-      buffer.outboxPosted(h.id, m.id, () => onPosted(h, m.id));
+      buffer.outboxPosted(h.id, m.id, () => { onPosted(h, m.id); recordOwnPost(h, m, target); });
       unstage(h);
       log.emit(postedEvent(h, false), { bot: name, key: h.key, channelMessageId: m.id });
     }
+  }
+  // Record confirmed own sends into channel_message under their actual Discord message and channel/thread id so a
+  // crossed-message wake sees them immediately (before the gateway echo arrives); INSERT OR IGNORE deduplicates echoes
+  // without overwriting newer edits (#87).
+  function recordOwnPost(h: OutboxRow, m: DiscordMessage, target: string): void {
+    if (!state.botUserId || !m.id) return;
+    const atts = attachmentNames(m.attachments);
+    const content = String(m.content ?? h.content) + (atts.length ? ` [attachment: ${atts.join(", ")}]` : "");
+    buffer.recordChannelMessage({
+      id: m.id, authorId: state.botUserId, authorName: name, authorKind: "bot", content,
+      at: Date.parse(m.timestamp as string) || now(), channelId: m.channel_id ?? target,
+    });
   }
 
   // Discord refused the request: nothing was created (or changed). Back to pending with the refusal counted, and after
@@ -1353,9 +1366,28 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       entries.splice(i >= 0 ? i : 0, 1);
     }
     const lines = entries.map((e) => e.line);
-    if (!lines.length) return fresh + threadIntro + hint.join("\n") + "\n";
+    // Crossed-message context (#87): if this bot already posted in this channel/thread *after* the oldest queued
+    // Discord message in this batch, surface those newer own posts in a compact supplemental block (trimmed first
+    // so incoming unread lines keep priority in headerMaxChars). Normal sequential turns see nothing added.
+    let ownLines: string[] = [];
+    if (state.botUserId) {
+      const discordIds = rows.filter((r) => r.source === "discord" && /^\d+$/.test(r.source_message_id)).map((r) => r.source_message_id);
+      if (discordIds.length) {
+        const oldestBatchId = discordIds.reduce((min, id) => (BigInt(id) < BigInt(min) ? id : min));
+        const usedChars = lines.length ? lines.join("\n").length : 0;
+        const remainingChars = headerMaxChars - usedChars - (lines.length ? 1 : 0);
+        if (remainingChars > 0) {
+          ownLines = buffer.ownPostsAfter(oldestBatchId, { selfId: state.botUserId, channelId, limit: OWN_POSTS_MAX })
+            .map((m) => `${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}`);
+          while (ownLines.length && ownLines.join("\n").length > remainingChars) ownLines.shift();
+        }
+      }
+    }
+    const ownBlock = ownLines.length ? ["[Your own posts sent after the queued message(s) below:]", ...ownLines] : [];
+    if (!lines.length && !ownBlock.length) return fresh + threadIntro + hint.join("\n") + "\n";
+    if (!lines.length) return fresh + threadIntro + [...hint, ...ownBlock, "[New messages for you:]"].join("\n") + "\n";
     const left = total - lines.length;
-    return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, "[New messages for you:]"].join("\n") + "\n";
+    return fresh + threadIntro + [`[Channel since your last turn, ${lines.length} message${lines.length === 1 ? "" : "s"}, oldest first${left ? `; ${left} left out` : ""}:]`, ...lines, ...hint, ...ownBlock, "[New messages for you:]"].join("\n") + "\n";
   }
 
   async function closeStep(): Promise<StepResult> {

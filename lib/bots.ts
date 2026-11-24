@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { DEFAULT_T3_APP_LABEL } from "./stuck.ts";
 import type { ModelOptions, ModelSelection } from "./types.ts";
 
 // One conversation per bot and channel: its buffer rows, kv prefix, t3 thread, outbox and tool config.
@@ -61,10 +62,20 @@ export function bridgeConfig(env: Record<string, string | undefined>) {
   if (silent !== "note" && silent !== "reaction" && silent !== "off") {
     throw new Error("BRIDGE_SILENT_FEEDBACK: must be note, reaction or off");
   }
+  const rawAppLabel = env.BRIDGE_T3_APP_LABEL;
+  let t3AppLabel = DEFAULT_T3_APP_LABEL;
+  if (rawAppLabel !== undefined && rawAppLabel !== "") {
+    const trimmed = rawAppLabel.trim();
+    if (!trimmed || trimmed.length > 80 || /[\u0000-\u001f\u007f\u2028\u2029[\]]|<@|@(?:everyone|here)\b/i.test(trimmed)) {
+      throw new Error("BRIDGE_T3_APP_LABEL: single-line label (1–80 chars, no mentions or control chars)");
+    }
+    t3AppLabel = trimmed;
+  }
   return {
     bot: self as BotConfig,
     allowedBots: members.filter((m) => m.key !== key).map(({ id, name, instanceId }) => ({ id, name, ...(!instanceId ? { talkOnly: true } : {}) })),
     exchangeCap: Number(cap),
     silentFeedback: silent as SilentFeedback,
+    t3AppLabel,
   };
 }

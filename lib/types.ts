@@ -146,8 +146,47 @@ export interface ProjectionRun {
   userMessageId?: string | null;
   providerInstanceId?: string;
 }
+export interface ProjectionNode {
+  id: string;
+  runId?: string | null;
+  kind?: string;
+  status?: string;
+  runtimeRequestId?: string | null;
+}
+export type BlockingRequestKind =
+  | "command"
+  | "file-read"
+  | "file-change"
+  | "mcp-elicitation"
+  | "permission"
+  | "user_input";
+export interface ProjectionRuntimeRequest {
+  id: string;
+  nodeId?: string | null;
+  kind: string;
+  status: string;
+  responseCapability?: { type?: string; [k: string]: unknown } | null;
+  createdAt?: string | null;
+  blocking?: boolean;
+}
+export interface ProjectionTurnItem {
+  id?: string;
+  type: string;
+  runId?: string | null;
+  nodeId?: string | null;
+  requestId?: string | null;
+  requestKind?: string | null;
+  status?: string | null;
+  responseMode?: string | null;
+  secretStatus?: string | null;
+  linkStatus?: string | null;
+  feedbackStatus?: string | null;
+}
 export interface Projection {
   runs: ProjectionRun[];
+  nodes?: ProjectionNode[];
+  runtimeRequests?: ProjectionRuntimeRequest[];
+  turnItems?: ProjectionTurnItem[];
   [k: string]: unknown;
 }
 export interface QueueItem {

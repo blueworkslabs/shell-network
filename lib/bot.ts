@@ -27,10 +27,14 @@ import { importTranscripts } from "./transcript-import.ts";
 import { attachmentLines, attachmentNames, readStaged, removeSaved, removeStaged, saveInbound, type FetchFile, type StagedFile } from "./attachments.ts";
 import { handoffInput, type ScheduleHandoff } from "./schedule-handoff.ts";
 import { errText } from "./log.ts";
-import { DEFAULT_LIMITS_MS, clearText, stuckAlerts, type StuckLimits } from "./stuck.ts";
+import {
+  DEFAULT_LIMITS_MS, DEFAULT_PENDING_REQUEST_ALERT_MS, DEFAULT_T3_APP_LABEL,
+  clearText, findBlockingRequest, pendingRequestAlertText, pendingRequestClearText, pendingRequestStatusLine, stuckAlerts,
+  type StuckLimits,
+} from "./stuck.ts";
 import type { SilentFeedback } from "./bots.ts";
 import type { BatchLimit, Buffer } from "./buffer.ts";
-import type { BatchRow, DiscordMessage, DiscordPort, InboundRow, Log, ModelSelection, OutboxRow, Projection, QueueList, T3Port, ThreadRead, Verdict } from "./types.ts";
+import type { BatchRow, BlockingRequestKind, DiscordMessage, DiscordPort, InboundRow, Log, ModelSelection, OutboxRow, Projection, QueueList, T3Port, ThreadRead, Verdict } from "./types.ts";
 
 // wake: not accepted, but the message left work for the step loop (an exchange-cap notice to post).
 export interface AcceptResult { accepted: boolean; inserted?: boolean; reason?: string; wake?: boolean }
@@ -73,6 +77,8 @@ export interface BotOptions {
   name: string; conversationKey: string; channelId: string; channelName?: string; threadLabel?: string; botUserId: string | null; botRoleId?: string | null; allowedAuthors: string[]; projectId: string; modelSelection: ModelSelection;
   buffer: Buffer; t3: T3Port; discord: DiscordPort; log: Log; now?: () => number;
   typingEveryMs?: number; session?: () => unknown; backfillEveryMs?: number; searchPagesPerStep?: number; stuckLimits?: StuckLimits;
+  // Blocking t3 approval/input alert threshold and app location label (#108)
+  pendingRequestAlertMs?: number; t3AppLabel?: string;
   // Bot-to-bot: other crew bots this bot takes mentions from, the bot-to-bot exchange cap (0 = off) and the unread header
   allowedBots?: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap?: number; headerMaxMessages?: number; headerMaxChars?: number;
   // Visible feedback on deliberate NO_REPLY to a person's direct mention when nothing was posted (#82): note (default), reaction, or off
@@ -273,6 +279,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
+  pendingRequestAlertMs = DEFAULT_PENDING_REQUEST_ALERT_MS, t3AppLabel = DEFAULT_T3_APP_LABEL,
   allowedBots = [], exchangeCap = 2, silentFeedback = "note", headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, activeThreads, notesRoot, startedAt, version = null }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
@@ -502,6 +509,9 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     ];
     const stopLine = st ? ["/stop: stopping running turn"]
       : lastStop ? [`Last /stop: stopped at ${new Date(lastStop.at).toISOString().slice(0, 16).replace("T", " ")} UTC`] : [];
+    const activePendingReq = pendingReqState().active;
+    const pendingReqLine = activePendingReq
+      ? [`Pending request: ${pendingRequestStatusLine(activePendingReq.kind, now() - activePendingReq.since, t3AppLabel)}`] : [];
     const threads = activeThreads?.() ?? [];
     const publicThreads = threads.filter((t) => !t.isPrivate).map((t) => `"${t.name}"${t.state === "closing" ? " (closing)" : ""}`);
     const privateThreads = threads.filter((t) => t.isPrivate);
@@ -516,6 +526,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,
+      ...pendingReqLine,
       ...stopLine,
       ...(threads.length ? [`Active threads (${threads.length}): ${threadParts.join(", ")}`] : []),
       ...(pendingJobCount > 0 ? [`Warning: ${threadsWithJobs.length} closed thread${threadsWithJobs.length === 1 ? "" : "s"} still ${threadsWithJobs.length === 1 ? "has" : "have"} ${pendingJobCount} scheduled job${pendingJobCount === 1 ? "" : "s"} (archive held until moved or deleted)`] : []),
@@ -1498,15 +1509,142 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   type ThreadAlert = { seq: number; msg: string | null; clear?: { seq: number; ref: string | null } };
   const threadAlertState = (): ThreadAlert => JSON.parse(buffer.kvGet(K("threadAlert")) ?? '{"seq":0,"msg":null}') as ThreadAlert;
   const saveThreadAlert = (v: ThreadAlert) => buffer.kvSet(K("threadAlert"), JSON.stringify(v));
+  type PendingReqActive = {
+    seq: number; requestId: string; runId: string; kind: BlockingRequestKind; since: number;
+    alerted: boolean; hasBatch: boolean; batchId: number | null; batchEpisode: number | null;
+  };
+  type PendingReqAlertState = {
+    seq: number;
+    active: PendingReqActive | null;
+    batchPause: { batchId: number; episode: number; ms: number } | null;
+  };
+  const pendingReqState = (): PendingReqAlertState =>
+    JSON.parse(buffer.kvGet(K("pendingReqAlert")) ?? '{"seq":0,"active":null,"batchPause":null}') as PendingReqAlertState;
+  const savePendingReqState = (v: PendingReqAlertState) => buffer.kvSet(K("pendingReqAlert"), JSON.stringify(v));
+  // Track genuinely blocking t3 approval/input requests correlated to a live run (#108). Alerts once after
+  // `pendingRequestAlertMs`, deduplicates across restarts, withdraws unsent alerts if cleared early, and posts one
+  // reply follow-up once resolved or when the run ends. Returns true if an active blocking request is currently open.
+  function reconcilePendingRequest({ projection, read, targetRunId, batch }: {
+    projection: Projection | null; read: ThreadRead; targetRunId: string | null; batch: BatchRow | null;
+  }): { active: boolean; queued: boolean } {
+    const st = pendingReqState();
+    const runStatusOf = (runId: string): string | null =>
+      projection?.runs?.find((r) => r.id === runId)?.status
+      ?? (read.recentRuns ?? []).find((r) => r.runId === runId)?.status
+      ?? null;
+    let queued = false;
+    // Drop stale batchPause once its batch/episode is no longer open.
+    const open = buffer.openBatches(conversationKey)[0] ?? null;
+    const basePause = st.batchPause && open && st.batchPause.batchId === open.id && st.batchPause.episode === open.episode
+      ? st.batchPause : null;
+
+    if (!projection || !Array.isArray(projection.runs)) {
+      // Transient projection outage: fail conservatively, except clear if `read` already proves the alerted run ended.
+      const act = st.active;
+      const rs = act ? runStatusOf(act.runId) : null;
+      if (act && rs && TERMINAL.has(rs)) {
+        buffer.atomically(() => {
+          const alertEntry = buffer.outboxEntry(conversationKey, `preq:${act.seq}`);
+          if (act.alerted) {
+            if (alertEntry?.state === "pending" && buffer.outboxDrop(alertEntry.id)) {
+              log.emit("bridge.pending_request_alert_withdrawn", { bot: name, kind: act.kind, requestId: act.requestId, runId: act.runId });
+            } else {
+              buffer.enqueue(conversationKey, {
+                key: `pclear:${act.seq}`, nonce: `pc${act.seq}`,
+                content: pendingRequestClearText(act.kind, rs, name),
+                replyTo: refTo(alertEntry),
+              });
+              queued = true;
+              log.emit("bridge.pending_request_cleared", { bot: name, kind: act.kind, requestId: act.requestId, runId: act.runId, runStatus: rs });
+            }
+          }
+          savePendingReqState({ seq: st.seq, active: null, batchPause: basePause });
+        });
+        return { active: false, queued };
+      }
+      return { active: st.active !== null, queued: false };
+    }
+
+    const found = findBlockingRequest(projection, targetRunId);
+    let active = st.active;
+    let batchPause = basePause;
+    let changed = batchPause !== st.batchPause;
+
+    const sameActive = Boolean(active && found && active.requestId === found.requestId && active.runId === found.runId);
+    buffer.atomically(() => {
+      if (active && !sameActive) {
+        const prev = active;
+        if (prev.batchId !== null && prev.batchEpisode !== null && open && prev.batchId === open.id && prev.batchEpisode === open.episode) {
+          const added = Math.max(0, now() - Math.max(prev.since, open.status_since));
+          batchPause = { batchId: prev.batchId, episode: prev.batchEpisode, ms: (batchPause?.ms ?? 0) + added };
+        }
+        if (prev.alerted) {
+          const alertEntry = buffer.outboxEntry(conversationKey, `preq:${prev.seq}`);
+          if (alertEntry?.state === "pending" && buffer.outboxDrop(alertEntry.id)) {
+            log.emit("bridge.pending_request_alert_withdrawn", { bot: name, kind: prev.kind, requestId: prev.requestId, runId: prev.runId });
+          } else {
+            const rs = runStatusOf(prev.runId);
+            buffer.enqueue(conversationKey, {
+              key: `pclear:${prev.seq}`, nonce: `pc${prev.seq}`,
+              content: pendingRequestClearText(prev.kind, rs, name),
+              replyTo: refTo(alertEntry),
+            });
+            queued = true;
+            log.emit("bridge.pending_request_cleared", { bot: name, kind: prev.kind, requestId: prev.requestId, runId: prev.runId, runStatus: rs });
+          }
+        }
+        active = null;
+        changed = true;
+      }
+
+      if (found) {
+        if (!active) {
+          const since = found.createdAtMs !== null && found.createdAtMs <= now() ? found.createdAtMs : now();
+          st.seq += 1;
+          active = {
+            seq: st.seq, requestId: found.requestId, runId: found.runId, kind: found.kind, since,
+            alerted: false, hasBatch: batch !== null, batchId: batch?.id ?? null, batchEpisode: batch?.episode ?? null,
+          };
+          changed = true;
+        } else if (batch && (active.batchId !== batch.id || active.batchEpisode !== batch.episode || !active.hasBatch)) {
+          active = { ...active, hasBatch: true, batchId: batch.id, batchEpisode: batch.episode };
+          changed = true;
+        }
+        const ageMs = Math.max(0, now() - active.since);
+        if (!active.alerted && ageMs >= pendingRequestAlertMs) {
+          active = { ...active, alerted: true };
+          buffer.enqueue(conversationKey, {
+            key: `preq:${active.seq}`, nonce: `pa${active.seq}`,
+            content: pendingRequestAlertText(found, ageMs, name, { t3AppLabel, hasBatch: active.hasBatch }),
+          });
+          queued = true;
+          changed = true;
+          log.emit("bridge.pending_request_alert", { bot: name, kind: found.kind, requestId: found.requestId, runId: found.runId, ageMs });
+        }
+      }
+
+      if (changed) savePendingReqState({ seq: st.seq, active, batchPause });
+    });
+
+    return { active: active !== null, queued };
+  }
   const refTo = (e: OutboxRow | undefined): string | null => (e && e.state !== "dropped" ? (e.channel_message_id ?? `outbox:${e.id}`) : null);
   function alertsPass(): void {
     resetAlertPass();
+    const pr = pendingReqState();
+    const suppressSentForBatchIds = new Set<number>(pr.active?.alerted && pr.active.batchId !== null ? [pr.active.batchId] : []);
+    const pausedMsForBatch = (b: { id: number; episode: number; status_since: number }): number => {
+      let ms = pr.batchPause && pr.batchPause.batchId === b.id && pr.batchPause.episode === b.episode ? pr.batchPause.ms : 0;
+      if (pr.active && pr.active.batchId === b.id && pr.active.batchEpisode === b.episode) ms += Math.max(0, now() - Math.max(pr.active.since, b.status_since));
+      return ms;
+    };
+    const stuckOpts = { suppressSentForBatchIds, pausedMsForBatch };
     for (const r of buffer.unclearedAlerts(conversationKey)) {
       const current = r.batch_episode === r.episode;
       const queued = buffer.outboxEntry(conversationKey, `alert:${r.batch_id}:${r.episode}`);
       if (current) {
         if (r.channel_message_id === null && !queued) { // recorded, not queued yet (crash between the two)
-          const a = stuckAlerts([{ ...(buffer.batch(r.batch_id) as BatchRow), alerted_episode: null }], now(), stuckLimits, name)[0];
+          const a = stuckAlerts([{ ...(buffer.batch(r.batch_id) as BatchRow), alerted_episode: null }], now(), stuckLimits, name, stuckOpts)[0];
           buffer.enqueue(conversationKey, { key: `alert:${r.batch_id}:${r.episode}`, content: a?.text ?? `⚠️ Stuck, needs help: ${name}'s input is not delivered.`, nonce: `a${r.batch_id}e${r.episode}` });
         }
         continue; // still the alerted episode
@@ -1521,7 +1659,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       buffer.enqueue(conversationKey, { key: `clear:${r.batch_id}:${r.episode}`, content: clearText(r.batch_settled_at !== null ? "settled" : r.batch_status, name),
         nonce: `c${r.batch_id}e${r.episode}`, replyTo: r.channel_message_id ?? refTo(alert) });
     }
-    for (const a of stuckAlerts(buffer.openBatches(conversationKey), now(), stuckLimits, name)) {
+    for (const a of stuckAlerts(buffer.openBatches(conversationKey), now(), stuckLimits, name, stuckOpts)) {
       buffer.recordAlert(a.batchId, a.episode, a.status);
       buffer.enqueue(conversationKey, { key: `alert:${a.batchId}:${a.episode}`, content: a.text, nonce: `a${a.batchId}e${a.episode}` });
       log.emit("bridge.stuck_alert", { bot: name, batchId: a.batchId, episode: a.episode, status: a.status, ageMs: a.ageMs });
@@ -1755,7 +1893,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const bound = buffer.kvGet(K("threadId"));
     if (!bound) {
       const dropped = buffer.atomically(() => {
-        for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "resetAlert", "threadAlert"]) buffer.kvDelete(K(k));
+        for (const k of ["watermark", "headerSince", "threadTitle", "reset", "stop", "closeJobs", "resetAlert", "threadAlert", "pendingReqAlert"]) buffer.kvDelete(K(k));
         buffer.kvSet(K("threadClosed"), "1");
         return buffer.purgeClosedConversation(conversationKey);
       });
@@ -1862,7 +2000,11 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     let read = await t3.read(threadId);
     const stop = await stopStep(threadId, read);
     if (stop.read) read = stop.read;
-    if (stop.done) { await drain(); return stop.done; }
+    if (stop.done) {
+      if (pendingReqState().active) reconcilePendingRequest({ projection: null, read, targetRunId: null, batch: null });
+      await drain();
+      return stop.done;
+    }
     queuePending(threadId, read);
     await drain();
     const reset = await resetStep(threadId, read);
@@ -1877,6 +2019,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       try { queue = await t3.queue(threadId); } catch (e) { log.emit("bridge.queue_unavailable", { bot: name, error: errText(e) }); }
       if (b.status === "resolved" || b.status === "cancelled") {
         // ended by a decision; newer input waits until t3 is verified to hold nothing pending for it
+        const pr = reconcilePendingRequest({ projection, read, targetRunId: batchRunId(b, read) ?? null, batch: null });
+        if (pr.queued) await drain();
         const st = settlement(b, { projection, queue });
         if (st.settled) { buffer.markSettled(b.id); log.emit("bridge.settled", { bot: name, batchId: b.id, why: st.why }); }
         else if (lastVerdict.get(b.id) !== `unsettled/${st.why}`) { lastVerdict.set(b.id, `unsettled/${st.why}`); log.emit("bridge.unsettled", { bot: name, batchId: b.id, why: st.why }); }
@@ -1893,11 +2037,24 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       } else if (v.action === "resume-needed" && b.status !== "held") buffer.setStatus(b.id, "held");
       else if (b.status === "held" && (v.state === "queued" || v.state === "running")) buffer.setStatus(b.id, "sent"); // released (watchdog queue.resume)
       else if (v.action === "escalate") buffer.setStatus(b.id, "escalated", { error: `${v.state}: ${v.why ?? ""}` });
-      if (v.state === "running" || v.state === "queued") await typing();
+      const liveBatch = buffer.batch(b.id) ?? b;
+      const targetRunId = v.state === "queued" ? null : (batchRunId(liveBatch, read) ?? null);
+      const pr = reconcilePendingRequest({
+        projection, read, targetRunId,
+        batch: liveBatch.status === "sent" ? liveBatch : null,
+      });
+      if (pr.queued) await drain();
+      if ((v.state === "running" || v.state === "queued") && !pr.active) await typing();
       return { phase: "open", ...v };
     }
-    if (!gateOpen()) return { phase: "catching-up" };
     const busy = isBusy(read);
+    if (busy || pendingReqState().active !== null) {
+      let projection: Projection | null = null;
+      try { projection = await t3.projection(threadId); } catch (e) { log.emit("bridge.projection_unavailable", { bot: name, error: errText(e) }); }
+      const pr = reconcilePendingRequest({ projection, read, targetRunId: null, batch: null });
+      if (pr.queued) await drain();
+    }
+    if (!gateOpen()) return { phase: "catching-up" };
     if (busy || !buffer.buffered(conversationKey, reset.limit).length) return { phase: busy ? "busy" : "idle" };
     let inBatch = new Set<string>();
     const b = buffer.createBatch(conversationKey, (rows) => { inBatch = new Set(rows.map((r) => r.source_message_id)); return unreadHeader(rows, reset.limit); }, reset.limit, (r) => withReplyContext(r, inBatch))!;

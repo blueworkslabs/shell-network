@@ -17,6 +17,7 @@ import type { ScheduleHandoff } from "../lib/schedule-handoff.ts";
 //                            everyone else is dropped before the buffer
 //   BRIDGE_EXCHANGE_CAP      optional, bot-to-bot messages without a human message between (default 2, 0 = off)
 //   BRIDGE_SILENT_FEEDBACK   optional, deliberate NO_REPLY feedback on direct person mentions: note|reaction|off (default note)
+//   BRIDGE_T3_APP_LABEL      optional, where to direct the user when alerting on blocking t3 approvals/inputs (default "the t3 app")
 //   BRIDGE_NOTES_DIR         optional, absolute path of the bot's notes root (the Discord tool's DISCORD_TOOL_NOTES):
 //                            threads archived by /new are exported into its sessions/ (#50)
 //   BRIDGE_WORKSPACE         optional, absolute path of the agent's workspace (the Discord tool's DISCORD_TOOL_WORKSPACE):
@@ -164,7 +165,7 @@ for (const [i, channelId] of conversations.entries()) {
   if (!dm) parentChannels.set(channelId, { name: channelName, botRoleId });
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm, notesRoot, startedAt: START_MS, version: VERSION,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, dm, notesRoot, startedAt: START_MS, version: VERSION,
     ...(dm ? {} : { activeThreads: () => threads?.activeThreadsFor(channelId) ?? [] }),
     buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
@@ -189,7 +190,7 @@ threads = makeThreadManager({
       name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
       threadLabel: `${cfg.name} #${record.parentName} / ${shortName}`,
       botUserId: cfg.id, botRoleId, projectId, modelSelection,
-      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm: false, notesRoot, startedAt: START_MS, version: VERSION,
+      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, dm: false, notesRoot, startedAt: START_MS, version: VERSION,
       threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
       buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
     });

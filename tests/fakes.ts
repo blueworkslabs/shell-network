@@ -1,12 +1,12 @@
 // Offline stand-ins for t3 and Discord, with the behaviour the bridge relies on (as observed in the t3 stress test / documented by
 // Discord) and crash hooks. A "crash" closes the bridge's buffer first, so nothing the bridge does after the crash
 // point can reach durable state (like a killed process); the test then restarts on the same database file.
-import type { CreateMessagePayload, DiscordMessage, InterruptResult, ModelSelection, Projection, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead, T3Port } from "../lib/types.ts";
+import type { CreateMessagePayload, DiscordMessage, InterruptResult, ModelSelection, Projection, ProjectionNode, ProjectionRuntimeRequest, ProjectionTurnItem, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead, T3Port } from "../lib/types.ts";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "rolled_back"]);
 
 export interface FakeRun { runId: string; ordinal: number; status: string; userMessageId: string; text: string; queueHeld?: boolean; inputType?: "user_message" | "notification" }
-export interface FakeThread { id: string; projectId: string; title: string; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[]; archived?: boolean }
+export interface FakeThread { id: string; projectId: string; title: string; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[]; archived?: boolean; nodes: ProjectionNode[]; runtimeRequests: ProjectionRuntimeRequest[]; turnItems: ProjectionTurnItem[] }
 export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; launch?: "after"; interrupt?: "before" | "after"; archive?: "after"; post?: "before" | "after"; react?: "before" }
 export interface FakeCall { tool: string; title?: string; threadId?: string; runId?: string; mode?: string; clientRequestId?: string; message?: string }
 type SendArgs = { threadId: string; message: string; mode: string; clientRequestId: string };
@@ -63,7 +63,7 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
     async launch({ projectId, title, modelSelection }) {
       calls.push({ tool: "launch", title });
       const id = `thread-${++n}`;
-      threads.set(id, { id, projectId, title, modelSelection, runs: [], items: [], queue: [] });
+      threads.set(id, { id, projectId, title, modelSelection, runs: [], items: [], queue: [], nodes: [], runtimeRequests: [], turnItems: [] });
       if (crash.launch === "after") die("launch");
       return { threadId: id };
     },
@@ -79,7 +79,13 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       return { thread: { threadId, activeRunId: active?.runId ?? null, ...(t.archived ? { archived: true } : {}) }, recentRuns: t.runs.map((r) => ({ runId: r.runId, ordinal: r.ordinal, status: r.status })), items: t.items.map((i) => ({ ...i })) };
     },
     async projection(threadId) {
-      return { runs: th(threadId).runs.map((r) => ({ id: r.runId, ordinal: r.ordinal, status: r.status, queueHeld: r.queueHeld ?? false, userMessageId: r.userMessageId })) };
+      const t = th(threadId);
+      return {
+        runs: t.runs.map((r) => ({ id: r.runId, ordinal: r.ordinal, status: r.status, queueHeld: r.queueHeld ?? false, userMessageId: r.userMessageId })),
+        nodes: t.nodes.map((node) => ({ ...node })),
+        runtimeRequests: t.runtimeRequests.map((req) => ({ ...req, ...(req.responseCapability ? { responseCapability: { ...req.responseCapability } } : {}) })),
+        turnItems: t.turnItems.map((it) => ({ ...it })),
+      };
     },
     async queue(threadId) {
       return { items: th(threadId).queue.map((q) => ({ ...q })) };

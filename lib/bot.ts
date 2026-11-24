@@ -732,17 +732,20 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const confirmedEdit = self
       ? buffer.latestPostedEdit(conversationKey, msg.id)
       : crewBot ? buffer.latestConfirmedEditByAuthor(authorId, channelId, msg.id) : null;
-    const prev = trailingForwardLog(existing.content);
+    const storedFwd = existing.forward_quote;
+    const existingHead = storedFwd && existing.content.endsWith(storedFwd)
+      ? existing.content.slice(0, -storedFwd.length).trimEnd()
+      : existing.content;
     const attSuffix = Array.isArray(msg.attachments)
       ? (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : "")
-      : (prev.head.match(/ \[attachment: [^\]]+\]$/)?.[0] ?? "");
+      : (existingHead.match(/ \[attachment: [^\]]+\]$/)?.[0] ?? "");
     const baseText = confirmedEdit ?? msg.content;
     const baseWithAtt = baseText + (attSuffix && !baseText.endsWith(attSuffix) ? attSuffix : "");
     const authorName = crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user";
     const fwd = forwardedLines(msg, authorName);
-    const fwdText = fwd ? fwd.logText : (msg.message_snapshots === undefined ? prev.fwd : "");
-    const content = fwdText && !baseWithAtt.endsWith(fwdText) ? [baseWithAtt.trim(), fwdText].filter(Boolean).join(" ") : baseWithAtt;
-    return buffer.updateChannelMessage(msg.id, channelId, authorId, content, editedAt);
+    const nextFwd = fwd ? fwd.logText : (msg.message_snapshots === undefined ? storedFwd : null);
+    const content = nextFwd ? [baseWithAtt.trim(), nextFwd].filter(Boolean).join(" ") : baseWithAtt;
+    return buffer.updateChannelMessage(msg.id, channelId, authorId, content, editedAt, nextFwd);
   }
   // Sync a Discord MESSAGE_DELETE / MESSAGE_DELETE_BULK into channel_message (#100). Log-only: removes matching row
   // from this channel without touching human_message cap boundaries or accepted inbound rows.
@@ -757,17 +760,6 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // for live pings.
   const FORWARD_MAX = 4000;
   const defangMentions = (s: string) => s.replace(/<@([!&]?)(\d+)>/g, (_, p: string, id: string) => (p === "&" ? `@role:${id}` : `@${id}`));
-  function trailingForwardLog(s: string): { head: string; fwd: string } {
-    const marker = "[forwarded by ";
-    for (let idx = s.lastIndexOf(marker); idx >= 0; idx = idx > 0 ? s.lastIndexOf(marker, idx - 1) : -1) {
-      if (idx > 0 && s[idx - 1] !== " ") continue;
-      const tail = s.slice(idx);
-      if (/^\[forwarded by [^[\]\r\n]+ \(quoted material, original author unknown\): .+\]$/.test(tail)) {
-        return { head: s.slice(0, idx).trimEnd(), fwd: tail };
-      }
-    }
-    return { head: s, fwd: "" };
-  }
   function forwardedLines(msg: DiscordMessage, senderName: string): { logText: string; inboundLines: string[] } | null {
     if (msg.message_reference?.type !== 1) return null;
     const snaps = Array.isArray(msg.message_snapshots) ? msg.message_snapshots.slice(0, 5) : [];
@@ -812,7 +804,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const content = fwd ? [baseContent.trim(), fwd.logText].filter(Boolean).join(" ") : baseContent;
       const editedAt = parseTimestampUs(msg.edited_timestamp);
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName, authorKind: fromBot ? "bot" : "human",
-        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly, editedAt });
+        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly, editedAt, forwardQuote: fwd?.logText ?? null });
       // If a peer bridge already logged the pre-edit echo into the shared channel_message table, repair it with our latest confirmed edit.
       if (edited !== null) buffer.editChannelMessage(msg.id, authorId, content);
       else if (editedAt !== null) onMessageUpdate(msg);

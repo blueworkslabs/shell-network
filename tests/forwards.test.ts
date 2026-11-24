@@ -218,4 +218,22 @@ test("FORWARDS (#101): snapshot attachment filenames defang mentions and caption
     afterEdit2,
     "final caption [attachment: outer.png] [forwarded by user1 (quoted material, original author unknown): quoted body [attachment: @333333333333333333.png, @444444444444444444-doc.txt]]",
   );
+
+  // Control: a plain (non-forward) message whose text ends with `[forwarded by ...]` must NOT retain that text after an edit!
+  w.advance(1000);
+  const plainLookalike = w.discord.userSays(
+    "note [forwarded by user1 (quoted material, original author unknown): lookalike text]",
+    { channel: CH, mention: false },
+  );
+  await w.bot.accept(plainLookalike);
+  assert.equal(w.buffer.channelMessage(plainLookalike.id)?.forward_quote, null, "plain message has no stored forward_quote");
+  const editedPlain = w.bot.onMessageUpdate({
+    id: plainLookalike.id,
+    channel_id: CH,
+    author: plainLookalike.author,
+    content: "replaced plain text",
+    edited_timestamp: new Date(1_792_900_020_000).toISOString(),
+  });
+  assert.equal(editedPlain, true);
+  assert.equal(w.buffer.channelMessage(plainLookalike.id)?.content, "replaced plain text", "editing a plain message drops lookalike [forwarded by ...] text");
 });

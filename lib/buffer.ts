@@ -91,7 +91,8 @@ CREATE TABLE IF NOT EXISTS channel_message (      -- what allowed authors and th
   content           TEXT NOT NULL,
   at                INTEGER NOT NULL,
   channel_id        TEXT NOT NULL DEFAULT '',
-  edited_at         INTEGER                       -- last applied Discord edit timestamp in microseconds (#100); NULL = unedited
+  edited_at         INTEGER,                      -- last applied Discord edit timestamp in microseconds (#100); NULL = unedited
+  forward_quote     TEXT                          -- stored forwarded snapshot log quote (#101); NULL for non-forwards
 );
 CREATE TABLE IF NOT EXISTS relay (                -- completion relay: runs no batch started (Monitor/background
   id                INTEGER PRIMARY KEY AUTOINCREMENT, -- wakes, scheduled tasks) whose final text goes to the channel
@@ -227,6 +228,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     if (!tcCols.has("channel_meta")) db.exec("ALTER TABLE tool_config ADD COLUMN channel_meta TEXT");
     const cmCols = new Set((db.prepare("PRAGMA table_info(channel_message)").all() as { name: string }[]).map((c) => c.name));
     if (!cmCols.has("edited_at")) db.exec("ALTER TABLE channel_message ADD COLUMN edited_at INTEGER");
+    if (!cmCols.has("forward_quote")) db.exec("ALTER TABLE channel_message ADD COLUMN forward_quote TEXT");
     db.exec(`PRAGMA user_version = ${BUFFER_SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (e) {
@@ -350,13 +352,13 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // Channel log for the unread header: only what the bridge was allowed to read (allowlisted authors, bots).
     // Respects deletion tombstones (`del:<channelId>:<id>` in kv) so a delayed MESSAGE_CREATE or backfill cannot
     // restore a message that was already deleted (#100).
-    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number; channelId?: string; resetsCap?: boolean; editedAt?: number | null }): void {
+    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number; channelId?: string; resetsCap?: boolean; editedAt?: number | null; forwardQuote?: string | null }): void {
       const ch = m.channelId ?? "";
       tx(() => {
         const deleted = one<{ v: number }>("SELECT 1 AS v FROM kv WHERE key = ?", `del:${ch}:${m.id}`) !== undefined;
         if (!deleted) {
-          db.prepare("INSERT OR IGNORE INTO channel_message (id, author_id, author_name, author_kind, content, at, channel_id, edited_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-            .run(m.id, m.authorId, m.authorName, m.authorKind, m.content, m.at, ch, m.editedAt ?? null);
+          db.prepare("INSERT OR IGNORE INTO channel_message (id, author_id, author_name, author_kind, content, at, channel_id, edited_at, forward_quote) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .run(m.id, m.authorId, m.authorName, m.authorKind, m.content, m.at, ch, m.editedAt ?? null, m.forwardQuote ?? null);
         }
         // Talk-only members reset episodes without losing their bot identity in the channel log.
         if (m.authorKind === "human" || m.resetsCap) db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(m.id, ch);
@@ -749,9 +751,12 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     editChannelMessage: (id: string, authorId: string, content: string): void => { db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND author_id = ?").run(content, id, authorId); },
     // Sync a gateway MESSAGE_UPDATE into an existing channel_message row (same id, channel, author); never inserts
     // and rejects older/stale edits whose timestamp is <= the last applied edited_at (#100).
-    updateChannelMessage: (id: string, channelId: string, authorId: string, content: string, editedAt: number): boolean =>
-      db.prepare("UPDATE channel_message SET content = ?, edited_at = ? WHERE id = ? AND channel_id = ? AND author_id = ? AND (edited_at IS NULL OR edited_at < ?)")
-        .run(content, editedAt, id, channelId, authorId, editedAt).changes === 1,
+    updateChannelMessage: (id: string, channelId: string, authorId: string, content: string, editedAt: number, forwardQuote?: string | null): boolean =>
+      forwardQuote !== undefined
+        ? db.prepare("UPDATE channel_message SET content = ?, edited_at = ?, forward_quote = ? WHERE id = ? AND channel_id = ? AND author_id = ? AND (edited_at IS NULL OR edited_at < ?)")
+            .run(content, editedAt, forwardQuote, id, channelId, authorId, editedAt).changes === 1
+        : db.prepare("UPDATE channel_message SET content = ?, edited_at = ? WHERE id = ? AND channel_id = ? AND author_id = ? AND (edited_at IS NULL OR edited_at < ?)")
+            .run(content, editedAt, id, channelId, authorId, editedAt).changes === 1,
     // Sync a gateway MESSAGE_DELETE / MESSAGE_DELETE_BULK into channel_message (never touches human_message or inbound);
     // records a bounded deletion tombstone so delayed creates/backfill cannot restore it, and marks any confirmed
     // outbox post for that message deleted so #87 ownPostsAfter() stops surfacing it (#100).
@@ -772,7 +777,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       one<{ v: number }>("SELECT 1 AS v FROM kv WHERE key = ?", `del:${channelId}:${id}`) !== undefined,
     hasInbound: (source: string, sourceMessageId: string, conversationKey: string): boolean =>
       one<{ id: number }>("SELECT id FROM inbound WHERE source = ? AND source_message_id = ? AND conversation_key = ?", source, sourceMessageId, conversationKey) !== undefined,
-    channelMessage: (id: string): { id: string; author_id: string; author_name: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_name, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
+    channelMessage: (id: string): { id: string; author_id: string; author_name: string; author_kind: string; content: string; channel_id: string; forward_quote: string | null } | undefined => one("SELECT id, author_id, author_name, author_kind, content, channel_id, forward_quote FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).
     relayOf: (conversationKey: string, runId: string): RelayRow | undefined => one<RelayRow>("SELECT * FROM relay WHERE conversation_key = ? AND run_id = ?", conversationKey, runId),

@@ -1178,19 +1178,68 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     log.emit("bridge.tool_edited", { bot: name, key: h.key, messageId, ...(h.state === "posting" ? { recovered: true } : {}) });
     return true;
   }
-  function staleAlert(h: OutboxRow): boolean {
+  let verifiedPendingReqSeq: number | null = null;
+  async function staleAlert(h: OutboxRow): Promise<boolean> {
     const [kind, a, b] = h.key.split(":");
     if (kind === "alert") {
       const batch = buffer.batch(Number(a));
       if (batch && batch.episode === Number(b)) return false;
       buffer.atomically(() => { if (buffer.outboxDrop(h.id)) buffer.markAlertWithdrawn(Number(a), Number(b)); });
-    } else if (kind === "talert") {
+      log.emit("bridge.stuck_alert_withdrawn", { bot: name, key: h.key });
+      return true;
+    }
+    if (kind === "talert") {
       const st = threadAlertState();
       if (buffer.kvGet(K("threadEscalated")) && st.seq === Number(a)) return false;
       buffer.atomically(() => { if (buffer.outboxDrop(h.id) && st.seq === Number(a) && st.msg === "") saveThreadAlert({ seq: st.seq + 1, msg: null, ...(st.clear ? { clear: st.clear } : {}) }); });
-    } else return false;
-    log.emit("bridge.stuck_alert_withdrawn", { bot: name, key: h.key, ...(kind === "talert" ? { thread: true } : {}) });
-    return true;
+      log.emit("bridge.stuck_alert_withdrawn", { bot: name, key: h.key, thread: true });
+      return true;
+    }
+    if (kind === "preq") {
+      const seq = Number(a);
+      const st = pendingReqState();
+      if (!st.active || st.active.seq !== seq) {
+        buffer.outboxDrop(h.id);
+        log.emit("bridge.pending_request_alert_withdrawn", { bot: name, key: h.key });
+        return true;
+      }
+      if (verifiedPendingReqSeq === seq) return false;
+      const bound = buffer.kvGet(K("threadId"));
+      let projection: Projection | null = null;
+      if (bound) {
+        try { projection = await t3.projection(bound); } catch (e) { log.emit("bridge.projection_unavailable", { bot: name, error: errText(e) }); }
+      }
+      if (bound && !projection) {
+        // Projection temporarily unreachable: drop the unverified alert and reset `alerted` so ordinary outbox
+        // traffic still drains; reconcilePendingRequest will re-alert if the request is still blocking once readable.
+        buffer.atomically(() => {
+          if (buffer.outboxDrop(h.id) && st.active?.seq === seq) {
+            const nextSeq = st.seq + 1;
+            savePendingReqState({ ...st, seq: nextSeq, active: { ...st.active, seq: nextSeq, alerted: false } });
+          }
+        });
+        log.emit("bridge.pending_request_alert_withdrawn", { bot: name, key: h.key, reason: "projection unavailable" });
+        return true;
+      }
+      const found = bound ? findBlockingRequest(projection, st.active.runId) : null;
+      if (found && found.requestId === st.active.requestId && found.runId === st.active.runId) {
+        verifiedPendingReqSeq = seq;
+        return false;
+      }
+      const open = buffer.openBatches(conversationKey)[0] ?? null;
+      const prev = st.active;
+      buffer.atomically(() => {
+        if (!buffer.outboxDrop(h.id)) return;
+        let batchPause = st.batchPause && open && st.batchPause.batchId === open.id && st.batchPause.episode === open.episode ? st.batchPause : null;
+        if (prev.batchId !== null && prev.batchEpisode !== null && open && prev.batchId === open.id && prev.batchEpisode === open.episode) {
+          batchPause = { batchId: prev.batchId, episode: prev.batchEpisode, ms: (batchPause?.ms ?? 0) + Math.max(0, now() - Math.max(prev.since, open.status_since)) };
+        }
+        savePendingReqState({ seq: st.seq, active: null, batchPause });
+      });
+      log.emit("bridge.pending_request_alert_withdrawn", { bot: name, key: h.key, kind: prev.kind, requestId: prev.requestId, runId: prev.runId });
+      return true;
+    }
+    return false;
   }
   // A bridge-owned silent-feedback reaction (#82): PUT is idempotent, so recovery repeats it; 404 drops it,
   // and repeated 4xx refusals drop it after REFUSE_LIMIT without stalling the outbox.
@@ -1248,9 +1297,9 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const boundary = await channelEnd(K(`outboxEnd:${h.id}`), target === channelId ? lastPostedId() : buffer.lastOutboxPost(conversationKey, target) ?? target, target);
       if (boundary === null) return false;
       // A pending alert is checked again right before its POST, after the boundary read: if its
-      // episode or escalation ended while it waited behind an older head, it is withdrawn (with its alert record, in
-      // one transaction), never posted.
-      if (staleAlert(h)) continue;
+      // episode, escalation, or blocking pending request ended while it waited (or across a restart), it is withdrawn
+      // never posted.
+      if (await staleAlert(h)) continue;
       if (tool) { const why = toolRejected(h); if (why) { rejectTool(h, why); continue; } }
       // the files of a tool post, validated again against the staging directory right before they go out
       let upload: { name: string; data: Uint8Array }[] = [];
@@ -1613,6 +1662,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
         const ageMs = Math.max(0, now() - active.since);
         if (!active.alerted && ageMs >= pendingRequestAlertMs) {
           active = { ...active, alerted: true };
+          verifiedPendingReqSeq = active.seq;
           buffer.enqueue(conversationKey, {
             key: `preq:${active.seq}`, nonce: `pa${active.seq}`,
             content: pendingRequestAlertText(found, ageMs, name, { t3AppLabel, hasBatch: active.hasBatch }),
@@ -1986,6 +2036,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // the thread is idle and the catch-up gate is open) send the next coalesced batch. Returns a summary for log/tests.
   async function step(): Promise<StepResult> {
     if (buffer.kvGet(K("threadClosing")) === "1") return closeStep();
+    verifiedPendingReqSeq = null;
     // The outbox head first: whatever an earlier step left unsettled is settled before this bot writes anything else.
     // While the head stays unsettled no message goes out, but everything else goes on.
     let draining = await drainOutbox();

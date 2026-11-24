@@ -320,8 +320,10 @@ a timing SLA. No bridge code change was required.
   never trigger alerts. After 90 s (within 1–2 min), the bridge posts one deduplicated alert naming the bot, the
   request type (e.g. shell command approval, file-change approval, user input), and where to answer (configurable via
   `BRIDGE_T3_APP_LABEL`, default `the t3 app`), pauses the 30-min `sent` timer while waiting, surfaces active waits in
-  `/status`, withdraws unsent alerts if resolved early, and posts one reply follow-up once resolved or when the run
-  ends. The bridge never auto-approves, interrupts, or replays on its own.
+  `/status`, withdraws unsent alerts if resolved early (revalidating any queued `preq:` alert against the current t3
+  projection before dispatch so a restart after an offline resolution never posts a stale alert or clear while ordinary
+  outbox traffic still drains), and posts one reply follow-up once resolved or when the run ends. The bridge never
+  auto-approves, interrupts, or replays on its own.
 - **Watchdog**: findings need the same condition in two snapshots at least 60 s apart.
   - Held queue: `queue.resume`, up to 3 times, 2 min apart, then a notice.
   - Every action is recorded before it is taken.

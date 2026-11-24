@@ -323,3 +323,64 @@ test("CONFIG (#108): BRIDGE_T3_APP_LABEL defaults cleanly and rejects unsafe val
   assert.throws(() => bridgeConfig({ BRIDGE_CREW_FILE: crewFile, BRIDGE_BOT: "codex", BRIDGE_T3_APP_LABEL: "@everyone" }), /BRIDGE_T3_APP_LABEL/);
   assert.throws(() => bridgeConfig({ BRIDGE_CREW_FILE: crewFile, BRIDGE_BOT: "codex", BRIDGE_T3_APP_LABEL: "x".repeat(81) }), /BRIDGE_T3_APP_LABEL/);
 });
+
+test("PENDING APPROVAL (#108): unsent queued alert is revalidated after restart; if resolved while down, neither alert nor clear posts and ordinary outbox traffic drains", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("check PR"));
+  await w.step();
+  const tid = w.thread();
+  const runId = w.lastRun();
+  const th = w.t3.threads.get(tid)!;
+
+  // Blocking approval sits past threshold while Discord POST crashes before sending the alert
+  th.runs[0].status = "waiting";
+  th.nodes.push({ id: "node:r1", runId, kind: "approval_request", status: "waiting" });
+  th.runtimeRequests.push({ id: "req-r1", nodeId: "node:r1", kind: "command", status: "pending", responseCapability: { type: "live" }, createdAt: new Date(w.now()).toISOString() });
+  await w.step();
+  w.tick(DEFAULT_PENDING_REQUEST_ALERT_MS);
+  // Queue an ordinary outbox post behind the alert once the alert is queued, and simulate crash before Discord POST
+  w.discord.crash.buffer = w.buffer;
+  w.discord.crash.post = "before";
+  await assert.rejects(w.step(), /CRASH at post/);
+  assert.equal(w.alerts().length, 0, "control: crash happened before Discord received the alert");
+
+  // Bridge restarts with the unsent `preq:1` still in the outbox (pending after recovery) + ordinary outbox traffic queued behind it
+  w.restart();
+  w.bot.initWatermark(w.now() - 60_000);
+  const preq = w.buffer.outboxEntry(KEY, "preq:1");
+  assert.ok(preq && preq.state !== "posted", "control: preq:1 is unsettled in outbox across restart");
+  w.buffer.enqueue(KEY, { key: "notice:ordinary-1", content: "ordinary outbox message", nonce: "ord1" });
+
+  // User resolves the approval while the bridge was down (before the first step after restart)
+  th.runtimeRequests[0].status = "resolved";
+  th.nodes[0].status = "completed";
+  th.runs[0].status = "running";
+
+  await w.step();
+  assert.equal(w.alerts().length, 0, "stale approval alert is withdrawn before dispatch, never posted");
+  assert.equal(w.clears().length, 0, "no follow-up clear for an alert that was never posted");
+  assert.ok(w.discord.botPosts().some((m) => m.content === "ordinary outbox message"), "ordinary outbox traffic still drains cleanly");
+  assert.equal(w.buffer.outboxEntry(KEY, "preq:1")?.state, "dropped");
+
+  // Control: if a queued unsent alert is STILL blocking after restart, revalidation lets it post normally
+  th.runs[0].status = "waiting";
+  th.nodes.push({ id: "node:r2", runId, kind: "approval_request", status: "waiting" });
+  th.runtimeRequests.push({ id: "req-r2", nodeId: "node:r2", kind: "permission", status: "pending", responseCapability: { type: "live" }, createdAt: new Date(w.now()).toISOString() });
+  await w.step();
+  w.tick(DEFAULT_PENDING_REQUEST_ALERT_MS);
+  w.discord.crash.buffer = w.buffer;
+  w.discord.crash.post = "before";
+  await assert.rejects(w.step(), /CRASH at post/);
+  w.restart();
+  w.bot.initWatermark(w.now() - 60_000);
+  await w.step();
+  assert.equal(w.alerts().length, 1, "still-blocking approval alert posts after restart revalidation");
+  assert.match(w.alerts()[0].content, /permission approval/);
+
+  // Also test pending-state preq queued directly (without crash/posting transition) + ordinary traffic behind it
+  w.buffer.enqueue(KEY, { key: "preq:99", content: "stale unlinked alert", nonce: "pa99" });
+  w.buffer.enqueue(KEY, { key: "notice:ordinary-2", content: "ordinary outbox message 2", nonce: "ord2" });
+  await w.step();
+  assert.equal(w.buffer.outboxEntry(KEY, "preq:99")?.state, "dropped", "orphaned preq alert is withdrawn");
+  assert.ok(w.discord.botPosts().some((m) => m.content === "ordinary outbox message 2"), "ordinary traffic behind orphaned alert drains");
+});

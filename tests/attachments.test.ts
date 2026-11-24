@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, truncate
 import { dirname, join } from "node:path";
 import { type Buffer } from "../lib/buffer.ts";
 import { makeBot } from "../lib/bot.ts";
-import { ATTACH_MAX_BYTES, INBOX_KEEP_MS, attachmentLines, safeName, sweepInbox, sweepStaging, type FetchFile } from "../lib/attachments.ts";
+import { ATTACH_MAX_BYTES, INBOX_KEEP_MS, TEXT_ATTACH_MAX_BYTES, attachmentLines, safeName, sweepInbox, sweepStaging, type FetchFile } from "../lib/attachments.ts";
 import { memoryLog } from "../lib/log.ts";
 import { openToolDb } from "../lib/tooldb.ts";
 import { makeTools, ToolError } from "../lib/tools.ts";
@@ -161,8 +161,97 @@ test("INBOUND IMAGES not saved: not an image, too big (declared or while streami
   assert.match(lines[3], /gone\.png .* not saved: download failed \(HTTP 404\)\]$/);
   assert.match(lines[4], /offline\.png .* not saved: download failed\]$/);
   assert.match(lines[6], /b\.png \(image\/jpeg, 44 B\) .* saved: .*-6-b\.jpg\]$/);
-  assert.match(lines[9], /e\.png .* not saved: more than 4 images\]$/);
+  assert.match(lines[9], /e\.png .* not saved: more than 4 files\]$/);
   assert.equal(readdirSync(w.inbox).length, 4, "only the four real images, no partial files");
+});
+
+// ---------- inbound text attachments (#102) ----------
+const txtAtt = (id: string, filename: string, content_type?: string, size = 32) => ({ id, filename, ...(content_type !== undefined ? { content_type } : {}), size, url: `${CDN}/${filename}?ex=1&hm=2` });
+
+test("INBOUND TEXT (#102): saves small UTF-8 text/code/config attachments always as .txt, deduplicates on repeat accept, and skips non-text binaries", async () => {
+  const tsBody = Buffer.from("export const ok = true; // ✓\n", "utf8");
+  const jsonBody = Buffer.from('{"a": 1}\n', "utf8");
+  const logBody = Buffer.from("2026-11-24 INFO started\n", "utf8");
+  const msgTxt = Buffer.from("pasted long message\n", "utf8");
+  const cdn = fakeCdn({
+    [`${CDN}/script.ts`]: tsBody,
+    [`${CDN}/config.json`]: jsonBody,
+    [`${CDN}/run.log`]: logBody,
+    [`${CDN}/message.txt`]: msgTxt,
+    [`${CDN}/archive.zip`]: Buffer.from("PK\x03\x04binary"),
+  });
+  const w = world({ fetchFile: cdn.fetchFile });
+  const m = w.discord.userSays("check these files", { attachments: [
+    txtAtt("1", "script.ts", "application/octet-stream", tsBody.length),
+    txtAtt("2", "config.json", "application/json; charset=utf-8", jsonBody.length),
+    txtAtt("3", "run.log", undefined, logBody.length),
+    txtAtt("4", "message.txt", "text/plain; charset=utf-8", msgTxt.length),
+    txtAtt("5", "archive.zip", "application/octet-stream", 10),
+    txtAtt("6", "spoof.txt", "application/pdf\nevil", 10),
+  ] });
+  await w.bot.accept(m);
+  await w.steps(1);
+  const text = w.sentText();
+  const savedNames = readdirSync(w.inbox).sort();
+  assert.deepEqual(savedNames, [
+    `${m.id}-0-script.txt`,
+    `${m.id}-1-config.txt`,
+    `${m.id}-2-run.txt`,
+    `${m.id}-3-message.txt`,
+  ], "every text/code/config attachment is saved with a .txt extension");
+  assert.deepEqual(readFileSync(join(w.inbox, `${m.id}-0-script.txt`)), tsBody);
+  assert.deepEqual(readFileSync(join(w.inbox, `${m.id}-1-config.txt`)), jsonBody);
+  assert.deepEqual(readFileSync(join(w.inbox, `${m.id}-2-run.txt`)), logBody);
+  assert.deepEqual(readFileSync(join(w.inbox, `${m.id}-3-message.txt`)), msgTxt);
+  assert.ok(text.includes(`[attachment: script.ts (text/plain, ${tsBody.length} B) ${CDN}/script.ts?ex=1&hm=2 saved: ${join(w.inbox, `${m.id}-0-script.txt`)}]`), text);
+  assert.ok(text.includes(`[attachment: config.json (text/plain, ${jsonBody.length} B) ${CDN}/config.json?ex=1&hm=2 saved: ${join(w.inbox, `${m.id}-1-config.txt`)}]`), text);
+  assert.match(text, /\[attachment: archive\.zip \(application\/octet-stream, 10 B\) \S+\]$/m, "non-text octet-stream keeps plain line");
+  assert.match(text, /\[attachment: spoof\.txt \(unknown type, 10 B\) \S+\]$/m, "malformed content_type is never downloaded as text");
+  assert.deepEqual(cdn.calls, ["script.ts", "config.json", "run.log", "message.txt"], "archive.zip and spoof.txt were not downloaded");
+  await w.bot.accept(m);
+  assert.deepEqual(cdn.calls, ["script.ts", "config.json", "run.log", "message.txt"], "repeat accept reuses saved .txt files without re-downloading");
+});
+
+test("INBOUND TEXT (#102) rejected: NUL bytes, invalid UTF-8, oversized (declared or streaming), and 5th file across mixed image+text", async () => {
+  let pulled = 0;
+  const bigText = () => new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(64 * 1024).fill(0x61)); } });
+  const cdn = fakeCdn({
+    [`${CDN}/nul.txt`]: Buffer.from([0x68, 0x69, 0x00, 0x21]),
+    [`${CDN}/badutf8.md`]: Buffer.from([0x68, 0x69, 0xff, 0xfe]),
+    [`${CDN}/stream.log`]: bigText,
+    [`${CDN}/a.png`]: PNG,
+    [`${CDN}/b.txt`]: Buffer.from("ok b"),
+    [`${CDN}/c.json`]: Buffer.from("{}"),
+    [`${CDN}/d.diff`]: Buffer.from("--- a\n+++ b\n"),
+    [`${CDN}/e.txt`]: Buffer.from("fifth"),
+  });
+  const w = world({ fetchFile: cdn.fetchFile });
+  const m = w.discord.userSays("mixed", { attachments: [
+    txtAtt("1", "nul.txt", "text/plain", 4),
+    txtAtt("2", "badutf8.md", "text/markdown", 4),
+    txtAtt("3", "declared.txt", "text/plain; charset=utf-8", TEXT_ATTACH_MAX_BYTES + 1),
+    txtAtt("4", "stream.log", "text/plain", 10),
+    img("5", "a.png"),
+    txtAtt("6", "b.txt", "text/plain", 4),
+    txtAtt("7", "c.json", "application/json", 2),
+    txtAtt("8", "d.diff", "text/x-diff", 12),
+    txtAtt("9", "e.txt", "text/plain", 5),
+  ] });
+  await w.bot.accept(m);
+  await w.steps(1);
+  const lines = w.sentText().split("\n").filter((l) => l.startsWith("[attachment:"));
+  assert.match(lines[0], /nul\.txt .* not saved: not valid UTF-8 text\]$/);
+  assert.match(lines[1], /badutf8\.md .* not saved: not valid UTF-8 text\]$/);
+  assert.match(lines[2], /declared\.txt \(text\/plain, 256 KB\) .* not saved: too big\]$/);
+  assert.ok(!cdn.calls.includes("declared.txt"), "declared oversized text is not fetched");
+  assert.match(lines[3], /stream\.log .* not saved: too big\]$/);
+  assert.ok(pulled < 16, `oversized text stream stopped early (${pulled} chunks read)`);
+  assert.match(lines[4], /a\.png \(image\/png, 48 B\) .* saved: .*-4-a\.png\]$/);
+  assert.match(lines[5], /b\.txt \(text\/plain, 4 B\) .* saved: .*-5-b\.txt\]$/);
+  assert.match(lines[6], /c\.json \(text\/plain, 2 B\) .* saved: .*-6-c\.txt\]$/);
+  assert.match(lines[7], /d\.diff \(text\/plain, 12 B\) .* saved: .*-7-d\.txt\]$/);
+  assert.match(lines[8], /e\.txt .* not saved: more than 4 files\]$/);
+  assert.equal(readdirSync(w.inbox).length, 4, "4 valid mixed files saved, no partial files");
 });
 
 test("INBOUND IMAGES: an inbox that is a symlink is refused; without an inbox nothing is downloaded", async () => {
@@ -209,12 +298,12 @@ test("INBOUND IMAGES: a message counts as waiting until its batch is delivered",
 
 test("INBOX SWEEP: saved images older than seven days and stale partial writes are removed; recent, still waiting and foreign files stay; a symlinked inbox is left alone", () => {
   const dir = tempDir("inbox-"), t = 1_792_500_000_000;
-  const files: [string, number][] = [["1792-0-old.png", INBOX_KEEP_MS + 1], ["1792-1-new.jpg", INBOX_KEEP_MS - 60_000], [".1792-2-x.png.0123456789ab.part", 2 * 3_600_000],
+  const files: [string, number][] = [["1792-0-old.png", INBOX_KEEP_MS + 1], ["1792-4-old.txt", INBOX_KEEP_MS + 1], ["1792-1-new.jpg", INBOX_KEEP_MS - 60_000], ["1792-5-new.txt", INBOX_KEEP_MS - 60_000], [".1792-2-x.png.0123456789ab.part", 2 * 3_600_000],
     [".1792-3-y.png.0123456789ab.part", 60_000], ["notes.md", INBOX_KEEP_MS * 2]];
   for (const [n, age] of files) { writeFileSync(join(dir, n), "x"); utimesSync(join(dir, n), (t - age) / 1000, (t - age) / 1000); }
   writeFileSync(join(dir, "1793-0-waiting.png"), "x"); utimesSync(join(dir, "1793-0-waiting.png"), (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);
-  assert.equal(sweepInbox({ inboxDir: dir, inUse: (id) => id === "1793", now: () => t }), 2);
-  assert.deepEqual(readdirSync(dir).sort(), [".1792-3-y.png.0123456789ab.part", "1792-1-new.jpg", "1793-0-waiting.png", "notes.md"], "a waiting message keeps its image");
+  assert.equal(sweepInbox({ inboxDir: dir, inUse: (id) => id === "1793", now: () => t }), 3);
+  assert.deepEqual(readdirSync(dir).sort(), [".1792-3-y.png.0123456789ab.part", "1792-1-new.jpg", "1792-5-new.txt", "1793-0-waiting.png", "notes.md"], "a waiting message keeps its file and recent .txt stays while old .txt is swept");
   const target = join(tempDir("inbox-target-"), "keep.png");
   writeFileSync(target, "x"); utimesSync(target, (t - INBOX_KEEP_MS * 2) / 1000, (t - INBOX_KEEP_MS * 2) / 1000);
   symlinkSync(target, join(dir, "1794-0-link.png"));

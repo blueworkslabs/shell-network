@@ -702,13 +702,24 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const recentOwn = c.own === true && headerFrom !== null && byId({ id: c.ref }, { id: headerFrom }) > 0;
     return batchIds.has(c.ref) || headerShown.has(c.ref) || recentOwn ? r.text : `${c.line}\n${r.text}`;
   }
+  // Parse a Discord ISO-8601 timestamp into integer microseconds so out-of-order MESSAGE_UPDATE events (even within
+  // the same millisecond) can be compared losslessly (#100). Returns null if malformed.
+  function parseTimestampUs(ts: unknown): number | null {
+    if (typeof ts !== "string" || !ts) return null;
+    const ms = Date.parse(ts);
+    if (!Number.isFinite(ms)) return null;
+    const frac = /\.(\d{4,6})/.exec(ts);
+    const sub = frac ? Number(frac[1].slice(3).padEnd(3, "0")) : 0;
+    return ms * 1000 + sub;
+  }
   // Sync a Discord MESSAGE_UPDATE into an existing channel_message row (#100). Log-only: never starts a turn, never
-  // inserts new rows, ignores embed/link-preview-only updates (no edited_timestamp or no content), respects this bot's
-  // allowlist, and never regresses a newer confirmed discord_edit.
+  // inserts new rows, ignores embed/link-preview-only updates (no valid edited_timestamp or no content), rejects older
+  // edits via persisted edited_at, respects this bot's allowlist, and never regresses a newer confirmed discord_edit.
   function onMessageUpdate(msg: DiscordMessage): boolean {
     if (msg?.channel_id !== channelId || buffer.kvGet(K("threadClosing"))) return false;
     if (typeof msg.id !== "string" || !/^\d{1,25}$/.test(msg.id)) return false;
-    if (typeof msg.edited_timestamp !== "string" || !msg.edited_timestamp || typeof msg.content !== "string") return false;
+    const editedAt = parseTimestampUs(msg.edited_timestamp);
+    if (editedAt === null || typeof msg.content !== "string") return false;
     const authorId = msg.author?.id;
     if (typeof authorId !== "string" || !authorId) return false;
     const fromBot = Boolean(msg.author?.bot);
@@ -726,7 +737,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       : (existing.content.match(/ \[attachment: [^\]]+\]$/)?.[0] ?? "");
     const baseText = confirmedEdit ?? msg.content;
     const content = baseText + (attSuffix && !baseText.endsWith(attSuffix) ? attSuffix : "");
-    return buffer.updateChannelMessage(msg.id, channelId, authorId, content);
+    return buffer.updateChannelMessage(msg.id, channelId, authorId, content, editedAt);
   }
   // Sync a Discord MESSAGE_DELETE / MESSAGE_DELETE_BULK into channel_message (#100). Log-only: removes matching row
   // from this channel without touching human_message cap boundaries or accepted inbound rows.
@@ -747,10 +758,12 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
       const edited = self ? buffer.latestPostedEdit(conversationKey, msg.id) : null;
       const content = (edited ?? String(msg.content ?? "")) + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : "");
+      const editedAt = parseTimestampUs(msg.edited_timestamp);
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly, editedAt });
       // If a peer bridge already logged the pre-edit echo into the shared channel_message table, repair it with our latest confirmed edit.
       if (edited !== null) buffer.editChannelMessage(msg.id, authorId, content);
+      else if (editedAt !== null) onMessageUpdate(msg);
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };

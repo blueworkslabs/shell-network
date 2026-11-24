@@ -207,3 +207,70 @@ test("EDITS & DELETES (#100): delayed MESSAGE_UPDATE of an earlier discord_edit 
   await threads.onDispatch("MESSAGE_DELETE", { id: m1.id, channel_id: TH });
   assert.equal(w.buffer.channelMessage(m1.id), undefined);
 });
+
+test("EDITS & DELETES (#100) ordering: older MESSAGE_UPDATE never overwrites a newer edit, and a delayed MESSAGE_CREATE or backfill never restores a deleted message", async () => {
+  const w = world();
+  await w.bot.accept(w.discord.userSays("start"));
+  await w.steps(1);
+  w.finish("ok");
+  await w.steps(2);
+
+  // 1) Out-of-order edits: newer edit (T2) applied first, then older edit (T1) arrives (same or microsecond earlier) -> rejected!
+  w.advance(1000);
+  const m = w.discord.userSays("v0", { mention: false });
+  await w.dispatch("MESSAGE_CREATE", m);
+  assert.equal(
+    w.bot.onMessageUpdate({ ...m, content: "v2 newer", edited_timestamp: "2026-11-24T15:02:00.500200+00:00" }),
+    true,
+  );
+  assert.equal(w.buffer.channelMessage(m.id)?.content, "v2 newer");
+
+  // Older edit (T1 < T2, both seconds earlier and sub-ms earlier) MUST be rejected
+  assert.equal(
+    w.bot.onMessageUpdate({ ...m, content: "v1 older", edited_timestamp: "2026-11-24T15:01:00.000000+00:00" }),
+    false,
+    "older edit is rejected",
+  );
+  assert.equal(
+    w.bot.onMessageUpdate({ ...m, content: "v1b sub-ms older", edited_timestamp: "2026-11-24T15:02:00.500100+00:00" }),
+    false,
+    "sub-millisecond older edit is rejected",
+  );
+  // Same timestamp is a no-op
+  assert.equal(
+    w.bot.onMessageUpdate({ ...m, content: "v2 dup", edited_timestamp: "2026-11-24T15:02:00.500200+00:00" }),
+    false,
+    "duplicate timestamp does not overwrite",
+  );
+  assert.equal(w.buffer.channelMessage(m.id)?.content, "v2 newer");
+
+  // Even newer edit (T3 > T2) IS applied
+  assert.equal(
+    w.bot.onMessageUpdate({ ...m, content: "v3 newest", edited_timestamp: "2026-11-24T15:02:00.500300+00:00" }),
+    true,
+  );
+  assert.equal(w.buffer.channelMessage(m.id)?.content, "v3 newest");
+
+  // 2) Delayed MESSAGE_CREATE after MESSAGE_DELETE must NOT restore deleted text (both pre-existing and delete-before-create orders!)
+  w.advance(1000);
+  const delBeforeCreate = w.discord.userSays("deleted before create arrived", { mention: false });
+  await w.dispatch("MESSAGE_DELETE", { id: delBeforeCreate.id, channel_id: CH });
+  // Delayed MESSAGE_CREATE arrives afterwards -> must NOT insert into channel_message!
+  await w.dispatch("MESSAGE_CREATE", delBeforeCreate);
+  assert.equal(w.buffer.channelMessage(delBeforeCreate.id), undefined, "delayed create after delete cannot restore row");
+
+  // Also test create -> delete -> late duplicate create / peer echo -> stays deleted!
+  w.advance(1000);
+  const delAfterCreate = w.discord.userSays("created then deleted then echoed", { mention: false });
+  await w.dispatch("MESSAGE_CREATE", delAfterCreate);
+  assert.ok(w.buffer.channelMessage(delAfterCreate.id));
+  await w.dispatch("MESSAGE_DELETE", { id: delAfterCreate.id, channel_id: CH });
+  assert.equal(w.buffer.channelMessage(delAfterCreate.id), undefined);
+  await w.dispatch("MESSAGE_CREATE", delAfterCreate);
+  assert.equal(w.buffer.channelMessage(delAfterCreate.id), undefined, "late echo after delete cannot restore row");
+
+  // Tombstone prunes after 7-day retention window
+  w.advance(8 * 24 * 3600_000);
+  await w.dispatch("MESSAGE_CREATE", w.discord.userSays("prune trigger", { mention: false }));
+  assert.equal(w.buffer.kvGet(`del:${CH}:${delBeforeCreate.id}`), null, "expired deletion tombstone is pruned");
+});

@@ -308,7 +308,22 @@ a timing SLA. No bridge code change was required.
 
 - **Stuck alerts** (`lib/stuck.ts`): a batch that stays open past its limit gets one "⚠️ Stuck" post per status
   episode. The limits are: prepared 2 min, send-failed 5 min, held 5 min, sent 30 min, escalated at once. When the
-  episode ends, one follow-up is posted. Alert texts name the agent only: no ids, paths or raw errors.
+  episode ends, one follow-up is posted. Alert texts name the agent only: no ids, paths or raw errors. Active work
+  (`sent` batches already received by t3) is phrased distinctly (`turn is still in progress`) from genuinely
+  undelivered input (`prepared`, `send-failed`, `held`, `escalated`, `resolved`/`cancelled`).
+- **Blocking pending requests** (`lib/stuck.ts`, #108): while a live run is active (open batch or background/scheduled
+  turn), the bridge inspects `orchestration.getThreadProjection` (`runtimeRequests`, `nodes`, `turnItems`, `runs`) for
+  genuinely blocking pending requests (`status === "pending"`, `responseCapability.type === "live"`, excluding internal
+  `auth_refresh`/`dynamic_tool_call`, non-blocking `responseMode === "message"` questions, and non-blocking cards such
+  as `secret_request`/`link_request`/`feedback_request`). Each request must correlate strictly to a live non-queued,
+  non-terminal run (`node.runId`/`turnItem.runId`); stale requests from ended runs and `run.status === "waiting"` alone
+  never trigger alerts. After 90 s (within 1–2 min), the bridge posts one deduplicated alert naming the bot, the
+  request type (e.g. shell command approval, file-change approval, user input), and where to answer (configurable via
+  `BRIDGE_T3_APP_LABEL`, default `the t3 app`), pauses the 30-min `sent` timer while waiting, surfaces active waits in
+  `/status`, withdraws unsent alerts if resolved early (revalidating any queued `preq:` alert against the current t3
+  projection before dispatch so a restart after an offline resolution never posts a stale alert or clear while ordinary
+  outbox traffic still drains), and posts one reply follow-up once resolved or when the run ends. The bridge never
+  auto-approves, interrupts, or replays on its own.
 - **Watchdog**: findings need the same condition in two snapshots at least 60 s apart.
   - Held queue: `queue.resume`, up to 3 times, 2 min apart, then a notice.
   - Every action is recorded before it is taken.

@@ -190,6 +190,7 @@ export interface DiscordMessage {
   timestamp?: string;
   edited_timestamp?: string | null;
   message_reference?: { message_id?: string; channel_id?: string; type?: number }; // type 1: a forward, not a reply
+  message_snapshots?: { message?: { content?: string; attachments?: { id?: string; filename?: string; content_type?: string; size?: number; url?: string }[] } }[];
   attachments?: { id?: string; filename?: string; content_type?: string; size?: number; url?: string }[];
 }
 export interface CreateMessagePayload {

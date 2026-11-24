@@ -28,6 +28,8 @@ export interface ThreadRecord {
 }
 export interface ThreadBot extends CommandBot {
   accept(msg: DiscordMessage): Promise<AcceptResult>;
+  onMessageUpdate?(msg: DiscordMessage): boolean;
+  onMessageDelete?(id: string): boolean;
   initWatermark(startMs: number, marginMs?: number): string;
   initWatermarkAt(watermarkId: string): string;
   step(): Promise<StepResult>;
@@ -377,6 +379,15 @@ export function makeThreadManager({
     }
     if (type === "MESSAGE_CREATE" && typeof d?.channel_id === "string" && !parentChannels.has(d.channel_id) && d?.guild_id) {
       return handleMessage(d as DiscordMessage);
+    }
+    if ((type === "MESSAGE_UPDATE" || type === "MESSAGE_DELETE" || type === "MESSAGE_DELETE_BULK") && typeof d?.channel_id === "string" && !parentChannels.has(d.channel_id)) {
+      if (pendingRestore.has(d.channel_id) || recordOf(d.channel_id)?.state !== "active") return undefined;
+      const bot = bots.get(d.channel_id);
+      if (!bot) return undefined;
+      if (type === "MESSAGE_UPDATE") bot.onMessageUpdate?.(d as DiscordMessage);
+      else if (type === "MESSAGE_DELETE" && typeof d?.id === "string") bot.onMessageDelete?.(d.id);
+      else if (type === "MESSAGE_DELETE_BULK" && Array.isArray(d?.ids)) { for (const id of d.ids) if (typeof id === "string") bot.onMessageDelete?.(id); }
+      return undefined;
     }
     return undefined;
   }

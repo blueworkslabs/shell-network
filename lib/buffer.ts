@@ -386,6 +386,20 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       );
       return row?.content ?? null;
     },
+    // Latest confirmed discord_edit text for a message authored by any bridge bot sharing this buffer DB (#100),
+    // preventing a delayed MESSAGE_UPDATE of an earlier edit from overwriting a newer confirmed edit.
+    latestConfirmedEditByAuthor(authorId: string, channelId: string, messageId: string): string | null {
+      const row = one<{ content: string }>(
+        `SELECT o.content FROM outbox o
+         JOIN tool_config tc ON tc.conversation_key = o.conversation_key
+         WHERE tc.bot_user_id = ? AND tc.channel_id = ?
+           AND substr(o.key, 1, 5) = 'edit:' AND o.state = 'posted' AND o.boundary = ?
+           AND COALESCE(json_extract(o.meta, '$.confirmed'), 0) = 1
+         ORDER BY o.id DESC LIMIT 1`,
+        authorId, channelId, messageId,
+      );
+      return row?.content ?? null;
+    },
     // This bot's own posts in `channelId` strictly after `afterId` (lossless snowflake comparison), newest `limit`
     // returned oldest-first. Merges gateway-echoed rows in `channel_message` with confirmed `outbox` posts for
     // `conversationKey` targeting `channelId` (without writing un-echoed posts into `channel_message`, so `headerSince`
@@ -414,6 +428,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
            WHERE conversation_key = ? AND state = 'posted' AND channel_message_id IS NOT NULL
              AND ${after("channel_message_id")}
              AND NOT (substr(key, 1, 5) = 'tool:' AND COALESCE(json_extract(meta, '$.thread'), 0) = 1)
+             AND COALESCE(json_extract(meta, '$.deleted'), 0) = 0
            ORDER BY length(channel_message_id) DESC, channel_message_id DESC LIMIT ?`,
           conversationKey, afterId, afterId, afterId, limit,
         )) {
@@ -719,6 +734,20 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // A message of the channel log (allowlisted people, allowed crew bots, this bot): tool targets must be one.
     // An edit of the bot's own post (discord_edit), applied: the channel log shows the new text.
     editChannelMessage: (id: string, authorId: string, content: string): void => { db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND author_id = ?").run(content, id, authorId); },
+    // Sync a gateway MESSAGE_UPDATE into an existing channel_message row (same id, channel, author); never inserts (#100).
+    updateChannelMessage: (id: string, channelId: string, authorId: string, content: string): boolean =>
+      db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND channel_id = ? AND author_id = ?").run(content, id, channelId, authorId).changes === 1,
+    // Sync a gateway MESSAGE_DELETE / MESSAGE_DELETE_BULK into channel_message (never touches human_message or inbound);
+    // also marks any confirmed outbox post for that message deleted so #87 ownPostsAfter() stops surfacing it (#100).
+    deleteChannelMessage(id: string, channelId: string): boolean {
+      return tx(() => {
+        const removed = db.prepare("DELETE FROM channel_message WHERE id = ? AND channel_id = ?").run(id, channelId).changes === 1;
+        db.prepare(
+          "UPDATE outbox SET meta = json_set(meta, '$.deleted', 1) WHERE channel_message_id = ? AND state = 'posted' AND (conversation_key LIKE '%.' || ? OR json_extract(meta, '$.channel') = ?)",
+        ).run(id, channelId, channelId);
+        return removed;
+      });
+    },
     channelMessage: (id: string): { id: string; author_id: string; author_name: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_name, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).

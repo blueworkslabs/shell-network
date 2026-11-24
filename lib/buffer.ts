@@ -16,6 +16,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import type { AcceptInput, ActionRow, AlertRow, BatchRow, BatchStatus, InboundRow, NoticeRow, OutboxRow, RelayRow, ReplyRow, SendResult } from "./types.ts";
 
 const CHANNEL_LOG_KEEP_MS = 7 * 24 * 3600_000; // channel log retention (unread header, tool reads)
+const DELETED_MARKER_MAX = 5000;               // upper bound on deletion tombstones in kv (also pruned after 7 days)
 // Schema version (PRAGMA user_version), set by openBuffer. Openers that must not create the schema (the Discord
 // tool, lib/tooldb.ts) refuse any other version. Raise it with every schema change.
 export const BUFFER_SCHEMA_VERSION = 2;
@@ -89,7 +90,8 @@ CREATE TABLE IF NOT EXISTS channel_message (      -- what allowed authors and th
   author_kind       TEXT NOT NULL,                -- 'human' | 'bot'
   content           TEXT NOT NULL,
   at                INTEGER NOT NULL,
-  channel_id        TEXT NOT NULL DEFAULT ''
+  channel_id        TEXT NOT NULL DEFAULT '',
+  edited_at         INTEGER                       -- last applied Discord edit timestamp in microseconds (#100); NULL = unedited
 );
 CREATE TABLE IF NOT EXISTS relay (                -- completion relay: runs no batch started (Monitor/background
   id                INTEGER PRIMARY KEY AUTOINCREMENT, -- wakes, scheduled tasks) whose final text goes to the channel
@@ -219,10 +221,12 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
   db.exec("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;");
   try {
     db.exec(SCHEMA);
-    // added after the table existed (#93, #98): a DB created before gets the columns in place
+    // added after the tables existed (#93, #98, #100): a DB created before gets the columns in place
     const tcCols = new Set((db.prepare("PRAGMA table_info(tool_config)").all() as { name: string }[]).map((c) => c.name));
     if (!tcCols.has("people")) db.exec("ALTER TABLE tool_config ADD COLUMN people TEXT");
     if (!tcCols.has("channel_meta")) db.exec("ALTER TABLE tool_config ADD COLUMN channel_meta TEXT");
+    const cmCols = new Set((db.prepare("PRAGMA table_info(channel_message)").all() as { name: string }[]).map((c) => c.name));
+    if (!cmCols.has("edited_at")) db.exec("ALTER TABLE channel_message ADD COLUMN edited_at INTEGER");
     db.exec(`PRAGMA user_version = ${BUFFER_SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (e) {
@@ -344,12 +348,21 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     },
 
     // Channel log for the unread header: only what the bridge was allowed to read (allowlisted authors, bots).
-    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number; channelId?: string; resetsCap?: boolean }): void {
+    // Respects deletion tombstones (`del:<channelId>:<id>` in kv) so a delayed MESSAGE_CREATE or backfill cannot
+    // restore a message that was already deleted (#100).
+    recordChannelMessage(m: { id: string; authorId: string; authorName: string; authorKind: "human" | "bot"; content: string; at: number; channelId?: string; resetsCap?: boolean; editedAt?: number | null }): void {
+      const ch = m.channelId ?? "";
       tx(() => {
-        db.prepare("INSERT OR IGNORE INTO channel_message (id, author_id, author_name, author_kind, content, at, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?)").run(m.id, m.authorId, m.authorName, m.authorKind, m.content, m.at, m.channelId ?? "");
+        const deleted = one<{ v: number }>("SELECT 1 AS v FROM kv WHERE key = ?", `del:${ch}:${m.id}`) !== undefined;
+        if (!deleted) {
+          db.prepare("INSERT OR IGNORE INTO channel_message (id, author_id, author_name, author_kind, content, at, channel_id, edited_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+            .run(m.id, m.authorId, m.authorName, m.authorKind, m.content, m.at, ch, m.editedAt ?? null);
+        }
         // Talk-only members reset episodes without losing their bot identity in the channel log.
-        if (m.authorKind === "human" || m.resetsCap) db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(m.id, m.channelId ?? "");
-        db.prepare("DELETE FROM channel_message WHERE at < ?").run(now() - CHANNEL_LOG_KEEP_MS); // the header needs recent turns only
+        if (m.authorKind === "human" || m.resetsCap) db.prepare("INSERT OR IGNORE INTO human_message (id, channel_id) VALUES (?, ?)").run(m.id, ch);
+        const cutoff = now() - CHANNEL_LOG_KEEP_MS;
+        db.prepare("DELETE FROM channel_message WHERE at < ?").run(cutoff); // the header needs recent turns only
+        db.prepare("DELETE FROM kv WHERE key >= 'del:' AND key < 'del;' AND CAST(value AS INTEGER) < ?").run(cutoff);
       });
     },
 
@@ -386,6 +399,20 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       );
       return row?.content ?? null;
     },
+    // Latest confirmed discord_edit text for a message authored by any bridge bot sharing this buffer DB (#100),
+    // preventing a delayed MESSAGE_UPDATE of an earlier edit from overwriting a newer confirmed edit.
+    latestConfirmedEditByAuthor(authorId: string, channelId: string, messageId: string): string | null {
+      const row = one<{ content: string }>(
+        `SELECT o.content FROM outbox o
+         JOIN tool_config tc ON tc.conversation_key = o.conversation_key
+         WHERE tc.bot_user_id = ? AND tc.channel_id = ?
+           AND substr(o.key, 1, 5) = 'edit:' AND o.state = 'posted' AND o.boundary = ?
+           AND COALESCE(json_extract(o.meta, '$.confirmed'), 0) = 1
+         ORDER BY o.id DESC LIMIT 1`,
+        authorId, channelId, messageId,
+      );
+      return row?.content ?? null;
+    },
     // This bot's own posts in `channelId` strictly after `afterId` (lossless snowflake comparison), newest `limit`
     // returned oldest-first. Merges gateway-echoed rows in `channel_message` with confirmed `outbox` posts for
     // `conversationKey` targeting `channelId` (without writing un-echoed posts into `channel_message`, so `headerSince`
@@ -414,6 +441,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
            WHERE conversation_key = ? AND state = 'posted' AND channel_message_id IS NOT NULL
              AND ${after("channel_message_id")}
              AND NOT (substr(key, 1, 5) = 'tool:' AND COALESCE(json_extract(meta, '$.thread'), 0) = 1)
+             AND COALESCE(json_extract(meta, '$.deleted'), 0) = 0
            ORDER BY length(channel_message_id) DESC, channel_message_id DESC LIMIT ?`,
           conversationKey, afterId, afterId, afterId, limit,
         )) {
@@ -719,6 +747,31 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     // A message of the channel log (allowlisted people, allowed crew bots, this bot): tool targets must be one.
     // An edit of the bot's own post (discord_edit), applied: the channel log shows the new text.
     editChannelMessage: (id: string, authorId: string, content: string): void => { db.prepare("UPDATE channel_message SET content = ? WHERE id = ? AND author_id = ?").run(content, id, authorId); },
+    // Sync a gateway MESSAGE_UPDATE into an existing channel_message row (same id, channel, author); never inserts
+    // and rejects older/stale edits whose timestamp is <= the last applied edited_at (#100).
+    updateChannelMessage: (id: string, channelId: string, authorId: string, content: string, editedAt: number): boolean =>
+      db.prepare("UPDATE channel_message SET content = ?, edited_at = ? WHERE id = ? AND channel_id = ? AND author_id = ? AND (edited_at IS NULL OR edited_at < ?)")
+        .run(content, editedAt, id, channelId, authorId, editedAt).changes === 1,
+    // Sync a gateway MESSAGE_DELETE / MESSAGE_DELETE_BULK into channel_message (never touches human_message or inbound);
+    // records a bounded deletion tombstone so delayed creates/backfill cannot restore it, and marks any confirmed
+    // outbox post for that message deleted so #87 ownPostsAfter() stops surfacing it (#100).
+    deleteChannelMessage(id: string, channelId: string): boolean {
+      return tx(() => {
+        const removed = db.prepare("DELETE FROM channel_message WHERE id = ? AND channel_id = ?").run(id, channelId).changes === 1;
+        const t = now();
+        db.prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)").run(`del:${channelId}:${id}`, String(t));
+        db.prepare("DELETE FROM kv WHERE key >= 'del:' AND key < 'del;' AND CAST(value AS INTEGER) < ?").run(t - CHANNEL_LOG_KEEP_MS);
+        db.prepare("DELETE FROM kv WHERE key IN (SELECT key FROM kv WHERE key >= 'del:' AND key < 'del;' ORDER BY CAST(value AS INTEGER) DESC, key DESC LIMIT -1 OFFSET ?)").run(DELETED_MARKER_MAX);
+        db.prepare(
+          "UPDATE outbox SET meta = json_set(meta, '$.deleted', 1) WHERE channel_message_id = ? AND state = 'posted' AND (conversation_key LIKE '%.' || ? OR json_extract(meta, '$.channel') = ?)",
+        ).run(id, channelId, channelId);
+        return removed;
+      });
+    },
+    isDeletedChannelMessage: (id: string, channelId: string): boolean =>
+      one<{ v: number }>("SELECT 1 AS v FROM kv WHERE key = ?", `del:${channelId}:${id}`) !== undefined,
+    hasInbound: (source: string, sourceMessageId: string, conversationKey: string): boolean =>
+      one<{ id: number }>("SELECT id FROM inbound WHERE source = ? AND source_message_id = ? AND conversation_key = ?", source, sourceMessageId, conversationKey) !== undefined,
     channelMessage: (id: string): { id: string; author_id: string; author_name: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_name, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).

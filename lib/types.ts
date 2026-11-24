@@ -188,6 +188,7 @@ export interface DiscordMessage {
   mentions?: { id: string }[];
   mention_roles?: string[];
   timestamp?: string;
+  edited_timestamp?: string | null;
   message_reference?: { message_id?: string; channel_id?: string; type?: number }; // type 1: a forward, not a reply
   attachments?: { id?: string; filename?: string; content_type?: string; size?: number; url?: string }[];
 }

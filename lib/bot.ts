@@ -678,14 +678,17 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   // Kept in kv `replyCtx:<message id>` until the batch is built: the line goes before the message only when the message
   // it answers is not in view, i.e. not in the same batch, not in its unread header, and not one of this bot's own posts
   // since its previous batch (what it just wrote). Bot-to-bot replies nearly always answer something in view.
+  function replyQuote(refId: string): { ref: string; line: string; own?: true } {
+    const m = /^\d{1,25}$/.test(refId) ? buffer.channelMessage(refId) : undefined;
+    // the log is shared by every bot on the buffer: only an author this bot itself listens to is quoted
+    const listed = m && (m.author_id === state.botUserId || (m.author_kind === "bot" ? bots.has(m.author_id) : allowed.has(m.author_id)));
+    if (!m || m.channel_id !== channelId || !listed) return { ref: refId, line: "[replying to a message not in the local log]" };
+    return { ref: refId, line: `[replying to ${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}]`, ...(m.author_id === state.botUserId ? { own: true as const } : {}) };
+  }
   function replyContext(msg: DiscordMessage): { ref: string; line: string; own?: true } | null {
     const ref = msg.message_reference;
     if (!ref || ref.type === 1 || typeof ref.message_id !== "string" || !ref.message_id) return null;
-    const m = /^\d{1,25}$/.test(ref.message_id) ? buffer.channelMessage(ref.message_id) : undefined;
-    // the log is shared by every bot on the buffer: only an author this bot itself listens to is quoted
-    const listed = m && (m.author_id === state.botUserId || (m.author_kind === "bot" ? bots.has(m.author_id) : allowed.has(m.author_id)));
-    if (!m || m.channel_id !== channelId || !listed) return { ref: ref.message_id, line: "[replying to a message not in the local log]" };
-    return { ref: ref.message_id, line: `[replying to ${m.author_name}: ${cutLine(named(m.content).replace(/\s+/g, " ").trim(), HEADER_LINE_MAX)}]`, ...(m.author_id === state.botUserId ? { own: true as const } : {}) };
+    return replyQuote(ref.message_id);
   }
   // what the batch being built shows: the channel messages in its header, and the header marker before it (own posts after it are this bot's last turn)
   let headerShown = new Set<string>(), headerFrom: string | null = null;
@@ -693,9 +696,54 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const k = K(`replyCtx:${r.source_message_id}`), raw = buffer.kvGet(k);
     if (raw === null) return r.text;
     buffer.kvDelete(k);
-    const c = JSON.parse(raw) as { ref: string; line: string; own?: true };
+    const saved = JSON.parse(raw) as { ref: string; line: string; own?: true };
+    // Re-read from channel_message at batch-build time so edits/deletes arriving while queued are reflected (#100).
+    const c = replyQuote(saved.ref);
     const recentOwn = c.own === true && headerFrom !== null && byId({ id: c.ref }, { id: headerFrom }) > 0;
     return batchIds.has(c.ref) || headerShown.has(c.ref) || recentOwn ? r.text : `${c.line}\n${r.text}`;
+  }
+  // Parse a Discord ISO-8601 timestamp into integer microseconds so out-of-order MESSAGE_UPDATE events (even within
+  // the same millisecond) can be compared losslessly (#100). Returns null if malformed.
+  function parseTimestampUs(ts: unknown): number | null {
+    if (typeof ts !== "string" || !ts) return null;
+    const ms = Date.parse(ts);
+    if (!Number.isFinite(ms)) return null;
+    const frac = /\.(\d{4,6})/.exec(ts);
+    const sub = frac ? Number(frac[1].slice(3).padEnd(3, "0")) : 0;
+    return ms * 1000 + sub;
+  }
+  // Sync a Discord MESSAGE_UPDATE into an existing channel_message row (#100). Log-only: never starts a turn, never
+  // inserts new rows, ignores embed/link-preview-only updates (no valid edited_timestamp or no content), rejects older
+  // edits via persisted edited_at, respects this bot's allowlist, and never regresses a newer confirmed discord_edit.
+  function onMessageUpdate(msg: DiscordMessage): boolean {
+    if (msg?.channel_id !== channelId || buffer.kvGet(K("threadClosing"))) return false;
+    if (typeof msg.id !== "string" || !/^\d{1,25}$/.test(msg.id)) return false;
+    const editedAt = parseTimestampUs(msg.edited_timestamp);
+    if (editedAt === null || typeof msg.content !== "string") return false;
+    const authorId = msg.author?.id;
+    if (typeof authorId !== "string" || !authorId) return false;
+    const fromBot = Boolean(msg.author?.bot);
+    const self = fromBot && authorId === state.botUserId;
+    const crewBot = fromBot && bots.has(authorId);
+    const allowedHuman = !fromBot && allowed.has(authorId);
+    if (!(self || crewBot || allowedHuman)) return false;
+    const existing = buffer.channelMessage(msg.id);
+    if (!existing || existing.channel_id !== channelId || existing.author_id !== authorId) return false;
+    const confirmedEdit = self
+      ? buffer.latestPostedEdit(conversationKey, msg.id)
+      : crewBot ? buffer.latestConfirmedEditByAuthor(authorId, channelId, msg.id) : null;
+    const attSuffix = Array.isArray(msg.attachments)
+      ? (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : "")
+      : (existing.content.match(/ \[attachment: [^\]]+\]$/)?.[0] ?? "");
+    const baseText = confirmedEdit ?? msg.content;
+    const content = baseText + (attSuffix && !baseText.endsWith(attSuffix) ? attSuffix : "");
+    return buffer.updateChannelMessage(msg.id, channelId, authorId, content, editedAt);
+  }
+  // Sync a Discord MESSAGE_DELETE / MESSAGE_DELETE_BULK into channel_message (#100). Log-only: removes matching row
+  // from this channel without touching human_message cap boundaries or accepted inbound rows.
+  function onMessageDelete(id: string): boolean {
+    if (typeof id !== "string" || !/^\d{1,25}$/.test(id)) return false;
+    return buffer.deleteChannelMessage(id, channelId);
   }
   // Accept one Discord MESSAGE_CREATE. Returns { accepted, inserted?, reason? }.
   async function accept(msg: DiscordMessage): Promise<AcceptResult> {
@@ -710,14 +758,20 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (msg.id && authorId && (self || crewBot || (!fromBot && allowed.has(authorId)))) {
       const edited = self ? buffer.latestPostedEdit(conversationKey, msg.id) : null;
       const content = (edited ?? String(msg.content ?? "")) + (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : "");
+      const editedAt = parseTimestampUs(msg.edited_timestamp);
       buffer.recordChannelMessage({ id: msg.id, authorId, authorName: crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user", authorKind: fromBot ? "bot" : "human",
-        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly });
+        content, at: Date.parse(msg.timestamp as string) || now(), channelId, resetsCap: talkOnly, editedAt });
       // If a peer bridge already logged the pre-edit echo into the shared channel_message table, repair it with our latest confirmed edit.
       if (edited !== null) buffer.editChannelMessage(msg.id, authorId, content);
+      else if (editedAt !== null) onMessageUpdate(msg);
     }
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
     if (!fromBot && !allowed.has(authorId)) { log.emit("bridge.dropped", { bot: name, sourceMessageId: msg.id ?? null, reason: "sender not allowed" }); return { accepted: false, reason: "sender not allowed" }; }
+    // A message already deleted before intake must not start /new, download attachments, or queue new inbound work (#100).
+    if (msg.id && buffer.isDeletedChannelMessage(msg.id, channelId) && !buffer.hasInbound("discord", msg.id, conversationKey)) {
+      return { accepted: false, reason: "deleted" };
+    }
     if (!fromBot && msg.id && isNewCommand(msg)) return acceptNew(msg as DiscordMessage & { id: string });
     // A crew bot's mention counts from its text too: whether Discord fills `mentions` for a bot-authored post is not
     // something the bridge relies on.
@@ -737,27 +791,37 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     for (const [i, s] of saved.entries()) if (s && "error" in s) log.emit("bridge.inbox_not_saved", { bot: name, sourceMessageId: msg.id, index: i, reason: s.error });
     const files = attachmentLines(msg.attachments, saved);
     const text = [stripped ? named : files.length ? "" : BARE_MENTION_TEXT, ...files].filter(Boolean).join("\n");
-    const reply = replyContext(msg);
-    if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
-    let r: { inserted: boolean; id: number };
-    if (crewBot && !talkOnly) {
-      const b = buffer.acceptFromBot(input, exchangeCap);
-      if ("capped" in b) {
-        // the cap is reached: not delivered; one notice per episode (key = last human message), whichever bot sees it first
-        const bridgeBots = [name, ...allowedBots.filter((b) => !b.talkOnly).map((b) => b.name)].join(" and ");
-        buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${b.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
-        log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: b.count, cap: exchangeCap });
-        removeSaved(saved);
-        if (msg.id) buffer.kvDelete(K(`replyCtx:${msg.id}`));
-        return { accepted: false, reason: "exchange cap", wake: true };
+    // Re-check tombstone atomically after any async attachment download so a delete arriving mid-download also blocks new intake (#100).
+    let r: { inserted: boolean; id: number } | { capped: true; count: number; lastHumanId: string | null } | { deleted: true };
+    r = buffer.atomically(() => {
+      if (msg.id && buffer.isDeletedChannelMessage(msg.id, channelId) && !buffer.hasInbound("discord", msg.id, conversationKey)) {
+        return { deleted: true as const };
       }
-      r = b;
-    } else r = buffer.atomically(() => {
+      const reply = replyContext(msg);
+      if (crewBot && !talkOnly) {
+        const b = buffer.acceptFromBot(input, exchangeCap);
+        if ("capped" in b) return b;
+        if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
+        return b;
+      }
       const accepted = buffer.accept({ ...input, authorKind: "human" });
+      if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
       if (personDirectMention && msg.id) buffer.kvSet(K(`directMention:${msg.id}`), "1");
       return accepted;
     });
+    if ("deleted" in r) {
+      removeSaved(saved);
+      return { accepted: false, reason: "deleted" };
+    }
+    if ("capped" in r) {
+      // the cap is reached: not delivered; one notice per episode (key = last human message), whichever bot sees it first
+      const bridgeBots = [name, ...allowedBots.filter((b) => !b.talkOnly).map((b) => b.name)].join(" and ");
+      buffer.addNotice(`cap:${r.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${r.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
+      log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: r.count, cap: exchangeCap });
+      removeSaved(saved);
+      return { accepted: false, reason: "exchange cap", wake: true };
+    }
     log.emit("bridge.accepted", { bot: name, sourceMessageId: msg.id, inserted: r.inserted, inboundId: r.id });
     const row = buffer.unacked(conversationKey).find((x) => x.id === r.id);
     if (row) await ack(row);
@@ -1798,5 +1862,5 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     return { phase: "sent", batchId: b.id };
   }
 
-  return { accept, backfill, initWatermark, initWatermarkAt, step, ensureThread, requestNew, requestStop, requestClose, reopen, isClosed, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
+  return { accept, onMessageUpdate, onMessageDelete, backfill, initWatermark, initWatermarkAt, step, ensureThread, requestNew, requestStop, requestClose, reopen, isClosed, status, setBotUserId: (id: string) => { state.botUserId = id; publishToolConfig(); }, state };
 }

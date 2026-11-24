@@ -170,6 +170,8 @@ export interface ProjectionRuntimeRequest {
   responseCapability?: { type?: string; [k: string]: unknown } | null;
   createdAt?: string | null;
   blocking?: boolean;
+  cwd?: string | null;
+  workingDirectory?: string | null;
 }
 export interface ProjectionTurnItem {
   id?: string;
@@ -181,6 +183,8 @@ export interface ProjectionTurnItem {
   prompt?: string | null;
   reason?: string | null;
   appName?: string | null;
+  cwd?: string | null;
+  workingDirectory?: string | null;
   status?: string | null;
   responseMode?: string | null;
   secretStatus?: string | null;

@@ -128,8 +128,8 @@ const kind = (e: unknown) => { const c = (e as { code?: number } | null)?.code; 
 // An interaction token is a credential for its 15 minutes: it never reaches the log or the database, errors included.
 const redact = (s: string, token: string) => s.split(token).join("[token]").replace(/(\/(?:interactions|webhooks)\/\d+\/)[\w.-]+/g, "$1[token]");
 
-export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, now = () => Date.now() }: {
-  port: InteractionPort; bots: Pick<Map<string, CommandBot>, "get">; allowedAuthors: string[]; nudge: () => void; log: Log; now?: () => number;
+export function interactionDispatch({ port, bots, allowedAuthors, approvalOwnerId = null, nudge, log, now = () => Date.now() }: {
+  port: InteractionPort; bots: Pick<Map<string, CommandBot>, "get">; allowedAuthors: string[]; approvalOwnerId?: string | null; nudge: () => void; log: Log; now?: () => number;
 }): (type: string, d: unknown) => Promise<void> | undefined {
   const allowed = new Set(allowedAuthors);
   const safe = async (token: string, what: string, fn: () => Promise<unknown>) => {
@@ -146,6 +146,11 @@ export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, no
     // anything but our own commands, from our user, in our channels: refused, ephemeral, nothing else done
     if (!bot) { await safe(token, "reply", () => port.reply(id, token, "This bot is not active in this channel.")); log.emit("bridge.interaction_refused", { command: name, why: "channel" }); return; }
     if (user?.bot === true || typeof user?.id !== "string" || !allowed.has(user.id)) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: name, why: user?.bot === true ? "bot" : "user" }); return; }
+    // /approve and /deny require the dedicated approval owner, never just the regular message allowlist (#110)
+    if (name === "approve" || name === "deny") {
+      if (!approvalOwnerId) { await safe(token, "reply", () => port.reply(id, token, "Approvals from Discord are not enabled for this bot.")); log.emit("bridge.interaction_refused", { command: name, why: "approvals_disabled" }); return; }
+      if (user.id !== approvalOwnerId) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: name, why: "approval_owner" }); return; }
+    }
     if (!(await safe(token, "defer", () => port.defer(id, token)))) return; // expired before we answered: nothing to do, nothing was started
     let text = FAILED;
     let editOpts: InteractionEditOptions | undefined;
@@ -185,6 +190,8 @@ export function interactionDispatch({ port, bots, allowedAuthors, nudge, log, no
     const bot = typeof i.channel_id === "string" ? bots.get(i.channel_id) : undefined;
     if (!bot) { await safe(token, "reply", () => port.reply(id, token, "This bot is not active in this channel.")); log.emit("bridge.interaction_refused", { command: `apv:${op}`, why: "channel" }); return; }
     if (user?.bot === true || typeof user?.id !== "string" || !allowed.has(user.id)) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: `apv:${op}`, why: user?.bot === true ? "bot" : "user" }); return; }
+    if (!approvalOwnerId) { await safe(token, "reply", () => port.reply(id, token, "Approvals from Discord are not enabled for this bot.")); log.emit("bridge.interaction_refused", { command: `apv:${op}`, why: "approvals_disabled" }); return; }
+    if (user.id !== approvalOwnerId) { await safe(token, "reply", () => port.reply(id, token, "Not allowed.")); log.emit("bridge.interaction_refused", { command: `apv:${op}`, why: "approval_owner" }); return; }
     if (op === "cancel") {
       if (!bot.cancelApproval) { await safe(token, "reply", () => port.reply(id, token, "Approvals from Discord are not enabled for this bot.")); return; }
       const r = bot.cancelApproval({ nonce, userId: user.id });

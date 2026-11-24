@@ -20,7 +20,7 @@
 //     after a crash is deduplicated by Discord (within its nonce window), looked up in the channel before a repeat
 //     (marker set before the post; the search resumes across steps and only a search that reached the end of the
 //     channel counts as "absent"), and never repeated after it was recorded. Replies post in batch order.
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { reconcileBatch, messageIdMatchesRequest, settlement } from "./reconcile.ts";
 import { stopClientRequestId } from "./allowlist.ts";
 import { readArchivedTranscript } from "./t3-transcript.ts";
@@ -97,8 +97,8 @@ export interface BotOptions {
   attachmentsDir?: string;
   // where images of accepted messages are saved for the agent to open (BRIDGE_WORKSPACE/.inbox, #59); none = links only
   inboxDir?: string; fetchFile?: FetchFile;
-  // agent workspace directory (optional fallback cwd for /approve and /deny confirmation details, #110)
-  workspaceDir?: string;
+  // dedicated single Discord user id allowed to run /approve, /deny and their confirmation buttons (#110); null = disabled
+  approvalOwnerId?: string | null;
   // runtime info shown in /status (#99): bridge process start time and short commit SHA (optional)
   startedAt?: number; version?: string | null;
 }
@@ -111,6 +111,8 @@ const REFUSED = new Set([400, 403, 404, 413]), REFUSE_LIMIT = 3;
 export const RESET_STUCK_MS = 10 * 60_000;
 // Ephemeral /approve and /deny confirmation buttons stay valid for 5 minutes (single use, #110).
 export const APPROVAL_CONFIRM_TTL_MS = 5 * 60_000;
+// Discord interaction edit limit: approval previews are never truncated; anything longer is directed to t3 (#110).
+export const MAX_APPROVAL_PREVIEW_CHARS = 2000;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
 // Markdown images of local paths (`![x](/abs/path.png)`, `![x](<...>)` around such a path, `![x](file:...)`, with an
@@ -286,12 +288,15 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
   pendingRequestAlertMs = DEFAULT_PENDING_REQUEST_ALERT_MS, t3AppLabel = DEFAULT_T3_APP_LABEL,
-  allowedBots = [], exchangeCap = 2, silentFeedback = "note", headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, workspaceDir, dm = false, threadContext, activeThreads, notesRoot, startedAt, version = null }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, silentFeedback = "note", headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, approvalOwnerId = null, dm = false, threadContext, activeThreads, notesRoot, startedAt, version = null }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
   }
   const allowed = new Set<string | undefined>(allowedAuthors);
+  if (approvalOwnerId !== null && (typeof approvalOwnerId !== "string" || !/^\d{1,25}$/.test(approvalOwnerId) || !allowed.has(approvalOwnerId))) {
+    throw new Error("makeBot: approvalOwnerId must be a single Discord user id in allowedAuthors");
+  }
   if (!allowedBots.every((b) => /^\d+$/.test(b.id) && typeof b.name === "string" && b.name)) throw new Error("makeBot: allowedBots must be { id, name } with Discord user ids");
   if (!Number.isInteger(exchangeCap) || exchangeCap < 0) throw new Error("makeBot: exchangeCap must be an integer >= 0 (0 = off)");
   const bots = new Map(allowedBots.map((b) => [b.id, b.name]));
@@ -439,12 +444,14 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     runId: string;
     requestId: string;
     kind: ApprovalRequestKind;
+    promptSha256: string;
     createdAt: number;
     expiresAt: number;
   };
   const APPROVAL_CONFIRM_PREFIX = K("approvalConfirm:");
   const APPROVAL_CONFIRM_MAX = 20;
   const approvalConfirmKey = (nonce: string) => `${APPROVAL_CONFIRM_PREFIX}${nonce}`;
+  const hashPrompt = (prompt: string) => createHash("sha256").update(prompt).digest("hex");
   function pruneApprovalConfirms(): void {
     const t = now();
     const rows = buffer.kvWithPrefix(APPROVAL_CONFIRM_PREFIX);
@@ -463,12 +470,12 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       for (const old of live.slice(0, live.length - APPROVAL_CONFIRM_MAX + 1)) buffer.kvDelete(old.key);
     }
   }
-  const clipField = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [truncated]` : s);
-  const safeCodeBlock = (s: string) => s.replace(/```/g, "` ` `");
   const safeInline = (s: string) => s.replace(/[\r\n`]+/g, " ").trim();
+  const oneLine = (s: string) => s.replace(/\r?\n/g, " ").trim();
 
   async function inspectApproval({ action, userId, author }: { action: "approve" | "deny"; userId: string; author: string }): Promise<ApprovalInspectResult> {
-    if (!t3.respondApproval) return { ok: false, text: "Approvals from Discord are not enabled for this bot." };
+    if (!approvalOwnerId || !t3.respondApproval) return { ok: false, text: "Approvals from Discord are not enabled for this bot." };
+    if (userId !== approvalOwnerId) return { ok: false, text: "Not allowed." };
     const threadId = buffer.kvGet(K("threadId"));
     if (!threadId) return { ok: false, text: "Nothing is pending approval (no session started yet)." };
     let projection: Projection;
@@ -480,31 +487,55 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     }
     const pending = findBlockingApproval(projection);
     if (!pending) return { ok: false, text: "No pending approval for this bot in this channel." };
+    // Never offer confirmation unless the exact action can be rendered verbatim without truncation (#110).
+    if (!pending.prompt) {
+      log.emit("bridge.approval_preview_incomplete", { bot: name, action, reason: "missing_prompt", kind: pending.kind, requestId: pending.requestId });
+      return { ok: false, text: `Cannot show the exact pending action for this ${REQUEST_KIND_LABELS[pending.kind]} in Discord. Review and answer it in ${t3AppLabel}.` };
+    }
+    if (pending.prompt.includes("```")) {
+      log.emit("bridge.approval_preview_incomplete", { bot: name, action, reason: "unrenderable_prompt", kind: pending.kind, requestId: pending.requestId });
+      return { ok: false, text: `Cannot show the exact pending action verbatim in Discord. Review and answer it in ${t3AppLabel}.` };
+    }
+    if (pending.cwd !== null && /[\r\n`]/.test(pending.cwd)) {
+      log.emit("bridge.approval_preview_incomplete", { bot: name, action, reason: "unrenderable_cwd", kind: pending.kind, requestId: pending.requestId });
+      return { ok: false, text: `Cannot show the exact pending action verbatim in Discord. Review and answer it in ${t3AppLabel}.` };
+    }
+    const cwdLine = pending.cwd !== null
+      ? `Working directory: \`${pending.cwd}\``
+      : "Working directory: unknown (not reported by t3 for this request)";
+    const baseLines = (extra: string[] = []) => [
+      action === "approve" ? "**Confirm approve (once)?**" : "**Confirm deny?**",
+      `Agent: ${name}`,
+      `Type: ${REQUEST_KIND_LABELS[pending.kind]}`,
+      ...(pending.appName ? [`App: ${oneLine(pending.appName)}`] : []),
+      cwdLine,
+      ...extra,
+      `Request:\n\`\`\`\n${pending.prompt}\n\`\`\``,
+      ...(pending.reason ? [`Reason: ${oneLine(pending.reason)}`] : []),
+      "Bound to this specific pending request only (single use; expires in 5 min).",
+    ].join("\n");
+    let text = baseLines();
+    if (text.length > MAX_APPROVAL_PREVIEW_CHARS) {
+      log.emit("bridge.approval_preview_incomplete", { bot: name, action, reason: "too_long", kind: pending.kind, requestId: pending.requestId, length: text.length });
+      return { ok: false, text: `Cannot show the full pending ${REQUEST_KIND_LABELS[pending.kind]} in Discord (too long for one message). Review and answer it in ${t3AppLabel}.` };
+    }
+    if (pending.cwd === null && pending.threadWorktreePath && !/[\r\n`]/.test(pending.threadWorktreePath)) {
+      const withWorktree = baseLines([`Thread worktree: \`${pending.threadWorktreePath}\``]);
+      if (withWorktree.length <= MAX_APPROVAL_PREVIEW_CHARS) text = withWorktree;
+    }
     const nonce = randomBytes(8).toString("hex");
     const t = now();
     const record: ApprovalConfirmRecord = {
       nonce, action, userId, author, threadId, runId: pending.runId, requestId: pending.requestId,
-      kind: pending.kind, createdAt: t, expiresAt: t + APPROVAL_CONFIRM_TTL_MS,
+      kind: pending.kind, promptSha256: hashPrompt(pending.prompt), createdAt: t, expiresAt: t + APPROVAL_CONFIRM_TTL_MS,
     };
     buffer.atomically(() => {
       pruneApprovalConfirms();
       buffer.kvSet(approvalConfirmKey(nonce), JSON.stringify(record));
     });
-    const cwd = pending.worktreePath ?? workspaceDir ?? "(not reported by t3)";
-    const detail = pending.prompt ? clipField(safeCodeBlock(pending.prompt), 1100) : "(no command detail provided)";
-    const lines = [
-      action === "approve" ? "**Confirm approve (once)?**" : "**Confirm deny?**",
-      `Agent: ${name}`,
-      `Type: ${REQUEST_KIND_LABELS[pending.kind]}`,
-      ...(pending.appName ? [`App: ${clipField(safeInline(pending.appName), 120)}`] : []),
-      `Working directory: \`${clipField(safeInline(cwd), 240)}\``,
-      `Request:\n\`\`\`\n${detail}\n\`\`\``,
-      ...(pending.reason ? [`Reason: ${clipField(safeInline(pending.reason), 240)}`] : []),
-      "Bound to this specific pending request only (single use; expires in 5 min).",
-    ];
     return {
       ok: true,
-      text: lines.join("\n"),
+      text,
       buttons: [
         { custom_id: `apv:confirm:${nonce}`, label: action === "approve" ? "Confirm Approve (once)" : "Confirm Deny", style: action === "approve" ? 3 : 4 },
         { custom_id: `apv:cancel:${nonce}`, label: "Cancel", style: 2 },
@@ -524,6 +555,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   }
 
   function cancelApproval({ nonce, userId }: { nonce: string; userId: string }): ApprovalConfirmResult {
+    if (!approvalOwnerId || !t3.respondApproval) return { ok: false, text: "Approvals from Discord are not enabled for this bot." };
+    if (userId !== approvalOwnerId) return { ok: false, text: "Not allowed.", keepButtons: true };
     const key = approvalConfirmKey(nonce);
     return buffer.atomically(() => {
       const raw = buffer.kvGet(key);
@@ -539,7 +572,8 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   }
 
   async function confirmApproval({ nonce, userId, author }: { nonce: string; userId: string; author: string }): Promise<ApprovalConfirmResult> {
-    if (!t3.respondApproval) return { ok: false, text: "Approvals from Discord are not enabled for this bot." };
+    if (!approvalOwnerId || !t3.respondApproval) return { ok: false, text: "Approvals from Discord are not enabled for this bot." };
+    if (userId !== approvalOwnerId) return { ok: false, text: "Not allowed.", keepButtons: true };
     const key = approvalConfirmKey(nonce);
     const taken = buffer.atomically((): { ok: true; rec: ApprovalConfirmRecord } | { ok: false; text: string; keepButtons?: boolean } => {
       const raw = buffer.kvGet(key);
@@ -567,7 +601,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       { ...projection, runtimeRequests: (projection.runtimeRequests ?? []).filter((r) => r?.id === rec.requestId) },
       rec.runId,
     );
-    if (!live || live.requestId !== rec.requestId || live.runId !== rec.runId) {
+    if (!live || live.requestId !== rec.requestId || live.runId !== rec.runId || !live.prompt || hashPrompt(live.prompt) !== rec.promptSha256) {
       log.emit("bridge.approval_stale", { bot: name, action: rec.action, userId, requestId: rec.requestId, runId: rec.runId });
       return { ok: false, text: "That pending approval is already resolved or no longer active. Nothing was sent." };
     }

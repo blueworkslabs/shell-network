@@ -169,9 +169,9 @@ rule. Do not enable DMs for an agent that serves untrusted channels.
 
 ## Slash commands (`lib/commands.ts`)
 
-Each bot application registers three global, guild-only commands without options: `/new` (the reset above), `/status`
+Each bot application registers five global, guild-only commands without options: `/new` (the reset above), `/status`
 (this bot in this channel: bridge version, uptime and queued outbox count (#99), thread title and state, open batch, waiting messages, pending `/new`, last `/stop`,
-bot-to-bot count and cap) and `/stop` (interrupt this bot's running turn in this channel). Discord shows one entry per
+bot-to-bot count and cap), `/stop` (interrupt this bot's running turn in this channel), `/approve` (approve a pending action once), and `/deny` (deny a pending action). Discord shows one entry per
 bot, so choosing the entry chooses the bot. The text `@Bot /new` keeps working.
 
 - **Registration** runs in the background after startup. The application id is read from Discord's
@@ -324,16 +324,21 @@ a timing SLA. No bridge code change was required.
   projection before dispatch so a restart after an offline resolution never posts a stale alert or clear while ordinary
   outbox traffic still drains), and posts one reply follow-up once resolved or when the run ends. The bridge never
   auto-approves, interrupts, or replays on its own.
-- **Discord `/approve` and `/deny` (#110):** guild-only slash commands allowing an allowlisted human user (never bots or
-  other members) to inspect and answer a live pending approval (never `user_input`, stale requests, or non-blocking
+- **Discord `/approve` and `/deny` (#110):** guild-only slash commands allowing a dedicated single approval owner
+  (`BRIDGE_APPROVAL_USER_ID`, which must also be in `BRIDGE_ALLOWED_AUTHORS`; never bots, other members, or a second
+  allowlisted reader) to inspect and answer a live pending approval (never `user_input`, stale requests, or non-blocking
   cards) directly from Discord. Running `/approve` or `/deny` replies with an ephemeral confirmation showing the agent,
-  approval type, working directory, and exact command/request detail, bound to a single-use 5-minute confirmation token
-  tied to `(userId, action, threadId, runId, requestId)`. Confirming consumes the token atomically, re-verifies the
-  exact `requestId` is still pending and live on the bound thread, sends strictly `accept` (approve once — never
-  `acceptForSession` or `acceptAlways`) or `decline` through the narrow `approvalClient` over WS
-  `orchestration.dispatchCommand` (`runtime-request.respond`, configured via optional `BRIDGE_OPERATE_TOKEN`; disabled
-  when unset), verifies t3 accepted it before reporting success, and records an audit entry in `watchdog_action` and the
-  JSONL log. `/stop` remains the separate whole-turn cancellation command.
+  approval type, working directory (labeled unknown when t3 does not report a request-level working directory, never
+  guessed from `BRIDGE_WORKSPACE`), and the exact untruncated command/request detail, bound to a single-use 5-minute
+  confirmation token tied to `(userId, action, threadId, runId, requestId, promptSha256)`. If the exact action is
+  missing, cannot be rendered verbatim, or exceeds Discord's 2000-character message limit, no confirmation is offered
+  and the user is directed to `BRIDGE_T3_APP_LABEL`. Confirming consumes the token atomically, re-verifies the exact
+  `requestId` and prompt are still pending and live on the bound thread, sends strictly `accept` (approve once — never
+  `acceptForSession` or `acceptAlways`) or `decline` through `approvalClient` over WS `orchestration.dispatchCommand`
+  (`runtime-request.respond`, configured via optional `BRIDGE_OPERATE_TOKEN` which requires `BRIDGE_APPROVAL_USER_ID`;
+  disabled when either is unset; note that the wrapper restricts normal bridge calls, not the token's server-granted
+  `orchestration:operate` scope — see `SECURITY.md`), verifies t3 accepted it before reporting success, and records an
+  audit entry in `watchdog_action` and the JSONL log. `/stop` remains the separate whole-turn cancellation command.
 - **Watchdog**: findings need the same condition in two snapshots at least 60 s apart.
   - Held queue: `queue.resume`, up to 3 times, 2 min apart, then a notice.
   - Every action is recorded before it is taken.

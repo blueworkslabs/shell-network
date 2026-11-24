@@ -17,8 +17,15 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   Only the bot's configured channels are read or written; at startup the bridge also reads the guild's role list once, to
   find its own managed role.
 - **Separated grants.**
-  - Each bridge has its bot's Discord token, an MCP token, and a read-only WS session.
-  - Only the watchdog has the `operate` session, and it has no Discord or MCP credential.
+  - Each bridge has its bot's Discord token, an MCP token, a read-only WS session, and — only when Discord approvals are
+    explicitly enabled (`BRIDGE_OPERATE_TOKEN` paired with `BRIDGE_APPROVAL_USER_ID`) — an optional `orchestration:operate`
+    WS session.
+  - Without `BRIDGE_OPERATE_TOKEN`, only the watchdog holds an `orchestration:operate` session (and the watchdog has no
+    Discord or MCP credential). When `BRIDGE_OPERATE_TOKEN` is configured on a bridge, the bridge process holds that
+    `orchestration:operate` credential too: `approvalClient` (`lib/operate.ts`) limits normal bridge calls to
+    `runtime-request.respond` (`accept` once or `decline`) on the conversation's own bound thread, **not the token's
+    server-granted authority** (the token itself retains full `orchestration:operate` scope on t3, just as the bridge's
+    MCP token retains broader authority than `lib/allowlist.ts`).
   - The Discord tool has no credential at all. It refuses to start if the bridge's secret variables are in its
     environment.
   - Bridge code reaches MCP only through a strict tool and argument allowlist (`lib/allowlist.ts`). The allowlist
@@ -32,8 +39,13 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
     bridge uses only IDs, bindings and enabled states, and discards prompts and other schedule metadata.
   - Slash commands: the Discord client can manage only its own application's global commands (the id is read from
     Discord) and answer an interaction by its id and token (checked for format); an interaction is answered only if it
-    comes from an allowlisted person in one of the bot's channels, otherwise with an ephemeral refusal. Interaction
-    tokens are never stored or logged.
+    comes from an allowlisted person in one of the bot's channels, otherwise with an ephemeral refusal. `/approve`,
+    `/deny`, and their confirmation buttons additionally require a dedicated single owner (`BRIDGE_APPROVAL_USER_ID`,
+    which must also be in `BRIDGE_ALLOWED_AUTHORS`; unset fails closed with Discord approvals disabled, and
+    `BRIDGE_OPERATE_TOKEN` is refused at startup without `BRIDGE_APPROVAL_USER_ID`), never the broader message allowlist.
+    Confirmations are offered only when the exact pending action can be shown verbatim without truncation (working
+    directory is labeled unknown when t3 does not report it for that request), bound to one `requestId` for single use,
+    and audited in `watchdog_action` and the JSONL log. Interaction tokens are never stored or logged.
 - **Hybrid memory search.** With an embedding endpoint configured, the Discord tool sends note chunks and queries to
   that endpoint (the one network connection it makes). The key is a file passed by path (checked like the bridge's
   secrets), sent only in the Authorization header, and never put into errors or logs; error texts never include the

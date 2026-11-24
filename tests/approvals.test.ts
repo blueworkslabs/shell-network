@@ -4,9 +4,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { interactionDispatch, type InteractionButton, type InteractionEditOptions, type InteractionPort } from "../lib/commands.ts";
-import { APPROVAL_CONFIRM_TTL_MS, makeBot } from "../lib/bot.ts";
+import { APPROVAL_CONFIRM_TTL_MS, MAX_APPROVAL_PREVIEW_CHARS, makeBot } from "../lib/bot.ts";
 import { conversationKeyFor } from "../lib/bots.ts";
 import { memoryLog } from "../lib/log.ts";
+import { approvalOwner } from "../lib/startup.ts";
 import { DEFAULT_PENDING_REQUEST_ALERT_MS } from "../lib/stuck.ts";
 import { fakeDiscord, fakeT3, HUMAN_ID, STRANGER_ID } from "./fakes.ts";
 import { openTempBuffer, tempDir } from "./tmp.ts";
@@ -15,8 +16,16 @@ const CH = "100000000000000110", OTHER_CH = "100000000000000111", BOT = "3333333
 const SECOND_USER = "111111111111111112";
 const KEY = conversationKeyFor("codex", CH);
 
-function setup({ enableApproval = true, allowedAuthors = [HUMAN_ID], workspaceDir = "/srv/work/codex" }: {
-  enableApproval?: boolean; allowedAuthors?: string[]; workspaceDir?: string;
+function setup({
+  enableApproval = true,
+  allowedAuthors = [HUMAN_ID],
+  approvalOwnerId = HUMAN_ID,
+  t3AppLabel = "the t3 app",
+}: {
+  enableApproval?: boolean;
+  allowedAuthors?: string[];
+  approvalOwnerId?: string | null;
+  t3AppLabel?: string;
 } = {}) {
   const path = join(tempDir("approve-"), "buffer.db");
   let clock = 1_793_100_000_000;
@@ -28,9 +37,8 @@ function setup({ enableApproval = true, allowedAuthors = [HUMAN_ID], workspaceDi
   const buffer = openTempBuffer(path, { now });
   const bot = makeBot({
     name: "Codex", conversationKey: KEY, channelId: CH, channelName: "shell-network",
-    botUserId: BOT, allowedAuthors, projectId: "proj-codex",
+    botUserId: BOT, allowedAuthors, approvalOwnerId, t3AppLabel, projectId: "proj-codex",
     modelSelection: { instanceId: "crewCodex", model: "m" },
-    workspaceDir,
     buffer, t3, discord, log, now, session: () => "s1",
   });
   bot.initWatermark(clock - 60_000);
@@ -46,7 +54,7 @@ function setup({ enableApproval = true, allowedAuthors = [HUMAN_ID], workspaceDi
   };
   let nudges = 0, seq = 0;
   const dispatch = interactionDispatch({
-    port, bots: new Map([[CH, bot]]), allowedAuthors, nudge: () => { nudges++; }, log, now,
+    port, bots: new Map([[CH, bot]]), allowedAuthors, approvalOwnerId, nudge: () => { nudges++; }, log, now,
   });
   const slash = async (name: string, { channel = CH, user = HUMAN_ID, username = "user1", isBot = false }: {
     channel?: string; user?: string; username?: string; isBot?: boolean;
@@ -71,8 +79,12 @@ function setup({ enableApproval = true, allowedAuthors = [HUMAN_ID], workspaceDi
     return { id, token };
   };
   const startPendingApproval = async ({
-    requestId = "exec-1", kind = "command", prompt = "rm -f /tmp/scratch-file", reason = "Forced removal requires review",
-    worktreePath = "/srv/work/repo-codex",
+    requestId = "exec-1",
+    kind = "command",
+    prompt = "rm -f /tmp/scratch-file" as string | null,
+    reason = "Forced removal requires review" as string | null,
+    cwd = "/srv/work/repo-codex" as string | null,
+    worktreePath = "/srv/work/repo-codex" as string | null,
   } = {}) => {
     await bot.accept(discord.userSays("run check"));
     await bot.step();
@@ -89,7 +101,10 @@ function setup({ enableApproval = true, allowedAuthors = [HUMAN_ID], workspaceDi
     });
     th.turnItems.push({
       type: "approval_request", requestId, requestKind: kind, runId: run.runId, nodeId: `node:${requestId}`,
-      status: "waiting", prompt, reason,
+      status: "waiting",
+      ...(prompt !== null ? { prompt } : {}),
+      ...(reason !== null ? { reason } : {}),
+      ...(cwd !== null ? { cwd } : {}),
     });
     return { tid, th, run };
   };
@@ -101,7 +116,7 @@ function setup({ enableApproval = true, allowedAuthors = [HUMAN_ID], workspaceDi
   };
 }
 
-test("DENY FLOW (#110): /deny shows ephemeral confirmation with command, agent and cwd; Confirm sends strictly decline, audits decision, clears buttons and clears #108 alert", async () => {
+test("DENY FLOW (#110): /deny shows ephemeral confirmation with exact command, agent and reported cwd; Confirm sends strictly decline, audits decision, clears buttons and clears #108 alert", async () => {
   const w = setup();
   const { tid, run } = await w.startPendingApproval();
 
@@ -163,16 +178,20 @@ test("DENY FLOW (#110): /deny shows ephemeral confirmation with command, agent a
   assert.ok(w.discord.botPosts().some((m) => m.content === "denied safely"));
 });
 
-test("APPROVE ONCE FLOW (#110): /approve sends strictly 'accept' (never session/always), uses fallback workspaceDir when worktreePath is null, and Cancel leaves request untouched", async () => {
-  const w = setup({ workspaceDir: "/srv/workspace/codex" });
-  await w.startPendingApproval({ requestId: "exec-2", kind: "file-change", prompt: "edit ```README.md```", worktreePath: null as unknown as string });
+test("APPROVE ONCE FLOW (#110): /approve sends strictly 'accept' (never session/always), labels missing request cwd as unknown, and Cancel leaves request untouched", async () => {
+  const w = setup();
+  await w.startPendingApproval({
+    requestId: "exec-2", kind: "file-change", prompt: "edit `README.md`",
+    cwd: null, worktreePath: "/srv/work/thread-only",
+  });
 
   // Open confirmation and Cancel it first
   await w.slash("approve");
   const first = w.edits.at(-1)!;
   assert.match(first.content, /\*\*Confirm approve \(once\)\?\*\*/);
-  assert.match(first.content, /Working directory: `\/srv\/workspace\/codex`/);
-  assert.match(first.content, /edit ` ` `README\.md` ` `/, "triple backticks sanitized inside code block");
+  assert.match(first.content, /Working directory: unknown \(not reported by t3 for this request\)/);
+  assert.match(first.content, /Thread worktree: `\/srv\/work\/thread-only`/);
+  assert.match(first.content, /edit `README\.md`/, "single backticks preserved verbatim inside code block");
   assert.equal(first.components![0].label, "Confirm Approve (once)");
   assert.equal(first.components![0].style, 3);
   await w.click(first.components![1].custom_id);
@@ -192,8 +211,117 @@ test("APPROVE ONCE FLOW (#110): /approve sends strictly 'accept' (never session/
   assert.equal(w.buffer.actions("approval-accept").length, 1);
 });
 
-test("SECURITY & STALE GUARDS (#110): non-allowlisted user, bot, wrong channel, wrong allowlisted user, stale/resolved request, expired nonce, user_input, disabled operate, and t3 error", async () => {
-  const w = setup({ allowedAuthors: [HUMAN_ID, SECOND_USER] });
+test("DEDICATED OWNER CHECK (#110): second allowlisted reader cannot open /approve, /deny, or use buttons; unset owner disables approvals; approvalOwner() validates config", async () => {
+  // Startup helper validation
+  assert.equal(approvalOwner(undefined, [HUMAN_ID]), null);
+  assert.equal(approvalOwner("   ", [HUMAN_ID]), null);
+  assert.equal(approvalOwner(HUMAN_ID, [HUMAN_ID, SECOND_USER]), HUMAN_ID);
+  assert.throws(() => approvalOwner(`${HUMAN_ID},${SECOND_USER}`, [HUMAN_ID, SECOND_USER]), /single Discord user id/);
+  assert.throws(() => approvalOwner("not-a-snowflake", [HUMAN_ID]), /single Discord user id/);
+  assert.throws(() => approvalOwner(STRANGER_ID, [HUMAN_ID]), /must also be in BRIDGE_ALLOWED_AUTHORS/);
+
+  // Two allowlisted humans; only HUMAN_ID is approvalOwnerId
+  const w = setup({ allowedAuthors: [HUMAN_ID, SECOND_USER], approvalOwnerId: HUMAN_ID });
+  await w.startPendingApproval({ requestId: "exec-owner" });
+
+  // Second allowlisted reader cannot open /approve or /deny (refused before defer, zero kv records)
+  await w.slash("approve", { user: SECOND_USER, username: "reader2" });
+  assert.equal(w.replies.at(-1)!.content, "Not allowed.");
+  await w.slash("deny", { user: SECOND_USER, username: "reader2" });
+  assert.equal(w.replies.at(-1)!.content, "Not allowed.");
+  assert.equal(w.edits.length, 0);
+  assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 0);
+  assert.ok(w.log.events.some((e) => e.event === "bridge.interaction_refused" && e.why === "approval_owner"));
+
+  // Direct bot API also enforces approvalOwnerId independently of interactionDispatch
+  const direct = await w.bot.inspectApproval({ action: "approve", userId: SECOND_USER, author: "reader2" });
+  assert.deepEqual(direct, { ok: false, text: "Not allowed." });
+
+  // Owner opens confirmation; second allowlisted reader clicking Confirm or Cancel is refused without consuming owner's nonce
+  await w.slash("deny", { user: HUMAN_ID });
+  const btns = w.edits.at(-1)!.components!;
+  assert.equal(btns.length, 2);
+  await w.click(btns[0].custom_id, { user: SECOND_USER, username: "reader2" });
+  assert.equal(w.replies.at(-1)!.content, "Not allowed.");
+  await w.click(btns[1].custom_id, { user: SECOND_USER, username: "reader2" });
+  assert.equal(w.replies.at(-1)!.content, "Not allowed.");
+  assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 1, "owner nonce stays intact");
+  assert.equal(w.t3.calls.filter((c) => c.tool === "respondApproval").length, 0);
+
+  // Unset approvalOwnerId fails closed even for allowlisted human
+  const noOwner = setup({ allowedAuthors: [HUMAN_ID], approvalOwnerId: null });
+  await noOwner.startPendingApproval({ requestId: "exec-no-owner" });
+  await noOwner.slash("approve", { user: HUMAN_ID });
+  assert.equal(noOwner.replies.at(-1)!.content, "Approvals from Discord are not enabled for this bot.");
+  await noOwner.click("apv:confirm:0123456789abcdef", { user: HUMAN_ID });
+  assert.equal(noOwner.replies.at(-1)!.content, "Approvals from Discord are not enabled for this bot.");
+  assert.equal(noOwner.edits.length, 0);
+});
+
+test("COMPLETE PREVIEW GUARD (#110): refuses missing, oversized, or triple-backtick commands without offering buttons; shows exact long commands that fit; labels missing cwd unknown; rejects prompt drift", async () => {
+  const w = setup({ t3AppLabel: "the t3 web app" });
+  const { th } = await w.startPendingApproval({
+    requestId: "exec-missing", prompt: null, cwd: null, worktreePath: null,
+  });
+
+  // 1. Missing command prompt -> refused for both /approve and /deny, no buttons, no kv record
+  await w.slash("approve");
+  let edit = w.edits.at(-1)!;
+  assert.equal(edit.components, undefined);
+  assert.match(edit.content, /Cannot show the exact pending action/);
+  assert.match(edit.content, /the t3 web app/);
+  await w.slash("deny");
+  edit = w.edits.at(-1)!;
+  assert.equal(edit.components, undefined);
+  assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 0);
+
+  // 2. Whitespace-only prompt -> refused
+  th.turnItems[0].prompt = "   \n\t  ";
+  await w.slash("approve");
+  assert.equal(w.edits.at(-1)!.components, undefined);
+  assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 0);
+
+  // 3. Long command that fits in Discord's 2000-char limit (>1100 chars) -> shown 100% verbatim, NEVER truncated
+  const mediumCmd = `python3 -c "${"x".repeat(1300)}"`;
+  th.turnItems[0].prompt = mediumCmd;
+  await w.slash("approve");
+  edit = w.edits.at(-1)!;
+  assert.equal(edit.components?.length, 2);
+  assert.ok(edit.content.length <= MAX_APPROVAL_PREVIEW_CHARS);
+  assert.ok(edit.content.includes(mediumCmd), "full command included verbatim without truncation");
+  assert.doesNotMatch(edit.content, /\[truncated\]/);
+  assert.match(edit.content, /Working directory: unknown \(not reported by t3 for this request\)/);
+  assert.doesNotMatch(edit.content, /Thread worktree:/, "no worktree line when thread worktreePath is null");
+  const confirmMedium = edit.components![0].custom_id;
+
+  // Prompt drift between inspect and confirm -> rejected cleanly without sending to t3
+  th.turnItems[0].prompt = "rm -rf /";
+  await w.click(confirmMedium);
+  assert.equal(w.edits.at(-1)!.content, "That pending approval is already resolved or no longer active. Nothing was sent.");
+  assert.equal(w.t3.calls.filter((c) => c.tool === "respondApproval").length, 0);
+
+  // 4. Oversized command exceeding Discord's 2000-char limit -> refused, NEVER truncated
+  th.turnItems[0].prompt = `echo ${"a".repeat(2100)}`;
+  await w.slash("approve");
+  edit = w.edits.at(-1)!;
+  assert.equal(edit.components, undefined, "oversized action must never offer confirm buttons");
+  assert.match(edit.content, /too long for one message/);
+  assert.match(edit.content, /the t3 web app/);
+  await w.slash("deny");
+  assert.equal(w.edits.at(-1)!.components, undefined);
+  assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 0);
+
+  // 5. Triple backticks in command -> refused rather than mutating displayed command
+  th.turnItems[0].prompt = "cat <<'EOF'\n```sh\necho hi\n```\nEOF";
+  await w.slash("approve");
+  edit = w.edits.at(-1)!;
+  assert.equal(edit.components, undefined, "unrenderable triple-backtick action must not be mutated and offered");
+  assert.match(edit.content, /Cannot show the exact pending action verbatim/);
+  assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 0);
+});
+
+test("SECURITY & STALE GUARDS (#110): non-allowlisted user, bot, wrong channel, stale/resolved request, expired nonce, user_input, disabled operate, and t3 error", async () => {
+  const w = setup({ allowedAuthors: [HUMAN_ID, SECOND_USER], approvalOwnerId: HUMAN_ID });
   const { th } = await w.startPendingApproval({ requestId: "exec-sec" });
 
   // Non-allowlisted user, bot, and foreign channel are refused before deferring
@@ -204,18 +332,11 @@ test("SECURITY & STALE GUARDS (#110): non-allowlisted user, bot, wrong channel, 
   await w.slash("approve", { channel: OTHER_CH });
   assert.equal(w.replies.at(-1)!.content, "This bot is not active in this channel.");
 
-  // User 1 opens confirmation; User 2 (even though allowlisted!) clicking Confirm or Cancel is refused WITHOUT consuming User 1's nonce
+  // Request resolves before owner clicks Confirm -> rejected cleanly, nothing sent to t3
   await w.slash("deny", { user: HUMAN_ID });
   const btn = w.edits.at(-1)!.components!;
-  await w.click(btn[0].custom_id, { user: SECOND_USER, username: "user2" });
-  assert.equal(w.replies.at(-1)!.content, "Only the user who ran the command can confirm it.");
-  await w.click(btn[1].custom_id, { user: SECOND_USER, username: "user2" });
-  assert.equal(w.replies.at(-1)!.content, "Only the user who ran the command can confirm it.");
   await w.click(btn[0].custom_id, { user: STRANGER_ID });
   assert.equal(w.replies.at(-1)!.content, "Not allowed.");
-  assert.equal(w.t3.calls.filter((c) => c.tool === "respondApproval").length, 0);
-
-  // Request resolves before User 1 clicks Confirm -> rejected cleanly, nothing sent to t3
   th.runtimeRequests[0].status = "resolved";
   await w.click(btn[0].custom_id, { user: HUMAN_ID });
   assert.equal(w.edits.at(-1)!.content, "That pending approval is already resolved or no longer active. Nothing was sent.");

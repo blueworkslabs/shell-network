@@ -12,7 +12,8 @@ import type { ScheduleHandoff } from "../lib/schedule-handoff.ts";
 //   BRIDGE_LOG               event log path (JSONL)
 //   T1_MCP_URL, T1_TOKEN     t3 /mcp endpoint and the bridge's MCP token file (write path)
 //   T1_PUSH_TOKEN            WS read-only session file (projection; orchestration:read only)
-//   BRIDGE_OPERATE_TOKEN     optional, WS operate-scoped session file for /approve and /deny (#110); unset = Discord approvals disabled
+//   BRIDGE_OPERATE_TOKEN     optional, WS operate-scoped session file for /approve and /deny (#110); requires BRIDGE_APPROVAL_USER_ID
+//   BRIDGE_APPROVAL_USER_ID  optional, single Discord user id (also in BRIDGE_ALLOWED_AUTHORS) permitted to use /approve, /deny and their buttons (#110); unset = Discord approvals disabled
 //   BRIDGE_TICK_MS           optional, step interval while a batch is open (default 3000; idle 30000)
 //   BRIDGE_ALLOWED_AUTHORS   comma-separated Discord user ids whose mentions are accepted (the user only);
 //                            everyone else is dropped before the buffer
@@ -38,7 +39,7 @@ import { commandsHashKey, interactionDispatch, reconcileCommands } from "../lib/
 import { INBOX_KEEP_MS, sweepInbox, sweepStaging } from "../lib/attachments.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
-import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch, bridgeVersion } from "../lib/startup.ts";
+import { startBridge, gatewayDispatch, managedRole, stepAll, approvalOwner, dmUsers, openDms, dmIgnoredDispatch, bridgeVersion } from "../lib/startup.ts";
 import { makeThreadManager } from "../lib/threads.ts";
 import { stepLoop } from "../lib/steploop.ts";
 import { bridgeConfig, conversationKeyFor, modelSelectionFor } from "../lib/bots.ts";
@@ -74,6 +75,10 @@ try {
   console.error((e as Error).message);
   process.exit(2);
 }
+const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
+let approvalOwnerId: string | null;
+try { approvalOwnerId = approvalOwner(process.env.BRIDGE_APPROVAL_USER_ID, allowedAuthors); } catch (e) { console.error((e as Error).message); process.exit(2); }
+if (operateTokenPath && !approvalOwnerId) { console.error("BRIDGE_OPERATE_TOKEN requires BRIDGE_APPROVAL_USER_ID"); process.exit(2); }
 const channelIds = need("BRIDGE_CHANNEL_IDS").split(",").map((s) => s.trim()).filter(Boolean);
 if (!channelIds.length || channelIds.some((c) => !/^\d{1,25}$/.test(c)) || new Set(channelIds).size !== channelIds.length) {
   console.error("BRIDGE_CHANNEL_IDS: one or more distinct Discord channel ids, comma-separated");
@@ -113,7 +118,6 @@ const KEEP = new Set(["t3_thread_send", "t3_thread_launch", "t3_thread_interrupt
 const mcpLog = mcpCallLog(log, KEEP);
 const mcp = new McpClient({ log: mcpLog, token: loadToken(), clientName: "t3-crew-bridge" });
 await mcp.connect();
-const allowedAuthors = need("BRIDGE_ALLOWED_AUTHORS").split(",").map((s) => s.trim()).filter(Boolean);
 const notesRoot = process.env.BRIDGE_NOTES_DIR || undefined;
 if (notesRoot !== undefined && (!notesRoot.startsWith("/") || !(() => { try { return lstatSync(notesRoot).isDirectory(); } catch { return false; } })())) { console.error("BRIDGE_NOTES_DIR: an absolute path of an existing directory (not a symlink)"); process.exit(2); }
 const workspace = process.env.BRIDGE_WORKSPACE || undefined;
@@ -167,7 +171,7 @@ const policyFor = (conversationKey: string) => ({
   archivedThreads: () => (notesRoot ? (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) : []),
 });
 const approvalFor = (conversationKey: string) =>
-  operateToken ? approvalClient({ origin: t3Origin, token: operateToken, log, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`) }) : undefined;
+  operateToken && approvalOwnerId ? approvalClient({ origin: t3Origin, token: operateToken, log, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`) }) : undefined;
 const bots: ReturnType<typeof makeBot>[] = [];
 const parentChannels = new Map<string, { name: string; botRoleId: string | null }>();
 for (const [i, channelId] of conversations.entries()) {
@@ -178,9 +182,9 @@ for (const [i, channelId] of conversations.entries()) {
   if (!dm) parentChannels.set(channelId, { name: channelName, botRoleId });
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, workspaceDir: workspace, dm, notesRoot, startedAt: START_MS, version: VERSION,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, approvalOwnerId: dm ? null : approvalOwnerId, dm, notesRoot, startedAt: START_MS, version: VERSION,
     ...(dm ? {} : { activeThreads: () => threads?.activeThreadsFor(channelId) ?? [] }),
-    buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH, approval: approvalFor(conversationKey) }), discord, log, session,
+    buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH, approval: dm ? undefined : approvalFor(conversationKey) }), discord, log, session,
   }));
 }
 log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, version: VERSION, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback });
@@ -203,7 +207,7 @@ threads = makeThreadManager({
       name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
       threadLabel: `${cfg.name} #${record.parentName} / ${shortName}`,
       botUserId: cfg.id, botRoleId, projectId, modelSelection,
-      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, workspaceDir: workspace, dm: false, notesRoot, startedAt: START_MS, version: VERSION,
+      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, approvalOwnerId, dm: false, notesRoot, startedAt: START_MS, version: VERSION,
       threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
       buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH, approval: approvalFor(conversationKey) }), discord, log, session,
     });
@@ -213,7 +217,7 @@ threads.restore();
 
 // Slash commands (`/new`, `/status`, `/stop`, `/approve`, `/deny`): answered per interaction, by the bot of the interaction's channel or active thread (lib/commands.ts).
 // guild channels and their active threads only: the slash commands are guild-only, and a DM conversation is never a command target
-const interact = interactionDispatch({ port: discord.interactions, bots: { get: (ch) => channelBots.get(ch) ?? threads?.botFor(ch) }, allowedAuthors, nudge, log });
+const interact = interactionDispatch({ port: discord.interactions, bots: { get: (ch) => channelBots.get(ch) ?? threads?.botFor(ch) }, allowedAuthors, approvalOwnerId, nudge, log });
 const dmIgnored = dmIgnoredDispatch({ known: new Set(conversations), log });
 // Catch-up runs inside the step loop (single flight); every new live session (READY/RESUMED) closes the dispatch
 // gate until a catch-up has completed within it.

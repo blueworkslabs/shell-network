@@ -35,7 +35,8 @@ export interface BlockingApprovalDetail extends BlockingPendingRequest {
   prompt: string | null;
   reason: string | null;
   appName: string | null;
-  worktreePath: string | null;
+  cwd: string | null;
+  threadWorktreePath: string | null;
 }
 
 // resolved/cancelled: only while t3 is not verified settled yet (openBatches leaves settled ones out).
@@ -125,8 +126,9 @@ export function findBlockingRequest(
   return matches[0];
 }
 
-// Like findBlockingRequest, restricted strictly to approval requests (never user_input), returning the prompt, reason,
-// app name, and thread worktreePath needed for /approve and /deny ephemeral confirmation (#110).
+// Like findBlockingRequest, restricted strictly to approval requests (never user_input), returning the exact prompt,
+// reason, app name, request-reported cwd (null if t3 didn't report one for this request), and optional thread
+// worktreePath needed for /approve and /deny ephemeral confirmation (#110).
 export function findBlockingApproval(
   projection: Projection | null | undefined,
   targetRunId?: string | null,
@@ -138,18 +140,21 @@ export function findBlockingApproval(
   };
   const found = findBlockingRequest(approvalOnly, targetRunId);
   if (!found || found.kind === "user_input") return null;
+  const req = projection.runtimeRequests.find((r) => r?.id === found.requestId);
   let item: ProjectionTurnItem | undefined;
   for (const it of projection.turnItems ?? []) {
     if (it?.type === "approval_request" && it.requestId === found.requestId) item = it;
   }
   const str = (v: unknown): string | null => (typeof v === "string" && v.trim().length > 0 ? v.trim() : null);
+  const rawPrompt = typeof item?.prompt === "string" && item.prompt.trim().length > 0 ? item.prompt : null;
   return {
     ...found,
     kind: found.kind,
-    prompt: str(item?.prompt),
+    prompt: rawPrompt,
     reason: str(item?.reason),
     appName: str(item?.appName),
-    worktreePath: str(projection.thread?.worktreePath),
+    cwd: str(item?.cwd) ?? str(item?.workingDirectory) ?? str(req?.cwd) ?? str(req?.workingDirectory),
+    threadWorktreePath: str(projection.thread?.worktreePath),
   };
 }
 

@@ -52,6 +52,11 @@ schema change before the trial verdict means a fresh DB.
    deleted message (checked before intake and again after any attachment download; previously accepted rows stay as
    designed), without disturbing `human_message` cap boundaries (also hiding deleted own posts from `#87`
    crossed-message context). Known limit: text already delivered into a t3 session stays in that session.
+   A Discord forward (`message_reference.type === 1` with `message_snapshots`, #101) carries text and sanitized
+   attachment filenames only (forwarded attachments are never downloaded), explicitly marked as quoted material from an
+   unknown original author (not an instruction). Mentions inside forwarded snapshots are defanged and never trigger bot
+   mentions, `/new`, addressed-header priority, or bot-to-bot exchange cap counts; in DMs a forward delivers the quoted
+   text instead of an empty bare mention.
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before

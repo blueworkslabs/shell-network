@@ -197,22 +197,77 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
   }
 
   // Read-only: the bridge's channel log (allowlisted people, allowed crew bots, this bot), newest `limit` before
-  // `before` (or the newest), oldest first. Only the channel; threads are not in the log. The log is shared by every
-  // bot on the buffer: only messages by this bot, its crew and the people its bridge published are returned (#93);
-  // a config without `people` (a bridge from before) filters nothing, as before.
+  // `before` (or oldest `limit` after `after`, or the newest `limit`), oldest first. Only the channel; threads are not
+  // in the log. The log is shared by every bot on the buffer: only messages by this bot, its crew and the people its
+  // bridge published are returned (#93); a config without `people` (a bridge from before) filters nothing, as before.
   function read(a: Record<string, unknown>): ToolResult {
     const channel = str(a.channel, "channel");
     const { c } = resolve(channel);
     const limit = a.limit === undefined ? 20 : a.limit;
     if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > READ_MAX) throw new ToolError(`limit: an integer 1-${READ_MAX}`);
     const before = a.before === undefined || a.before === null ? null : str(a.before, "before");
+    const afterId = a.after === undefined || a.after === null ? null : str(a.after, "after");
+    if (before !== null && afterId !== null) throw new ToolError("give at most one of before and after");
     if (before !== null && !SNOWFLAKE.test(before)) throw new ToolError("before: a message id");
+    if (afterId !== null && !SNOWFLAKE.test(afterId)) throw new ToolError("after: a message id");
     const lt = "(length(id) < length(?) OR (length(id) = length(?) AND id < ?))";
     // bound one by one: the tool's connection may not read json_each (lib/tooldb.ts)
     const authors = c.people === null ? null : [...new Set([c.bot_user_id, ...c.crew.map((b) => b.id), ...c.people].filter((id) => typeof id === "string"))];
-    const rows = (db.prepare(`SELECT id, author_id, author_name, author_kind, content, at FROM channel_message WHERE channel_id = ?${authors ? ` AND author_id IN (${authors.map(() => "?").join(", ") || "NULL"})` : ""}${before ? ` AND ${lt}` : ""} ORDER BY length(id) DESC, id DESC LIMIT ?`)
-      .all(channel, ...(authors ?? []), ...(before ? [before, before, before] : []), limit) as { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number }[]).reverse();
+    const authorClause = authors ? ` AND author_id IN (${authors.map(() => "?").join(", ") || "NULL"})` : "";
+    type MsgRow = { id: string; author_id: string; author_name: string; author_kind: string; content: string; at: number };
+    const rows = afterId !== null
+      ? (db.prepare(`SELECT id, author_id, author_name, author_kind, content, at FROM channel_message WHERE channel_id = ?${authorClause} AND ${after("id")} ORDER BY length(id) ASC, id ASC LIMIT ?`)
+          .all(channel, ...(authors ?? []), afterId, afterId, afterId, limit) as MsgRow[])
+      : (db.prepare(`SELECT id, author_id, author_name, author_kind, content, at FROM channel_message WHERE channel_id = ?${authorClause}${before ? ` AND ${lt}` : ""} ORDER BY length(id) DESC, id DESC LIMIT ?`)
+          .all(channel, ...(authors ?? []), ...(before ? [before, before, before] : []), limit) as MsgRow[]).reverse();
     const out = { channel, messages: rows.map((r) => ({ id: r.id, author: r.author_name, authorId: r.author_id, kind: r.author_kind, content: r.content, at: new Date(r.at).toISOString() })) };
+    return { content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out };
+  }
+
+  // Read-only: this bot's allowed Discord channels, DMs, public active threads, and open legacy tool threads (#98).
+  // Private thread names and ids are never exposed here (same privacy rule as /status in #77: reported by count only).
+  function listChannels(): ToolResult {
+    type RawCfg = { channel_id: string; channel_meta?: string | null };
+    type ChannelMeta = { kind?: string; name?: string; parentId?: string; parentName?: string };
+    const rows = db.prepare(`SELECT * FROM tool_config WHERE ${mine} ORDER BY channel_id`).all(bot) as RawCfg[];
+    const seen = new Set(rows.map((r) => r.channel_id));
+    const guildParents = new Set<string>();
+    const parentNames = new Map<string, string>();
+    const list: { id: string; kind: "channel" | "dm" | "thread" | "tool_thread"; name?: string; parentId?: string; parentName?: string }[] = [];
+    let privateThreads = 0;
+    for (const r of rows) {
+      let meta: ChannelMeta | null = null;
+      if (typeof r.channel_meta === "string") { try { meta = JSON.parse(r.channel_meta) as ChannelMeta; } catch {} }
+      if (meta?.kind === "private_thread") { privateThreads++; continue; }
+      if (meta?.kind === "dm") { list.push({ id: r.channel_id, kind: "dm" }); continue; }
+      if (meta?.kind === "thread") {
+        list.push({
+          id: r.channel_id, kind: "thread",
+          ...(typeof meta.name === "string" && meta.name ? { name: meta.name } : {}),
+          ...(typeof meta.parentId === "string" && meta.parentId ? { parentId: meta.parentId } : {}),
+          ...(typeof meta.parentName === "string" && meta.parentName ? { parentName: meta.parentName } : {}),
+        });
+        continue;
+      }
+      if (meta?.kind !== "channel") continue; // fail closed: omit unclassified rows until the bridge publishes their type (avoids exposing private thread IDs from older buffers)
+      guildParents.add(r.channel_id);
+      const name = typeof meta.name === "string" && meta.name ? meta.name : undefined;
+      if (name) parentNames.set(r.channel_id, name);
+      list.push({ id: r.channel_id, kind: "channel", ...(name ? { name } : {}) });
+    }
+    const toolThreads = db.prepare(
+      `SELECT reply_to, content, meta FROM outbox WHERE ${mine} AND substr(key, 1, 7) = 'thread:' AND state = 'posted' AND reply_to IS NOT NULL AND COALESCE(json_extract(meta, '$.closed'), 0) = 0 ORDER BY id`,
+    ).all(bot) as { reply_to: string; content: string; meta: string }[];
+    for (const t of toolThreads) {
+      if (seen.has(t.reply_to)) continue;
+      let parentId: string | undefined;
+      try { const m = JSON.parse(t.meta) as { channel?: string }; if (typeof m.channel === "string") parentId = m.channel; } catch {}
+      if (!parentId || !guildParents.has(parentId)) continue;
+      seen.add(t.reply_to);
+      const parentName = parentNames.get(parentId);
+      list.push({ id: t.reply_to, kind: "tool_thread", ...(t.content ? { name: t.content } : {}), parentId, ...(parentName ? { parentName } : {}) });
+    }
+    const out = { channels: list, ...(privateThreads ? { privateThreads } : {}) };
     return { content: [{ type: "text", text: JSON.stringify(out) }], structuredContent: out };
   }
 
@@ -238,8 +293,11 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
       call: thread },
     { name: "discord_read", description: "Read recent messages of one of the bot's Discord channels (the people and crew bots the bridge listens to), oldest first. Read-only.",
       inputSchema: { type: "object", additionalProperties: false, required: ["channel"],
-        properties: { channel: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: READ_MAX }, before: { type: "string", description: "Optional: only messages older than this message id." } } },
+        properties: { channel: { type: "string" }, limit: { type: "integer", minimum: 1, maximum: READ_MAX }, before: { type: "string", description: "Optional: only messages older than this message id (newest `limit`, oldest first)." }, after: { type: "string", description: "Optional: only messages newer than this message id (oldest `limit`, oldest first). Cannot be combined with `before`." } } },
       call: read },
+    { name: "discord_channels", description: "List this bot's allowed Discord channels, DMs, public active threads, and open tool threads with their ids and names. Private thread names are omitted (reported by count only). Read-only.",
+      inputSchema: { type: "object", additionalProperties: false, required: [], properties: {} },
+      call: listChannels },
   ];
-  return { tools, send, edit, react, thread, read };
+  return { tools, send, edit, react, thread, read, channels: listChannels };
 }

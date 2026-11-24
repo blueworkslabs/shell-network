@@ -290,7 +290,12 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   const state: { botUserId: string | null } = { botUserId };
   // What this bot's Discord tool (bin/discord-tool.ts) works with: the one channel, this bot, the crew it may name,
   // the cap. Published whenever the bot's own user id is known.
-  const publishToolConfig = () => { if (state.botUserId && !buffer.kvGet(K("threadClosing"))) buffer.setToolConfig(conversationKey, { channelId, botUserId: state.botUserId, crew: allowedBots, exchangeCap, people: allowedAuthors }); };
+  const channelMeta = dm
+    ? { kind: "dm" as const }
+    : threadContext
+      ? { kind: threadContext.isPrivate ? "private_thread" as const : "thread" as const, parentId: threadContext.parentId, parentName: threadContext.parentName, ...(threadContext.isPrivate ? {} : { name: threadContext.threadName }) }
+      : { kind: "channel" as const, ...(channelName ? { name: channelName } : {}) };
+  const publishToolConfig = () => { if (state.botUserId && !buffer.kvGet(K("threadClosing"))) buffer.setToolConfig(conversationKey, { channelId, botUserId: state.botUserId, crew: allowedBots, exchangeCap, people: allowedAuthors, channelMeta }); };
   publishToolConfig();
   // catch-up gate: caughtUp = the session token in which the last complete catch-up ran (null = not caught up)
   const catchUp: { caughtUp: unknown; inFlight: Promise<number> | null; lastAt: number } = { caughtUp: null, inFlight: null, lastAt: 0 };

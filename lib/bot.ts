@@ -768,6 +768,10 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     if (self) return { accepted: false, reason: "own message" };
     if (fromBot && !crewBot) return { accepted: false, reason: "bot author" };
     if (!fromBot && !allowed.has(authorId)) { log.emit("bridge.dropped", { bot: name, sourceMessageId: msg.id ?? null, reason: "sender not allowed" }); return { accepted: false, reason: "sender not allowed" }; }
+    // A message already deleted before intake must not start /new, download attachments, or queue new inbound work (#100).
+    if (msg.id && buffer.isDeletedChannelMessage(msg.id, channelId) && !buffer.hasInbound("discord", msg.id, conversationKey)) {
+      return { accepted: false, reason: "deleted" };
+    }
     if (!fromBot && msg.id && isNewCommand(msg)) return acceptNew(msg as DiscordMessage & { id: string });
     // A crew bot's mention counts from its text too: whether Discord fills `mentions` for a bot-authored post is not
     // something the bridge relies on.
@@ -787,27 +791,37 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     for (const [i, s] of saved.entries()) if (s && "error" in s) log.emit("bridge.inbox_not_saved", { bot: name, sourceMessageId: msg.id, index: i, reason: s.error });
     const files = attachmentLines(msg.attachments, saved);
     const text = [stripped ? named : files.length ? "" : BARE_MENTION_TEXT, ...files].filter(Boolean).join("\n");
-    const reply = replyContext(msg);
-    if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
     const input = { source: "discord", sourceMessageId: msg.id, conversationKey, author: crewBot ? bots.get(authorId as string)! : msg.author?.username ?? "user", text, receivedAt: Date.parse(msg.timestamp as string) || now(), channelId };
-    let r: { inserted: boolean; id: number };
-    if (crewBot && !talkOnly) {
-      const b = buffer.acceptFromBot(input, exchangeCap);
-      if ("capped" in b) {
-        // the cap is reached: not delivered; one notice per episode (key = last human message), whichever bot sees it first
-        const bridgeBots = [name, ...allowedBots.filter((b) => !b.talkOnly).map((b) => b.name)].join(" and ");
-        buffer.addNotice(`cap:${b.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${b.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
-        log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: b.count, cap: exchangeCap });
-        removeSaved(saved);
-        if (msg.id) buffer.kvDelete(K(`replyCtx:${msg.id}`));
-        return { accepted: false, reason: "exchange cap", wake: true };
+    // Re-check tombstone atomically after any async attachment download so a delete arriving mid-download also blocks new intake (#100).
+    let r: { inserted: boolean; id: number } | { capped: true; count: number; lastHumanId: string | null } | { deleted: true };
+    r = buffer.atomically(() => {
+      if (msg.id && buffer.isDeletedChannelMessage(msg.id, channelId) && !buffer.hasInbound("discord", msg.id, conversationKey)) {
+        return { deleted: true as const };
       }
-      r = b;
-    } else r = buffer.atomically(() => {
+      const reply = replyContext(msg);
+      if (crewBot && !talkOnly) {
+        const b = buffer.acceptFromBot(input, exchangeCap);
+        if ("capped" in b) return b;
+        if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
+        return b;
+      }
       const accepted = buffer.accept({ ...input, authorKind: "human" });
+      if (reply && msg.id) buffer.kvSet(K(`replyCtx:${msg.id}`), JSON.stringify(reply));
       if (personDirectMention && msg.id) buffer.kvSet(K(`directMention:${msg.id}`), "1");
       return accepted;
     });
+    if ("deleted" in r) {
+      removeSaved(saved);
+      return { accepted: false, reason: "deleted" };
+    }
+    if ("capped" in r) {
+      // the cap is reached: not delivered; one notice per episode (key = last human message), whichever bot sees it first
+      const bridgeBots = [name, ...allowedBots.filter((b) => !b.talkOnly).map((b) => b.name)].join(" and ");
+      buffer.addNotice(`cap:${r.lastHumanId ?? "start"}`, `⏸ Exchange cap reached: ${bridgeBots} have had ${r.count} exchanges since the last message from a person or talk-only member. A person or talk-only member can mention one of those bots to resume (a bare @mention is enough).`, conversationKey);
+      log.emit("bridge.exchange_capped", { bot: name, sourceMessageId: msg.id, count: r.count, cap: exchangeCap });
+      removeSaved(saved);
+      return { accepted: false, reason: "exchange cap", wake: true };
+    }
     log.emit("bridge.accepted", { bot: name, sourceMessageId: msg.id, inserted: r.inserted, inboundId: r.id });
     const row = buffer.unacked(conversationKey).find((x) => x.id === r.id);
     if (row) await ack(row);

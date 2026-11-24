@@ -2,6 +2,7 @@
 // node --test tests/editsdeletes.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { makeBot } from "../lib/bot.ts";
 import { conversationKeyFor } from "../lib/bots.ts";
@@ -273,4 +274,66 @@ test("EDITS & DELETES (#100) ordering: older MESSAGE_UPDATE never overwrites a n
   w.advance(8 * 24 * 3600_000);
   await w.dispatch("MESSAGE_CREATE", w.discord.userSays("prune trigger", { mention: false }));
   assert.equal(w.buffer.kvGet(`del:${CH}:${delBeforeCreate.id}`), null, "expired deletion tombstone is pruned");
+});
+
+test("EDITS & DELETES (#100) inbound tombstone: delete before intake or mid-attachment-download blocks new inbound turns while leaving already-accepted rows intact", async () => {
+  const dir = tempDir("edits-inbound-");
+  const path = join(dir, "buffer.db");
+  const inboxDir = join(dir, "inbox");
+  let clock = 1_792_850_000_000;
+  const now = () => clock;
+  const t3 = fakeT3();
+  const discord = fakeDiscord({ channelId: CH, botUserId: GEM, now });
+  const log = memoryLog();
+  const buffer = openTempBuffer(path, { now });
+  const key = conversationKeyFor("gem", CH);
+
+  let releaseDownload: (() => void) | null = null;
+  const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+  const bot = makeBot({
+    name: "Gem", conversationKey: key, channelId: CH, channelName: "shell-network",
+    botUserId: GEM, allowedAuthors: [HUMAN_ID], allowedBots: [{ id: HERMES, name: "Hermes" }],
+    projectId: "proj-gem", modelSelection: { instanceId: "g", model: "m" },
+    inboxDir,
+    fetchFile: async () => {
+      await new Promise<void>((resolve) => { releaseDownload = resolve; });
+      return new Response(pngBytes, { status: 200, headers: { "content-type": "image/png" } });
+    },
+    buffer, t3, discord, log, now, session: () => "s1",
+  });
+  bot.initWatermark(clock - 60_000);
+  const dispatch = gatewayDispatch({ bot, channelId: CH, nudge: () => {}, log });
+
+  // 1) Delete arrives BEFORE first intake of an addressed mention -> rejected, nothing buffered, no turn!
+  const deletedMention = discord.userSays("secret addressed text deleted before intake");
+  await dispatch("MESSAGE_DELETE", { id: deletedMention.id, channel_id: CH });
+  const r1 = await bot.accept(deletedMention);
+  assert.deepEqual(r1, { accepted: false, reason: "deleted" });
+  assert.deepEqual(buffer.buffered(key), [], "deleted addressed message must not buffer a turn");
+  assert.equal(buffer.channelMessage(deletedMention.id), undefined);
+
+  // 2) Delete arrives MID-ATTACHMENT-DOWNLOAD -> download finishes, tombstone rejects intake and cleans up saved file!
+  clock += 1000;
+  const midDownload = {
+    ...discord.userSays("secret with image deleted mid-download"),
+    attachments: [{ id: "img1", filename: "shot.png", content_type: "image/png", size: pngBytes.length, url: "https://cdn.discordapp.com/attachments/1/2/shot.png" }],
+  };
+  const acceptP = bot.accept(midDownload);
+  while (!releaseDownload) await new Promise((r) => setTimeout(r, 1));
+  await dispatch("MESSAGE_DELETE", { id: midDownload.id, channel_id: CH });
+  (releaseDownload as () => void)();
+  const r2 = await acceptP;
+  assert.deepEqual(r2, { accepted: false, reason: "deleted" });
+  assert.deepEqual(buffer.buffered(key), [], "message deleted mid-download must not buffer a turn");
+  assert.equal(existsSync(inboxDir) ? readdirSync(inboxDir).length : 0, 0, "downloaded image for deleted message is removed");
+
+  // 3) Control: a previously accepted message stays accepted on redelivery even if deleted later
+  clock += 1000;
+  const alreadyAccepted = discord.userSays("accepted before delete");
+  const r3 = await bot.accept(alreadyAccepted);
+  assert.deepEqual(r3, { accepted: true, inserted: true });
+  await dispatch("MESSAGE_DELETE", { id: alreadyAccepted.id, channel_id: CH });
+  assert.equal(buffer.buffered(key).length, 1, "previously accepted inbound row stays intact as designed");
+  const r3Dup = await bot.accept(alreadyAccepted);
+  assert.deepEqual(r3Dup, { accepted: true, inserted: false });
 });

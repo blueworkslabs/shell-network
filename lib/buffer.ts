@@ -768,6 +768,10 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
         return removed;
       });
     },
+    isDeletedChannelMessage: (id: string, channelId: string): boolean =>
+      one<{ v: number }>("SELECT 1 AS v FROM kv WHERE key = ?", `del:${channelId}:${id}`) !== undefined,
+    hasInbound: (source: string, sourceMessageId: string, conversationKey: string): boolean =>
+      one<{ id: number }>("SELECT id FROM inbound WHERE source = ? AND source_message_id = ? AND conversation_key = ?", source, sourceMessageId, conversationKey) !== undefined,
     channelMessage: (id: string): { id: string; author_id: string; author_name: string; author_kind: string; content: string; channel_id: string } | undefined => one("SELECT id, author_id, author_name, author_kind, content, channel_id FROM channel_message WHERE id = ?", id),
 
     // Completion relay. One row per relayed run, created before its first post (its id is the post nonce).

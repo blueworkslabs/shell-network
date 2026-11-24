@@ -48,9 +48,10 @@ schema change before the trial verdict means a fresh DB.
    applied `edited_at` timestamp (added in place on older buffers) and reject older/out-of-order updates while updating
    only existing rows matching `(id, channel_id, author_id)` for authors this bot listens to (never regressing a newer
    confirmed `discord_edit`), and deletions remove matching rows and record a bounded deletion tombstone (pruned after
-   7 days / 5,000 entries) so delayed creates or backfill cannot restore deleted text, without disturbing
-   `human_message` cap boundaries (also hiding deleted own posts from `#87` crossed-message context). Known limit: text
-   already delivered into a t3 session stays in that session.
+   7 days / 5,000 entries) so delayed creates or backfill cannot restore deleted text or accept new inbound turns for a
+   deleted message (checked before intake and again after any attachment download; previously accepted rows stay as
+   designed), without disturbing `human_message` cap boundaries (also hiding deleted own posts from `#87`
+   crossed-message context). Known limit: text already delivered into a t3 session stays in that session.
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before

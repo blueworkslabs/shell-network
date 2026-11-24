@@ -1,8 +1,8 @@
 // Files in both directions.
 //
 // Inbound: the attachments of an accepted message are described under its text (name, type, size, Discord CDN url).
-// With an inbox (BRIDGE_WORKSPACE/.inbox, #59) the bridge also saves the images among them there and names the saved
-// file in the line, so the agent opens it with its own image tool; everything else the agent fetches itself.
+// With an inbox (BRIDGE_WORKSPACE/.inbox, #59, #102) the bridge also saves images and small UTF-8 text attachments
+// there (text always saved as .txt) and names the saved file in the line; everything else the agent fetches itself.
 //
 // Outbound: discord_send(files) runs in the tool process, which has no Discord credential. The tool checks each path
 // (inside DISCORD_TOOL_WORKSPACE once symlinks are resolved, a regular file, at most ATTACH_MAX_BYTES in all, at most
@@ -16,12 +16,18 @@ import type { DiscordMessage } from "./types.ts";
 
 export const ATTACH_MAX_FILES = 4;
 export const ATTACH_MAX_BYTES = 8 * 1024 * 1024; // in all, per message (Discord's smallest limit is 10 MiB)
+export const TEXT_ATTACH_MAX_BYTES = 256 * 1024; // per inbound text attachment (#102), within ATTACH_MAX_BYTES total
 export const ATTACH_LIST_MAX = 10;               // inbound: attachments described per message
 
 // ---- inbound ----
 const CDN = /^https:\/\/(?:cdn\.discordapp\.com|media\.discordapp\.net)\/[^\s<>"']*$/;
 const MIME = /^[A-Za-z0-9.+-]{1,60}\/[A-Za-z0-9.+-]{1,80}$/;
 const flat = (s: string, max: number) => s.replace(/[\u0000-\u001f\u007f\u2028\u2029[\]]/g, "_").slice(0, max);
+const cleanMime = (ct: unknown): string | null => {
+  if (typeof ct !== "string" || /[\u0000-\u001f\u007f\u2028\u2029[\]]/.test(ct)) return null;
+  const base = ct.split(";")[0].trim().toLowerCase();
+  return MIME.test(base) ? base : null;
+};
 const sizeText = (n: unknown): string => {
   if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return "unknown size";
   return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
@@ -29,13 +35,13 @@ const sizeText = (n: unknown): string => {
 type Att = NonNullable<DiscordMessage["attachments"]>[number];
 // One line per attachment, as the agent reads it. The name and type are made harmless (no brackets or line breaks that
 // could pass for text of the message); a url is kept only when it is on Discord's own CDN. `saved` (saveInbound) adds
-// where an image was saved, or why an image was not.
+// where an image or text file was saved, or why it was not.
 export function attachmentLines(atts: DiscordMessage["attachments"], saved: Saved[] = []): string[] {
   if (!Array.isArray(atts) || !atts.length) return [];
   const lines = atts.slice(0, ATTACH_LIST_MAX).map((a: Att, i) => {
     const name = flat(typeof a?.filename === "string" && a.filename ? a.filename : "file", NAME_MAX);
     const s = saved[i];
-    const type = s && "path" in s ? s.mime : typeof a?.content_type === "string" && MIME.test(a.content_type) ? a.content_type : "unknown type";
+    const type = s && "path" in s ? s.mime : cleanMime(a?.content_type) ?? "unknown type";
     const url = typeof a?.url === "string" && CDN.test(a.url) ? ` ${a.url}` : "";
     const note = !s ? "" : "path" in s ? ` saved: ${s.path}` : ` not saved: ${s.error}`;
     return `[attachment: ${name} (${type}, ${sizeText(s && "path" in s ? s.size : a?.size)})${url}${note}]`;
@@ -47,16 +53,19 @@ export function attachmentLines(atts: DiscordMessage["attachments"], saved: Save
 export const attachmentNames = (atts: DiscordMessage["attachments"]): string[] =>
   (Array.isArray(atts) ? atts : []).slice(0, ATTACH_LIST_MAX).map((a) => (typeof a?.filename === "string" ? flat(a.filename, NAME_MAX) : "file"));
 
-// ---- inbound images (#59) ----
-// Only attachments Discord calls image/* are downloaded (a hint that spares fetching every PDF); what is kept is decided
-// by the file's first bytes alone. At most ATTACH_MAX_FILES images and ATTACH_MAX_BYTES in all per message, enforced
-// while the bytes arrive. The saved name is `<message id>-<index>-<safe name>.<real extension>`, so a repeated accept of
-// the same message finds its files and downloads nothing; files older than INBOX_KEEP_MS are swept.
+// ---- inbound images (#59) and small UTF-8 text files (#102) ----
+// Only attachments Discord calls image/* or recognized text types/extensions are downloaded (sparing PDFs/archives);
+// what is kept is decided by the bytes alone: png/jpeg/gif/webp magic bytes for images, or valid UTF-8 with no NUL
+// bytes for text (always saved as .txt regardless of original extension so no workspace tool treats an attachment as
+// code or config). At most ATTACH_MAX_FILES files and ATTACH_MAX_BYTES in all per message (and TEXT_ATTACH_MAX_BYTES
+// per text file), enforced while the bytes arrive. The saved name is `<message id>-<index>-<safe name>.<real ext>`,
+// so a repeated accept of the same message finds its files and downloads nothing; files older than INBOX_KEEP_MS are
+// swept.
 export const INBOX_KEEP_MS = 7 * 24 * 3_600_000;
 export const INBOX_TIMEOUT_MS = 20_000;
 export type Saved = { path: string; mime: string; size: number } | { error: string } | null;
 export type FetchFile = (url: string, init: { signal: AbortSignal; redirect: "error" }) => Promise<Response>;
-const INBOX_NAME = /^\d{1,25}-\d-[A-Za-z0-9._-]{1,60}\.(?:png|jpg|gif|webp)$/, INBOX_PART = /^\.\d{1,25}-\d-[A-Za-z0-9._-]{1,80}\.[0-9a-f]{12}\.part$/;
+const INBOX_NAME = /^\d{1,25}-\d-[A-Za-z0-9._-]{1,60}\.(?:png|jpg|gif|webp|txt)$/, INBOX_PART = /^\.\d{1,25}-\d-[A-Za-z0-9._-]{1,80}\.[0-9a-f]{12}\.part$/;
 const SIGNATURES: { mime: string; ext: string; is: (b: Buffer) => boolean }[] = [
   { mime: "image/png", ext: "png", is: (b) => b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
   { mime: "image/jpeg", ext: "jpg", is: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
@@ -64,6 +73,34 @@ const SIGNATURES: { mime: string; ext: string; is: (b: Buffer) => boolean }[] = 
   { mime: "image/webp", ext: "webp", is: (b) => b.subarray(0, 4).toString("latin1") === "RIFF" && b.subarray(8, 12).toString("latin1") === "WEBP" },
 ];
 export const imageType = (head: Buffer) => (head.length < 12 ? null : SIGNATURES.find((t) => t.is(head)) ?? null);
+const TEXT_MIMES = new Set([
+  "application/json", "application/xml", "application/yaml", "application/x-yaml", "application/toml",
+  "application/javascript", "application/x-javascript", "application/typescript", "application/x-sh",
+  "application/sql", "application/x-ndjson", "application/jsonl",
+]);
+const TEXT_EXTS = new Set([
+  "txt", "md", "markdown", "log", "json", "jsonl", "ndjson", "diff", "patch", "csv", "tsv",
+  "yml", "yaml", "toml", "ini", "cfg", "conf", "xml", "sql", "sh", "bash", "zsh", "py",
+  "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx", "html", "htm", "css", "go", "rs",
+  "c", "h", "cpp", "hpp", "java", "rb", "php",
+]);
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+export function isValidUtf8Text(data: Buffer): boolean {
+  if (data.includes(0)) return false;
+  try { utf8Decoder.decode(data); return true; } catch { return false; }
+}
+function inboundKind(a: Att | null | undefined): "image" | "text" | null {
+  if (!a || typeof a.url !== "string" || !CDN.test(a.url)) return null;
+  if (typeof a.content_type === "string" && /^image\//i.test(a.content_type)) return "image";
+  const ct = cleanMime(a.content_type);
+  if (ct && (ct.startsWith("text/") || TEXT_MIMES.has(ct))) return "text";
+  const missingCt = typeof a.content_type !== "string" || !a.content_type.trim();
+  if (missingCt || ct === "application/octet-stream") {
+    const ext = typeof a.filename === "string" ? (a.filename.toLowerCase().match(/\.([a-z0-9]{1,10})$/)?.[1] ?? "") : "";
+    if (TEXT_EXTS.has(ext)) return "text";
+  }
+  return null;
+}
 
 class NotSaved extends Error {}
 // The inbox directory, created if missing; a symlink or anything but a plain directory is refused.
@@ -73,7 +110,7 @@ function inboxRoot(inboxDir: string): string {
   if (!st.isDirectory() || st.isSymbolicLink() || realpathSync(inboxDir) !== resolve(inboxDir)) throw new NotSaved("inbox is not a plain directory");
   return resolve(inboxDir);
 }
-async function download(url: string, budget: number, fetchFile: FetchFile, timeoutMs: number): Promise<{ data: Buffer; mime: string; ext: string } | null> {
+async function download(url: string, kind: "image" | "text", budget: number, fetchFile: FetchFile, timeoutMs: number): Promise<{ data: Buffer; mime: string; ext: string } | null> {
   const res = await fetchFile(url, { signal: AbortSignal.timeout(timeoutMs), redirect: "error" }).catch(() => { throw new NotSaved("download failed"); });
   if (!res.ok || !res.body) throw new NotSaved(`download failed (HTTP ${res.status})`);
   if (Number(res.headers.get("content-length") ?? 0) > budget) { await res.body.cancel().catch(() => {}); throw new NotSaved("too big"); }
@@ -83,35 +120,57 @@ async function download(url: string, budget: number, fetchFile: FetchFile, timeo
     for (;;) {
       const { done, value } = await reader.read().catch(() => { throw new NotSaved("download failed"); });
       if (done) break;
-      chunks.push(Buffer.from(value)); size += value.length;
+      const chunk = Buffer.from(value);
+      chunks.push(chunk); size += chunk.length;
       if (size > budget) throw new NotSaved("too big");
-      if (!type && size >= 12 && !(type = imageType(Buffer.concat(chunks)))) return null;
+      if (kind === "image") {
+        if (!type && size >= 12 && !(type = imageType(Buffer.concat(chunks)))) return null;
+      } else if (chunk.includes(0)) {
+        return null;
+      }
     }
   } finally { await reader.cancel().catch(() => {}); }
-  type ??= imageType(Buffer.concat(chunks));
-  return type ? { data: Buffer.concat(chunks), mime: type.mime, ext: type.ext } : null;
+  const data = Buffer.concat(chunks);
+  if (kind === "image") {
+    type ??= imageType(data);
+    return type ? { data, mime: type.mime, ext: type.ext } : null;
+  }
+  return isValidUtf8Text(data) ? { data, mime: "text/plain", ext: "txt" } : null;
 }
-// One entry per listed attachment (attachmentLines' order): where the image is, why an image was not saved, or null
-// (not called an image). Never throws.
+// One entry per listed attachment (attachmentLines' order): where the file is, why it was not saved, or null
+// (not an image or text candidate). Never throws.
 export async function saveInbound({ atts, messageId, inboxDir, fetchFile = fetch, timeoutMs = INBOX_TIMEOUT_MS }:
   { atts: DiscordMessage["attachments"]; messageId: string; inboxDir: string; fetchFile?: FetchFile; timeoutMs?: number }): Promise<Saved[]> {
   if (!Array.isArray(atts) || !/^\d{1,25}$/.test(messageId)) return [];
   const out: Saved[] = [];
   let root: string | null = null, kept = 0, total = 0;
   for (const [i, a] of atts.slice(0, ATTACH_LIST_MAX).entries()) {
-    if (typeof a?.content_type !== "string" || !/^image\//i.test(a.content_type) || typeof a.url !== "string" || !CDN.test(a.url)) { out.push(null); continue; }
+    const kind = inboundKind(a);
+    if (!kind) { out.push(null); continue; }
     try {
-      if (kept >= ATTACH_MAX_FILES) throw new NotSaved(`more than ${ATTACH_MAX_FILES} images`);
-      if (typeof a.size === "number" && a.size > ATTACH_MAX_BYTES - total) throw new NotSaved("too big");
+      if (kept >= ATTACH_MAX_FILES) throw new NotSaved(`more than ${ATTACH_MAX_FILES} files`);
+      const limit = kind === "text" ? Math.min(TEXT_ATTACH_MAX_BYTES, ATTACH_MAX_BYTES - total) : ATTACH_MAX_BYTES - total;
+      if (typeof a.size === "number" && a.size > limit) throw new NotSaved("too big");
       root ??= inboxRoot(inboxDir);
-      const stem = `${messageId}-${i}-${safeName(typeof a.filename === "string" ? a.filename : "image").replace(/\.[^.]*$/, "").slice(0, 40) || "image"}`;
-      const have = readdirSync(root).find((n) => INBOX_NAME.test(n) && n.startsWith(`${stem}.`) && /^(?:png|jpg|gif|webp)$/.test(n.slice(stem.length + 1)));
-      if (have) {
-        const path = join(root, have), st = lstatSync(path), type = st.isFile() ? imageType(readFileSync(path).subarray(0, 12)) : null;
-        if (type) { kept++; total += st.size; out.push({ path, mime: type.mime, size: st.size }); continue; }
+      const fallback = kind === "image" ? "image" : "text";
+      const stem = `${messageId}-${i}-${safeName(typeof a.filename === "string" ? a.filename : fallback).replace(/\.[^.]*$/, "").slice(0, 40) || fallback}`;
+      if (kind === "image") {
+        const have = readdirSync(root).find((n) => INBOX_NAME.test(n) && n.startsWith(`${stem}.`) && /^(?:png|jpg|gif|webp)$/.test(n.slice(stem.length + 1)));
+        if (have) {
+          const path = join(root, have), st = lstatSync(path), type = st.isFile() ? imageType(readFileSync(path).subarray(0, 12)) : null;
+          if (type && st.size <= limit) { kept++; total += st.size; out.push({ path, mime: type.mime, size: st.size }); continue; }
+        }
+      } else {
+        const have = `${stem}.txt`;
+        if (INBOX_NAME.test(have) && readdirSync(root).includes(have)) {
+          const path = join(root, have), st = lstatSync(path);
+          if (st.isFile() && st.size <= limit && isValidUtf8Text(readFileSync(path))) {
+            kept++; total += st.size; out.push({ path, mime: "text/plain", size: st.size }); continue;
+          }
+        }
       }
-      const got = await download(a.url, ATTACH_MAX_BYTES - total, fetchFile, timeoutMs);
-      if (!got) throw new NotSaved("not an image");
+      const got = await download(a.url!, kind, limit, fetchFile, timeoutMs);
+      if (!got) throw new NotSaved(kind === "image" ? "not an image" : "not valid UTF-8 text");
       const path = join(root, `${stem}.${got.ext}`), part = join(root, `.${stem}.${randomBytes(6).toString("hex")}.part`);
       writeFileSync(part, got.data, { flag: "wx", mode: 0o600 });
       try { renameSync(part, path); } catch (e) { rmSync(part, { force: true }); throw e; }

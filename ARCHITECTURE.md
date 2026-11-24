@@ -346,12 +346,15 @@ a timing SLA. No bridge code change was required.
 - **Files** (`lib/attachments.ts`). *Inbound:* each attachment of an accepted message is described under its text, one
   line each: `[attachment: name (type, size) url]`. The name and type are made harmless, the URL is kept only on Discord's
   CDN hosts, at most 10 are listed. A mention with only files is not a bare mention. The unread header names files of
-  unaddressed messages. With `BRIDGE_WORKSPACE` set (#59), the bridge also saves images into the workspace's
-  `.inbox/` and adds `saved: <path>` to the line (or `not saved: <reason>`), so the agent opens the image with its
-  own tool. Only attachments Discord calls `image/*` are downloaded, and the first bytes decide what is kept (png,
-  jpeg, gif, webp, saved under the real extension). At most 4 images and 8 MiB per message, enforced while
+  unaddressed messages. With `BRIDGE_WORKSPACE` set (#59, #102), the bridge also saves images and small UTF-8 text
+  attachments into the workspace's `.inbox/` and adds `saved: <path>` to the line (or `not saved: <reason>`), so the
+  agent opens them with its own tool. Only attachments Discord calls `image/*` or recognized text types/extensions are
+  downloaded, and the bytes decide what is kept: png, jpeg, gif, webp (saved under the real extension) or valid UTF-8
+  without NUL bytes (always saved as `.txt` regardless of original extension, so no workspace tool treats an attachment
+  as code or config). At most 4 files and 8 MiB in all per message (and 256 KiB per text file), enforced while
   downloading. Files are named `<message id>-<index>-<safe name>.<ext>`, so a repeated accept downloads nothing. A
-  message the exchange cap holds back keeps no file. Saved images are swept after 7 days unless their message still waits. Native t3 image attachments
+  message the exchange cap holds back (or a message deleted mid-download) keeps no file. Saved `.inbox/` files are swept
+  after 7 days unless their message still waits. Native t3 image attachments
   (`t3_thread_send_attachments`) are not used: that call steers a running turn and has no retry key. *Outbound:* `discord_send` takes `files` (at most 4 paths, 8 MiB in
   all). The tool, which has no Discord credential, resolves each path (symlinks included): it must be inside
   `DISCORD_TOOL_WORKSPACE` and a regular file (the type is checked before anything is opened, so a FIFO cannot block

@@ -732,14 +732,16 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const confirmedEdit = self
       ? buffer.latestPostedEdit(conversationKey, msg.id)
       : crewBot ? buffer.latestConfirmedEditByAuthor(authorId, channelId, msg.id) : null;
+    const prev = trailingForwardLog(existing.content);
     const attSuffix = Array.isArray(msg.attachments)
       ? (attachmentNames(msg.attachments).length ? ` [attachment: ${attachmentNames(msg.attachments).join(", ")}]` : "")
-      : (existing.content.match(/ \[attachment: [^\]]+\]$/)?.[0] ?? "");
+      : (prev.head.match(/ \[attachment: [^\]]+\]$/)?.[0] ?? "");
     const baseText = confirmedEdit ?? msg.content;
     const baseWithAtt = baseText + (attSuffix && !baseText.endsWith(attSuffix) ? attSuffix : "");
     const authorName = crewBot ? bots.get(authorId)! : self ? name : msg.author?.username ?? "user";
     const fwd = forwardedLines(msg, authorName);
-    const content = fwd ? [baseWithAtt.trim(), fwd.logText].filter(Boolean).join(" ") : baseWithAtt;
+    const fwdText = fwd ? fwd.logText : (msg.message_snapshots === undefined ? prev.fwd : "");
+    const content = fwdText && !baseWithAtt.endsWith(fwdText) ? [baseWithAtt.trim(), fwdText].filter(Boolean).join(" ") : baseWithAtt;
     return buffer.updateChannelMessage(msg.id, channelId, authorId, content, editedAt);
   }
   // Sync a Discord MESSAGE_DELETE / MESSAGE_DELETE_BULK into channel_message (#100). Log-only: removes matching row
@@ -750,10 +752,22 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   }
   // Extract Discord forwarded message snapshot text and attachment filenames (#101).
   // Marked explicitly as quoted material from an unknown original author (never trusted as instructions, never
-  // triggers mentions or /new, and never downloads forwarded attachments). Mentions inside snapshots are defanged
-  // so channelWindow() and exchange-cap accounting never mistake quoted mentions for live pings.
+  // triggers mentions or /new, and never downloads forwarded attachments). Mentions inside snapshots (both text and
+  // attachment filenames) are defanged so channelWindow() and exchange-cap accounting never mistake quoted mentions
+  // for live pings.
   const FORWARD_MAX = 4000;
   const defangMentions = (s: string) => s.replace(/<@([!&]?)(\d+)>/g, (_, p: string, id: string) => (p === "&" ? `@role:${id}` : `@${id}`));
+  function trailingForwardLog(s: string): { head: string; fwd: string } {
+    const marker = "[forwarded by ";
+    for (let idx = s.lastIndexOf(marker); idx >= 0; idx = idx > 0 ? s.lastIndexOf(marker, idx - 1) : -1) {
+      if (idx > 0 && s[idx - 1] !== " ") continue;
+      const tail = s.slice(idx);
+      if (/^\[forwarded by [^[\]\r\n]+ \(quoted material, original author unknown\): .+\]$/.test(tail)) {
+        return { head: s.slice(0, idx).trimEnd(), fwd: tail };
+      }
+    }
+    return { head: s, fwd: "" };
+  }
   function forwardedLines(msg: DiscordMessage, senderName: string): { logText: string; inboundLines: string[] } | null {
     if (msg.message_reference?.type !== 1) return null;
     const snaps = Array.isArray(msg.message_snapshots) ? msg.message_snapshots.slice(0, 5) : [];
@@ -763,7 +777,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       const m = snap?.message;
       if (!m || typeof m !== "object") continue;
       const body = typeof m.content === "string" ? defangMentions(m.content).trim() : "";
-      const atts = attachmentNames(m.attachments);
+      const atts = attachmentNames(m.attachments).map(defangMentions);
       const piece = [body, atts.length ? `[attachment: ${atts.join(", ")}]` : ""].filter(Boolean).join(" ");
       if (piece) parts.push(piece);
     }
@@ -771,7 +785,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const cutAt = raw.length > FORWARD_MAX ? safeCut(raw, FORWARD_MAX) : raw.length;
     const bounded = raw.length > FORWARD_MAX ? `${raw.slice(0, cutAt)}… [+${raw.length - cutAt} chars cut]` : raw;
     const flat = bounded.replace(/\s+/g, " ").trim();
-    const who = senderName.replace(/[\r\n[\]]/g, " ").trim() || "user";
+    const who = defangMentions(senderName).replace(/[\r\n[\]]/g, " ").trim() || "user";
     return {
       logText: `[forwarded by ${who} (quoted material, original author unknown): ${flat}]`,
       inboundLines: [

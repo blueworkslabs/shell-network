@@ -54,9 +54,10 @@ schema change before the trial verdict means a fresh DB.
    crossed-message context). Known limit: text already delivered into a t3 session stays in that session.
    A Discord forward (`message_reference.type === 1` with `message_snapshots`, #101) carries text and sanitized
    attachment filenames only (forwarded attachments are never downloaded), explicitly marked as quoted material from an
-   unknown original author (not an instruction). Mentions inside forwarded snapshots are defanged and never trigger bot
-   mentions, `/new`, addressed-header priority, or bot-to-bot exchange cap counts; in DMs a forward delivers the quoted
-   text instead of an empty bare mention.
+   unknown original author (not an instruction). Mentions inside forwarded snapshots (text and attachment filenames) are
+   defanged and never trigger bot mentions, `/new`, addressed-header priority, or bot-to-bot exchange cap counts; in DMs
+   a forward delivers the quoted text instead of an empty bare mention, and partial caption edits omitting snapshot
+   fields preserve the stored forwarded quote in the local log.
 2. **Catch-up gate.** A durable watermark records how far the channel history has been read through REST. On every
    READY/RESUMED, backfill reads from the watermark. New input goes to t3 only after a catch-up has completed inside
    the current gateway session. On first start, the watermark is the process start time minus 60 s, stored before

@@ -159,3 +159,63 @@ test("FORWARDS (#101) in guild channel: logs marked quoted content for unread he
   assert.deepEqual(br, { accepted: false, reason: "no mention" });
   assert.equal(w.buffer.channelMessage(botFwd.id)?.content.includes(`<@${GEM}>`), false, "bot-forwarded mention defanged");
 });
+
+test("FORWARDS (#101): snapshot attachment filenames defang mentions and caption-only edits preserve the stored forwarded quote", async () => {
+  const w = setup({ dm: false });
+  // Forward whose snapshot attachment filename contains Discord mention markup
+  const mentionFileFwd = {
+    ...w.discord.userSays("", { channel: CH, mention: false }),
+    content: "initial caption",
+    mentions: [],
+    attachments: [{ id: "outer1", filename: "outer.png", content_type: "image/png", size: 100, url: "https://cdn.discordapp.com/attachments/1/2/outer.png" }],
+    message_reference: { type: 1, message_id: "888888888888888893", channel_id: "777777777777777777" },
+    message_snapshots: [{
+      message: {
+        content: "quoted body",
+        attachments: [
+          { id: "att3", filename: `<@${GEM}>.png`, content_type: "image/png", size: 50, url: "https://cdn.discordapp.com/attachments/1/2/ping.png" },
+          { id: "att4", filename: `<@!${HERMES}>-doc.txt`, content_type: "text/plain", size: 50, url: "https://cdn.discordapp.com/attachments/1/2/ping2.txt" },
+        ],
+      },
+    }],
+  };
+  assert.deepEqual(await w.bot.accept(mentionFileFwd), { accepted: false, reason: "no mention" });
+  const logged = w.buffer.channelMessage(mentionFileFwd.id)!;
+  assert.equal(logged.content.includes(`<@${GEM}>`), false, "bot mention in snapshot filename is defanged");
+  assert.equal(logged.content.includes(`<@!${HERMES}>`), false, "crew mention in snapshot filename is defanged");
+  assert.match(logged.content, /\[attachment: @333333333333333333\.png, @444444444444444444-doc\.txt\]/);
+  const win = w.buffer.channelWindow(null, { selfId: GEM, excludeIds: [], addressedId: GEM, limit: 20, channelId: CH });
+  assert.equal(win.addressed.some((m) => m.id === mentionFileFwd.id), false, "snapshot filename mention must not grant addressed priority");
+  assert.equal(win.unaddressed.some((m) => m.id === mentionFileFwd.id), true);
+
+  // Caption-only MESSAGE_UPDATE that omits message_reference, message_snapshots, and attachments preserves both outer attachment and stored forward quote
+  w.advance(1000);
+  const edited1 = w.bot.onMessageUpdate({
+    id: mentionFileFwd.id,
+    channel_id: CH,
+    author: mentionFileFwd.author,
+    content: "updated caption",
+    edited_timestamp: new Date(1_792_900_005_000).toISOString(),
+  });
+  assert.equal(edited1, true);
+  const afterEdit1 = w.buffer.channelMessage(mentionFileFwd.id)!.content;
+  assert.equal(
+    afterEdit1,
+    "updated caption [attachment: outer.png] [forwarded by user1 (quoted material, original author unknown): quoted body [attachment: @333333333333333333.png, @444444444444444444-doc.txt]]",
+  );
+
+  // A second caption-only edit updates the caption again without duplicating the stored quote
+  const edited2 = w.bot.onMessageUpdate({
+    id: mentionFileFwd.id,
+    channel_id: CH,
+    author: mentionFileFwd.author,
+    content: "final caption",
+    edited_timestamp: new Date(1_792_900_010_000).toISOString(),
+  });
+  assert.equal(edited2, true);
+  const afterEdit2 = w.buffer.channelMessage(mentionFileFwd.id)!.content;
+  assert.equal(
+    afterEdit2,
+    "final caption [attachment: outer.png] [forwarded by user1 (quoted material, original author unknown): quoted body [attachment: @333333333333333333.png, @444444444444444444-doc.txt]]",
+  );
+});

@@ -249,8 +249,9 @@ export function makeTools(tdb: ToolDb, bot: string, { now = () => Date.now(), wo
         });
         continue;
       }
+      if (meta?.kind !== "channel") continue; // fail closed: omit unclassified rows until the bridge publishes their type (avoids exposing private thread IDs from older buffers)
       guildParents.add(r.channel_id);
-      const name = typeof meta?.name === "string" && meta.name ? meta.name : undefined;
+      const name = typeof meta.name === "string" && meta.name ? meta.name : undefined;
       if (name) parentNames.set(r.channel_id, name);
       list.push({ id: r.channel_id, kind: "channel", ...(name ? { name } : {}) });
     }

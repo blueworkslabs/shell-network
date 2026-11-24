@@ -107,7 +107,7 @@ test("DISCORD CHANNELS (#98): lists guild channels, DMs, public active threads, 
   assert.deepEqual(hRes, { channels: [{ id: CH_B, kind: "channel", name: "hermes-only" }] });
 });
 
-test("DISCORD CHANNELS (#98) migration compatibility: works on a pre-#98 DB without channel_meta, and bridge adds column in place", () => {
+test("DISCORD CHANNELS (#98) migration compatibility: omits unclassified rows (including pre-#98 private threads) until bridge publishes channel_meta", () => {
   const path = join(tempDir("channels-mig-"), "buffer.db");
   const raw = new DatabaseSync(path);
   raw.exec(`
@@ -118,20 +118,31 @@ test("DISCORD CHANNELS (#98) migration compatibility: works on a pre-#98 DB with
     CREATE TABLE tool_request (conversation_key TEXT NOT NULL, op TEXT NOT NULL, idem_key TEXT NOT NULL, args TEXT NOT NULL, outbox_id INTEGER NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (conversation_key, op, idem_key));
     PRAGMA user_version = ${BUFFER_SCHEMA_VERSION};
   `);
+  // Pre-#98 DB has both a channel and an active private thread without channel_meta
   raw.prepare("INSERT INTO tool_config VALUES ('gem.100', '100', '333', '[]', 2, 0)").run();
+  raw.prepare("INSERT INTO tool_config VALUES ('gem.200', '200', '333', '[]', 2, 0)").run();
   raw.close();
 
-  // New tool reads old schema cleanly before bridge restart
+  // Fail closed: before the bridge publishes channel_meta, unclassified rows are omitted (never exposing private thread ID 200)
   const preTools = makeTools(track(openToolDb(path)), "gem");
-  assert.deepEqual(preTools.channels().structuredContent, { channels: [{ id: "100", kind: "channel" }] });
+  assert.deepEqual(preTools.channels().structuredContent, { channels: [] });
 
-  // Opening with openBuffer adds both `people` and `channel_meta` in place without losing the row
+  // Opening with openBuffer adds both `people` and `channel_meta` in place without losing rows; still omitted while channel_meta is NULL
   const b = openBuffer(path);
   try {
     const cols = new Set((b.db.prepare("PRAGMA table_info(tool_config)").all() as { name: string }[]).map((c) => c.name));
     assert.ok(cols.has("people") && cols.has("channel_meta"));
     const row = b.db.prepare("SELECT channel_id, channel_meta FROM tool_config WHERE conversation_key = 'gem.100'").get() as { channel_id: string; channel_meta: string | null };
     assert.deepEqual({ ...row }, { channel_id: "100", channel_meta: null });
+    assert.deepEqual(preTools.channels().structuredContent, { channels: [] });
+
+    // Once the bridge publishes metadata, classified public channels appear and private threads stay count-only
+    b.setToolConfig("gem.100", { channelId: "100", botUserId: "333", crew: [], exchangeCap: 2, channelMeta: { kind: "channel", name: "general" } });
+    b.setToolConfig("gem.200", { channelId: "200", botUserId: "333", crew: [], exchangeCap: 2, channelMeta: { kind: "private_thread", parentId: "100", parentName: "general" } });
+    assert.deepEqual(preTools.channels().structuredContent, {
+      channels: [{ id: "100", kind: "channel", name: "general" }],
+      privateThreads: 1,
+    });
   } finally {
     b.close();
   }

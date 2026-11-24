@@ -1,9 +1,53 @@
 // Startup order of the bridge process: the durable history boundary first, the gateway only after
 // it exists. If the boundary cannot be stored, the gateway is never connected and the error propagates (the process
 // exits); nothing is received that could fall outside both history recovery and live delivery.
+import { readFileSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { errText } from "./log.ts";
 import type { DiscordRest } from "./discord.ts";
 import type { Log } from "./types.ts";
+
+// Short commit SHA of the running checkout (read once at startup, no subprocess). Returns null if git metadata is
+// absent or unreadable so installs without `.git` still start and answer /status cleanly (#99).
+export function bridgeVersion(repoDir: string): string | null {
+  try {
+    const dotGit = join(repoDir, ".git");
+    const st = statSync(dotGit);
+    let gitDir = dotGit;
+    if (st.isFile()) {
+      const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
+      if (!m) return null;
+      gitDir = resolve(repoDir, m[1].trim());
+    } else if (!st.isDirectory()) return null;
+    let commonDir = gitDir;
+    try {
+      const cd = readFileSync(join(gitDir, "commondir"), "utf8").trim();
+      if (cd) commonDir = resolve(gitDir, cd);
+    } catch {}
+    const head = readFileSync(join(gitDir, "HEAD"), "utf8").trim();
+    const hex = /^[0-9a-f]{7,40}$/i;
+    if (hex.test(head)) return head.slice(0, 7).toLowerCase();
+    const refMatch = /^ref:\s*(refs\/[^\s]+)$/.exec(head);
+    if (!refMatch || refMatch[1].includes("..")) return null;
+    const ref = refMatch[1];
+    for (const base of [gitDir, commonDir]) {
+      try {
+        const sha = readFileSync(join(base, ref), "utf8").trim();
+        if (hex.test(sha)) return sha.slice(0, 7).toLowerCase();
+      } catch {}
+    }
+    try {
+      for (const line of readFileSync(join(commonDir, "packed-refs"), "utf8").split(/\r?\n/)) {
+        if (!line || line.startsWith("#") || line.startsWith("^")) continue;
+        const [sha, name] = line.trim().split(/\s+/);
+        if (name === ref && sha && hex.test(sha)) return sha.slice(0, 7).toLowerCase();
+      }
+    } catch {}
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 export function startBridge({ bot, gateway, startMs, log }: { bot: { initWatermark(startMs: number): string }; gateway: { connect(): void }; startMs: number; log: Log }): string {
   const watermark = bot.initWatermark(startMs);

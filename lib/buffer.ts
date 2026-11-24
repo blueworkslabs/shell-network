@@ -661,6 +661,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     outboxById: (id: number): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE id = ?", id),
     // The oldest entry not posted (or dropped) yet: the only one the worker may touch.
     outboxHead: (conversationKey: string): OutboxRow | undefined => one<OutboxRow>("SELECT * FROM outbox WHERE conversation_key = ? AND state IN ('pending','posting') ORDER BY id LIMIT 1", conversationKey),
+    outboxPendingCount: (conversationKey: string): number => one<{ n: number }>("SELECT count(*) n FROM outbox WHERE conversation_key = ? AND state IN ('pending','posting')", conversationKey)!.n,
     outboxPosting(id: number, boundary: string): void {
       const r = db.prepare("UPDATE outbox SET state = 'posting', boundary = ? WHERE id = ? AND state = 'pending'").run(boundary, id);
       if (r.changes !== 1) throw new Error(`outboxPosting: entry ${id} is not pending`);

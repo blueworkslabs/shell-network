@@ -153,7 +153,7 @@ rule. Do not enable DMs for an agent that serves untrusted channels.
 ## Slash commands (`lib/commands.ts`)
 
 Each bot application registers three global, guild-only commands without options: `/new` (the reset above), `/status`
-(this bot in this channel: thread title and state, open batch, waiting messages, pending `/new`, last `/stop`,
+(this bot in this channel: bridge version, uptime and queued outbox count (#99), thread title and state, open batch, waiting messages, pending `/new`, last `/stop`,
 bot-to-bot count and cap) and `/stop` (interrupt this bot's running turn in this channel). Discord shows one entry per
 bot, so choosing the entry chooses the bot. The text `@Bot /new` keeps working.
 

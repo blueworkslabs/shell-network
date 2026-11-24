@@ -36,7 +36,7 @@ import { commandsHashKey, interactionDispatch, reconcileCommands } from "../lib/
 import { INBOX_KEEP_MS, sweepInbox, sweepStaging } from "../lib/attachments.ts";
 import { errText, makeLog } from "../lib/log.ts";
 import type { DiscordGateway } from "../lib/discord.ts";
-import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch } from "../lib/startup.ts";
+import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, dmIgnoredDispatch, bridgeVersion } from "../lib/startup.ts";
 import { makeThreadManager } from "../lib/threads.ts";
 import { stepLoop } from "../lib/steploop.ts";
 import { bridgeConfig, conversationKeyFor, modelSelectionFor } from "../lib/bots.ts";
@@ -47,6 +47,7 @@ import { McpClient, loadToken } from "../lib/vendor/mcp.mjs";
 import { PUSH_TOKEN_PATH } from "../lib/vendor/push.mjs";
 
 const START_MS = Date.now(); // first-start history boundary (lib/bot.ts initWatermark)
+const VERSION = bridgeVersion(resolve(import.meta.dirname, ".."));
 const need = (k: string): string => { const v = process.env[k]; if (!v) { console.error(`missing ${k}`); process.exit(2); } return v; };
 let crew: ReturnType<typeof bridgeConfig>;
 try { crew = bridgeConfig(process.env); } catch (e) { console.error((e as Error).message); process.exit(2); }
@@ -163,12 +164,12 @@ for (const [i, channelId] of conversations.entries()) {
   if (!dm) parentChannels.set(channelId, { name: channelName, botRoleId });
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm, notesRoot,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm, notesRoot, startedAt: START_MS, version: VERSION,
     ...(dm ? {} : { activeThreads: () => threads?.activeThreadsFor(channelId) ?? [] }),
     buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
   }));
 }
-log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback });
+log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, version: VERSION, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback });
 
 // Single-flight step loop (lib/steploop.ts); a gateway message or a t3 change wakes it early, also mid-step (latched).
 const stepTarget = { step: async () => (threads ? threads.step() : { phase: "idle" }) };
@@ -188,7 +189,7 @@ threads = makeThreadManager({
       name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
       threadLabel: `${cfg.name} #${record.parentName} / ${shortName}`,
       botUserId: cfg.id, botRoleId, projectId, modelSelection,
-      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm: false, notesRoot,
+      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, attachmentsDir, inboxDir, dm: false, notesRoot, startedAt: START_MS, version: VERSION,
       threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
       buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
     });

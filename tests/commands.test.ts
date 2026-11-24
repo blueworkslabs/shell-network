@@ -225,7 +225,7 @@ test("INTERACTION expired: a defer that got 10062 starts nothing; an edit that g
 test("INTERACTION /status: this bot and channel, the thread's state, the open batch, a pending /new and the exchange count with the cap", async () => {
   const w = world();
   await w.run("status");
-  assert.match(w.calls.at(-1)!, /^edit:\*\*Gem\*\* in #shell-network\nThread: none yet, not started\nOpen batch: none; waiting messages: 0\n\/new: none pending\nBot-to-bot messages since the last message from a person or talk-only member: 0 of 12$/);
+  assert.match(w.calls.at(-1)!, /^edit:\*\*Gem\*\* in #shell-network\nBridge: queued outbox: 0\nThread: none yet, not started\nOpen batch: none; waiting messages: 0\n\/new: none pending\nBot-to-bot messages since the last message from a person or talk-only member: 0 of 12$/);
   await w.bot.accept(w.discord.userSays("work"));
   await w.steps(2);
   await w.run("status");

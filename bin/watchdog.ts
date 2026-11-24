@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Watchdog process: the only holder of t3's `orchestration:operate` grant. Runs next to the bridge, shares its
-// buffer DB (bots' thread ids in, notices + action log out) and has no Discord or MCP credentials. Config from the
-// environment; secrets from files only.
+// Watchdog process: holds t3's `orchestration:operate` grant for queue recovery (a bridge holds an operate token only
+// when explicitly configured with BRIDGE_OPERATE_TOKEN + BRIDGE_APPROVAL_USER_ID for /approve and /deny; see SECURITY.md).
+// Runs next to the bridge, shares its buffer DB (bots' thread ids in, notices + action log out) and has no Discord or
+// MCP credentials. Config from the environment; secrets from files only.
 //   WATCHDOG_DB              the bridge's buffer DB (BRIDGE_DB)
 //   WATCHDOG_LOG             event log path (JSONL)
 //   WATCHDOG_OPERATE_TOKEN   path of the operate-scoped WS bearer session ({ "token": ... }); watchdog only

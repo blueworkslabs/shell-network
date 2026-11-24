@@ -1,7 +1,7 @@
 // Watchdog operate client: node --test tests/operate.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { operateClient } from "../lib/operate.ts";
+import { approvalClient, operateClient } from "../lib/operate.ts";
 import { memoryLog } from "../lib/log.ts";
 
 // a scripted t3: ticket endpoint + WS that answers one Request
@@ -51,4 +51,28 @@ test("NEG queue.resume: failure exits, a refused ticket, a silent server, and mi
   await assert.rejects(c.resumeQueue("a", ""), /required/);
   assert.equal(ok.seen.requests.length, 0);
   assert.throws(() => operateClient({ origin: "http://x", token: "", log: memoryLog() }), /token required/);
+});
+
+test("approvalClient (#110): sends ONLY runtime-request.respond with accept or decline on the bound thread, rejects session/always decisions and foreign threads", async () => {
+  const f = fakeT3();
+  const c = approvalClient({ origin: "http://t3.local:3773", token: "OPERATE", log: memoryLog(), boundThread: () => "thread-1", deps: f.deps });
+  assert.deepEqual(await c.respondApproval({ threadId: "thread-1", requestId: "req-1", decision: "decline", commandId: "cmd-1" }), { sequence: 7 });
+  assert.deepEqual(await c.respondApproval({ threadId: "thread-1", requestId: "req-2", decision: "accept", commandId: "cmd-2" }), { sequence: 7 });
+  assert.equal(f.seen.requests.length, 2);
+  assert.deepEqual(f.seen.requests[0].payload, { type: "runtime-request.respond", commandId: "cmd-1", threadId: "thread-1", requestId: "req-1", decision: "decline" });
+  assert.deepEqual(f.seen.requests[1].payload, { type: "runtime-request.respond", commandId: "cmd-2", threadId: "thread-1", requestId: "req-2", decision: "accept" });
+
+  // Refuses foreign thread, session/always allow, empty fields, unconfirmed response, and failures
+  const g = fakeT3();
+  const guarded = approvalClient({ origin: "http://t3.local:3773", token: "OPERATE", log: memoryLog(), boundThread: () => "thread-1", deps: g.deps });
+  await assert.rejects(guarded.respondApproval({ threadId: "thread-other", requestId: "req-1", decision: "accept", commandId: "cmd-x" }), /does not match bound thread/);
+  await assert.rejects(guarded.respondApproval({ threadId: "thread-1", requestId: "req-1", decision: "acceptForSession" as never, commandId: "cmd-x" }), /only accept or decline allowed/);
+  await assert.rejects(guarded.respondApproval({ threadId: "thread-1", requestId: "req-1", decision: "acceptAlways" as never, commandId: "cmd-x" }), /only accept or decline allowed/);
+  await assert.rejects(guarded.respondApproval({ threadId: "thread-1", requestId: "", decision: "decline", commandId: "cmd-x" }), /requestId required/);
+  await assert.rejects(guarded.respondApproval({ threadId: "thread-1", requestId: "req-1", decision: "decline", commandId: "" }), /commandId required/);
+  assert.equal(g.seen.requests.length, 0, "refused calls never touch the socket");
+
+  const unconfirmed = fakeT3({ exit: { _tag: "Success", value: {} } });
+  const u = approvalClient({ origin: "http://t3.local:3773", token: "OPERATE", log: memoryLog(), boundThread: () => "thread-1", deps: unconfirmed.deps });
+  await assert.rejects(u.respondApproval({ threadId: "thread-1", requestId: "req-1", decision: "decline", commandId: "cmd-u" }), /did not confirm/);
 });

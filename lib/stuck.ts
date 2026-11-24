@@ -15,7 +15,7 @@
 //   - one alert per batch and status episode: skipped when alerted_episode === episode.
 //   - the text names the agent only: no batch/message/request/run ids, no paths, no raw command or error text. An
 //     escalated batch shows the reconcile state word (e.g. "payload-mismatch") if its last_error starts with one.
-import type { BatchRow, BatchStatus, BlockingRequestKind, Projection, ProjectionNode, ProjectionTurnItem } from "./types.ts";
+import type { ApprovalRequestKind, BatchRow, BatchStatus, BlockingRequestKind, Projection, ProjectionNode, ProjectionTurnItem } from "./types.ts";
 
 export type StuckLimits = Partial<Record<BatchStatus, number>>;
 export interface StuckAlert { batchId: number; episode: number; conversationKey: string; status: BatchStatus; ageMs: number; text: string }
@@ -29,6 +29,14 @@ export interface BlockingPendingRequest {
   runId: string;
   kind: BlockingRequestKind;
   createdAtMs: number | null;
+}
+export interface BlockingApprovalDetail extends BlockingPendingRequest {
+  kind: ApprovalRequestKind;
+  prompt: string | null;
+  reason: string | null;
+  appName: string | null;
+  cwd: string | null;
+  threadWorktreePath: string | null;
 }
 
 // resolved/cancelled: only while t3 is not verified settled yet (openBatches leaves settled ones out).
@@ -116,6 +124,38 @@ export function findBlockingRequest(
   if (!matches.length) return null;
   matches.sort((a, b) => (a.createdAtMs ?? Infinity) - (b.createdAtMs ?? Infinity) || (a.requestId < b.requestId ? -1 : a.requestId > b.requestId ? 1 : 0));
   return matches[0];
+}
+
+// Like findBlockingRequest, restricted strictly to approval requests (never user_input), returning the exact prompt,
+// reason, app name, request-reported cwd (null if t3 didn't report one for this request), and optional thread
+// worktreePath needed for /approve and /deny ephemeral confirmation (#110).
+export function findBlockingApproval(
+  projection: Projection | null | undefined,
+  targetRunId?: string | null,
+): BlockingApprovalDetail | null {
+  if (!projection || !Array.isArray(projection.runs) || !Array.isArray(projection.runtimeRequests)) return null;
+  const approvalOnly: Projection = {
+    ...projection,
+    runtimeRequests: projection.runtimeRequests.filter((r) => r && r.kind !== "user_input"),
+  };
+  const found = findBlockingRequest(approvalOnly, targetRunId);
+  if (!found || found.kind === "user_input") return null;
+  const req = projection.runtimeRequests.find((r) => r?.id === found.requestId);
+  let item: ProjectionTurnItem | undefined;
+  for (const it of projection.turnItems ?? []) {
+    if (it?.type === "approval_request" && it.requestId === found.requestId) item = it;
+  }
+  const str = (v: unknown): string | null => (typeof v === "string" && v.trim().length > 0 ? v.trim() : null);
+  const rawPrompt = typeof item?.prompt === "string" && item.prompt.trim().length > 0 ? item.prompt : null;
+  return {
+    ...found,
+    kind: found.kind,
+    prompt: rawPrompt,
+    reason: str(item?.reason),
+    appName: str(item?.appName),
+    cwd: str(item?.cwd) ?? str(item?.workingDirectory) ?? str(req?.cwd) ?? str(req?.workingDirectory),
+    threadWorktreePath: str(projection.thread?.worktreePath),
+  };
 }
 
 export function pendingRequestAlertText(

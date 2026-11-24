@@ -59,7 +59,7 @@ test("TOOL PROCESS: handshake and the tool list over stdio (idempotency key requ
 
 test("TOOL PROCESS: refuses to start with the bridge's secret paths in its environment, a missing DB (not created) or another schema version", () => {
   const db = bridgeDb();
-  for (const k of ["BRIDGE_DISCORD_TOKEN", "T1_TOKEN", "T1_PUSH_TOKEN"]) {
+  for (const k of ["BRIDGE_DISCORD_TOKEN", "T1_TOKEN", "T1_PUSH_TOKEN", "BRIDGE_OPERATE_TOKEN"]) {
     const r = spawnSync(process.execPath, [TOOL], { env: { ...baseEnv(db), [k]: "/some/path" }, input: "", encoding: "utf8" });
     assert.equal(r.status, 2, k);
     assert.match(r.stderr, new RegExp(`${k} is set`));

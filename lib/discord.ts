@@ -12,7 +12,7 @@ import { API, GatewayIntentBits, type RESTPostAPIChannelMessageJSONBody } from "
 import { REST, type RESTOptions } from "@discordjs/rest";
 import { WebSocketManager, WebSocketShardEvents } from "@discordjs/ws";
 import { errText } from "./log.ts";
-import type { CommandBody, CommandsPort, ExistingCommand, InteractionPort } from "./commands.ts";
+import type { CommandBody, CommandsPort, ExistingCommand, InteractionEditOptions, InteractionPort } from "./commands.ts";
 import type { CreateMessagePayload, DiscordChannel, DiscordMessage, DiscordPort, Log } from "./types.ts";
 
 export const INTENTS = GatewayIntentBits.Guilds | GatewayIntentBits.GuildMessages | GatewayIntentBits.MessageContent | GatewayIntentBits.DirectMessages;
@@ -32,7 +32,8 @@ export interface DiscordRest extends DiscordPort, CommandsPort {
 }
 const EPHEMERAL = 64;
 const SNOWFLAKE = /^\d{1,25}$/, INTERACTION_TOKEN = /^[A-Za-z0-9._-]{1,1000}$/;
-const clip = (s: string) => (s.length > 1900 ? `${s.slice(0, 1900)}…` : s);
+export const MAX_INTERACTION_CONTENT = 1900;
+const clip = (s: string) => (s.length > MAX_INTERACTION_CONTENT ? `${s.slice(0, MAX_INTERACTION_CONTENT)}…` : s);
 const makeRest = ({ token, makeRequest, api, timeoutMs = 15_000 }: { token: string; makeRequest?: RESTOptions["makeRequest"]; api?: string; timeoutMs?: number }) =>
   // retries: 0 — no hidden repeats of a timed-out POST; the bridge's own recovery decides (reply lookup, nonce).
   new REST({ version: "10", timeout: timeoutMs, retries: 0, ...(makeRequest ? { makeRequest } : {}), ...(api ? { api } : {}) }).setToken(token);
@@ -72,7 +73,22 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
     interactions: Object.freeze({
       reply: (interactionId: string, token: string, content: string) => { callback(interactionId, token); return api.interactions.reply(interactionId, token, { content: clip(content), flags: EPHEMERAL, allowed_mentions: { parse: [] } }); },
       defer: (interactionId: string, token: string) => { callback(interactionId, token); return api.interactions.defer(interactionId, token, { flags: EPHEMERAL }); },
-      edit: async (token: string, content: string) => { callback("0", token); return api.interactions.editReply((await application()).id, token, { content: clip(content), allowed_mentions: { parse: [] } }); },
+      deferUpdate: (interactionId: string, token: string) => { callback(interactionId, token); return api.interactions.deferMessageUpdate(interactionId, token); },
+      edit: async (token: string, content: string, opts?: InteractionEditOptions) => {
+        callback("0", token);
+        const hasButtons = Boolean(opts?.components?.length);
+        // Never silently truncate interactive confirmation text while keeping buttons attached (#110).
+        if (hasButtons && content.length > MAX_INTERACTION_CONTENT) {
+          throw new Error(`interaction edit with components exceeds ${MAX_INTERACTION_CONTENT} chars`);
+        }
+        const components = opts?.components === undefined ? undefined
+          : hasButtons ? [{ type: 1, components: opts.components!.map((b) => ({ type: 2, ...b })) }] : [];
+        return api.interactions.editReply((await application()).id, token, {
+          content: hasButtons ? content : clip(content),
+          allowed_mentions: { parse: [] },
+          ...(components !== undefined ? { components } : {}),
+        } as never);
+      },
     }),
     guildRoles: (guildId: string) => api.guilds.getRoles(guildId),
     me: () => api.users.getCurrent() as unknown as Promise<{ id: string; [k: string]: unknown }>,

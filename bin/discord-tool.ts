@@ -30,7 +30,7 @@ import { makeTools } from "../lib/tools.ts";
 
 const fatal = (msg: string): never => { process.stderr.write(`discord-tool: ${msg}\n`); process.exit(2); };
 // The bridge's secret paths have no business here: refuse to run with them in the environment (deployment hygiene).
-for (const k of ["BRIDGE_DISCORD_TOKEN", "T1_TOKEN", "T1_PUSH_TOKEN"]) if (process.env[k] !== undefined) fatal(`${k} is set; the tool must not get the bridge's secrets`);
+for (const k of ["BRIDGE_DISCORD_TOKEN", "T1_TOKEN", "T1_PUSH_TOKEN", "BRIDGE_OPERATE_TOKEN"]) if (process.env[k] !== undefined) fatal(`${k} is set; the tool must not get the bridge's secrets`);
 const key = process.env.DISCORD_TOOL_BOT ?? "";
 if (!/^[a-z]{1,20}$/.test(key)) fatal("DISCORD_TOOL_BOT: lowercase letters only");
 const dbPath = process.env.DISCORD_TOOL_DB ?? fatal("missing DISCORD_TOOL_DB");

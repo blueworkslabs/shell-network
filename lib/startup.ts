@@ -125,6 +125,16 @@ export function stepAll(bots: { step(): Promise<{ phase: string }> }[], log: Log
   };
 }
 
+// Dedicated approval owner (BRIDGE_APPROVAL_USER_ID): at most one Discord user id, which must also be in
+// BRIDGE_ALLOWED_AUTHORS (#110). Unset disables Discord approvals; multiple ids or ids outside the allowlist fail fast.
+export function approvalOwner(value: string | undefined, allowedAuthors: string[]): string | null {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return null;
+  if (!/^\d{1,25}$/.test(trimmed)) throw new Error("BRIDGE_APPROVAL_USER_ID: a single Discord user id");
+  if (!allowedAuthors.includes(trimmed)) throw new Error("BRIDGE_APPROVAL_USER_ID: must also be in BRIDGE_ALLOWED_AUTHORS");
+  return trimmed;
+}
+
 // Direct messages (BRIDGE_DM_USERS): only allowlisted people, each DM its own conversation. Refuses ids outside the
 // people allowlist, so a DM never admits anyone the channels would not.
 export function dmUsers(value: string | undefined, allowedAuthors: string[]): string[] {

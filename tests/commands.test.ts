@@ -31,21 +31,21 @@ function fakeApp(initial: ExistingCommand[] = [], fail: { create?: string } = {}
 const kv = () => { const m = new Map<string, string>(); return { kvGet: (k: string) => m.get(k) ?? null, kvSet: (k: string, v: unknown) => { m.set(k, String(v)); } }; };
 const names = (a: ReturnType<typeof fakeApp>) => [...a.cmds.values()].map((c) => c.name).sort();
 
-test("COMMANDS: /new, /status and /stop, no options, guild only", () => {
-  assert.deepEqual(COMMANDS.map((c) => c.name), ["new", "status", "stop"]);
+test("COMMANDS: /new, /status, /stop, /approve and /deny, no options, guild only", () => {
+  assert.deepEqual(COMMANDS.map((c) => c.name), ["new", "status", "stop", "approve", "deny"]);
   for (const c of COMMANDS) assert.deepEqual([c.type, c.contexts, c.integration_types, c.options], [1, [0], [0], []]);
 });
 
-test("RECONCILE: a fresh application gets all three commands; the next start makes no command calls at all", async () => {
+test("RECONCILE: a fresh application gets all five commands; the next start makes no command calls at all", async () => {
   const app = fakeApp(), store = kv(), log = memoryLog();
-  assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 3, edited: 0, deleted: 0 });
-  assert.deepEqual(names(app), ["new", "status", "stop"]);
+  assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 5, edited: 0, deleted: 0 });
+  assert.deepEqual(names(app), ["approve", "deny", "new", "status", "stop"]);
   app.calls.length = 0;
   assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log }), { skipped: true });
   assert.deepEqual(app.writes().concat(app.calls.filter((c) => c === "list")), [], "no list, no writes while the hash is unchanged");
 });
 
-test("RECONCILE: an application with foreign commands, some with our names, ends with exactly our three", async () => {
+test("RECONCILE: an application with foreign commands, some with our names, ends with exactly our five", async () => {
   const [cNew, cStatus] = COMMANDS;
   const app = fakeApp([
     { id: "1", name: "new", description: "something else", type: 1, contexts: null, integration_types: null },    // ours by name, different
@@ -56,19 +56,19 @@ test("RECONCILE: an application with foreign commands, some with our names, ends
     { id: "6", name: "help", description: "foreign", type: 1 },
   ]);
   const r = await reconcileCommands({ port: app.port, buffer: kv(), hashKey: "h", log: memoryLog() });
-  assert.deepEqual(r, { skipped: false, created: 1, edited: 1, deleted: 4 });
-  assert.deepEqual(app.writes().sort(), ["create stop", "delete help", "delete new", "delete ping", "delete status", "edit new"]);
-  assert.deepEqual([...app.cmds.values()].map((c) => [c.name, c.type ?? 1]).sort(), [["new", 1], ["status", 1], ["stop", 1]]);
+  assert.deepEqual(r, { skipped: false, created: 3, edited: 1, deleted: 4 });
+  assert.deepEqual(app.writes().sort(), ["create approve", "create deny", "create stop", "delete help", "delete new", "delete ping", "delete status", "edit new"]);
+  assert.deepEqual([...app.cmds.values()].map((c) => [c.name, c.type ?? 1]).sort(), [["approve", 1], ["deny", 1], ["new", 1], ["status", 1], ["stop", 1]]);
   assert.ok(commandMatches([...app.cmds.values()].find((c) => c.name === "new")!, cNew), "the existing /new was edited into ours");
   assert.equal(app.cmds.get("2")!.version, "1", "the already-right /status was left alone");
 });
 
 test("RECONCILE: Discord's added fields do not count as a difference, and a changed description is edited", async () => {
-  const [cNew, cStatus, cStop] = COMMANDS;
+  const [cNew, cStatus, cStop, cApprove, cDeny] = COMMANDS;
   assert.ok(commandMatches(registered(cNew, "1"), cNew));
   assert.ok(commandMatches({ ...registered(cNew, "1"), contexts: [0], integration_types: [0], options: undefined, nsfw: undefined }, cNew), "defaults count as defaults");
   assert.ok(!commandMatches({ ...registered(cNew, "1"), contexts: [0, 1] }, cNew));
-  const app = fakeApp([registered(cNew, "1"), { ...registered(cStatus, "2"), description: "old text" }, registered(cStop, "3")]);
+  const app = fakeApp([registered(cNew, "1"), { ...registered(cStatus, "2"), description: "old text" }, registered(cStop, "3"), registered(cApprove, "4"), registered(cDeny, "5")]);
   assert.deepEqual(await reconcileCommands({ port: app.port, buffer: kv(), hashKey: "h", log: memoryLog() }), { skipped: false, created: 0, edited: 1, deleted: 0 });
   assert.deepEqual(app.writes(), ["edit status"]);
 });
@@ -80,20 +80,20 @@ test("RECONCILE hash is per application: one application's registration does not
   assert.equal((await reconcileCommands({ port: b.port, buffer: store, hashKey: "h", log })).skipped, false, "the other application registers although the first one is done");
   assert.equal((await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log })).skipped, true);
   // rollback: bin/clear-commands.ts reconciles to the empty set under the same key; the next normal start registers again
-  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log, commands: [] }), { skipped: false, created: 0, edited: 0, deleted: 3 });
+  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log, commands: [] }), { skipped: false, created: 0, edited: 0, deleted: 5 });
   assert.deepEqual(names(a), []);
-  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 3, edited: 0, deleted: 0 });
-  assert.deepEqual(names(a), ["new", "status", "stop"]);
-  assert.deepEqual(names(b), ["new", "status", "stop"], "the other application was not touched by the removal");
+  assert.deepEqual(await reconcileCommands({ port: a.port, buffer: store, hashKey: "h", log }), { skipped: false, created: 5, edited: 0, deleted: 0 });
+  assert.deepEqual(names(a), ["approve", "deny", "new", "status", "stop"]);
+  assert.deepEqual(names(b), ["approve", "deny", "new", "status", "stop"], "the other application was not touched by the removal");
 });
 
 test("RECONCILE failure: the rest is still done, the error surfaces, no hash is stored, and the next start finishes the job", async () => {
   const app = fakeApp([{ id: "3", name: "ping", description: "foreign", type: 1 }], { create: "new" }), store = kv();
   await assert.rejects(reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log: memoryLog() }), /create new: boom/);
-  assert.deepEqual(names(app), ["status", "stop"], "status and stop created and ping deleted although new failed");
+  assert.deepEqual(names(app), ["approve", "deny", "status", "stop"], "other commands created and ping deleted although new failed");
   assert.equal(store.kvGet("h:700"), null);
   assert.deepEqual(await reconcileCommands({ port: app.port, buffer: store, hashKey: "h", log: memoryLog() }), { skipped: false, created: 1, edited: 0, deleted: 0 });
-  assert.deepEqual(names(app), ["new", "status", "stop"]);
+  assert.deepEqual(names(app), ["approve", "deny", "new", "status", "stop"]);
   assert.notEqual(store.kvGet("h:700"), null);
 });
 

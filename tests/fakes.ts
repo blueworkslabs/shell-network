@@ -1,14 +1,14 @@
 // Offline stand-ins for t3 and Discord, with the behaviour the bridge relies on (as observed in the t3 stress test / documented by
 // Discord) and crash hooks. A "crash" closes the bridge's buffer first, so nothing the bridge does after the crash
 // point can reach durable state (like a killed process); the test then restarts on the same database file.
-import type { CreateMessagePayload, DiscordMessage, InterruptResult, ModelSelection, Projection, ProjectionNode, ProjectionRuntimeRequest, ProjectionTurnItem, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead, T3Port } from "../lib/types.ts";
+import type { ApprovalDecision, CreateMessagePayload, DiscordMessage, InterruptResult, ModelSelection, Projection, ProjectionNode, ProjectionRuntimeRequest, ProjectionTurnItem, QueueItem, QueueList, ReadItem, ThreadListItem, ThreadRead, T3Port } from "../lib/types.ts";
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted", "rolled_back"]);
 
 export interface FakeRun { runId: string; ordinal: number; status: string; userMessageId: string; text: string; queueHeld?: boolean; inputType?: "user_message" | "notification" }
-export interface FakeThread { id: string; projectId: string; title: string; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[]; archived?: boolean; nodes: ProjectionNode[]; runtimeRequests: ProjectionRuntimeRequest[]; turnItems: ProjectionTurnItem[] }
+export interface FakeThread { id: string; projectId: string; title: string; worktreePath?: string | null; modelSelection?: ModelSelection; runs: FakeRun[]; items: ReadItem[]; queue: QueueItem[]; archived?: boolean; nodes: ProjectionNode[]; runtimeRequests: ProjectionRuntimeRequest[]; turnItems: ProjectionTurnItem[] }
 export interface Crash { buffer?: { close(): void }; send?: "before" | "after"; launch?: "after"; interrupt?: "before" | "after"; archive?: "after"; post?: "before" | "after"; react?: "before" }
-export interface FakeCall { tool: string; title?: string; threadId?: string; runId?: string; mode?: string; clientRequestId?: string; message?: string }
+export interface FakeCall { tool: string; title?: string; threadId?: string; runId?: string; mode?: string; clientRequestId?: string; message?: string; requestId?: string; decision?: ApprovalDecision; commandId?: string }
 type SendArgs = { threadId: string; message: string; mode: string; clientRequestId: string };
 export interface FakeT3 {
   standingJobs: Awaited<ReturnType<T3Port["listStandingJobs"]>>;
@@ -24,6 +24,8 @@ export interface FakeT3 {
   interruptDelay: boolean; // test control: leave the run active until interrupted(threadId, runId) is called
   interrupt(args: { threadId: string; runId: string; clientRequestId: string }): Promise<InterruptResult>;
   interrupted(threadId: string, runId: string): void;
+  approvalError: string | null; // test control: respondApproval fails with this message
+  respondApproval?: (args: { threadId: string; requestId: string; decision: ApprovalDecision; commandId: string }) => Promise<{ sequence: number }>;
   archiveError: string | null; // test control: archive fails with this message (once)
   archive(threadId: string): Promise<{ archived: true }>; // like t3: a second archive of a thread is an error
   // the messages view of a thread (as live t3 answers it for an archived conversation), paged by `limit`
@@ -81,6 +83,7 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
     async projection(threadId) {
       const t = th(threadId);
       return {
+        thread: { id: t.id, title: t.title, worktreePath: t.worktreePath ?? null },
         runs: t.runs.map((r) => ({ id: r.runId, ordinal: r.ordinal, status: r.status, queueHeld: r.queueHeld ?? false, userMessageId: r.userMessageId })),
         nodes: t.nodes.map((node) => ({ ...node })),
         runtimeRequests: t.runtimeRequests.map((req) => ({ ...req, ...(req.responseCapability ? { responseCapability: { ...req.responseCapability } } : {}) })),
@@ -133,6 +136,23 @@ export function fakeT3({ clientId = "fake" }: { clientId?: string } = {}): FakeT
       const r = t.runs.find((x) => x.runId === runId)!;
       r.status = "interrupted";
       promote(t);
+    },
+    approvalError: null,
+    async respondApproval({ threadId, requestId, decision, commandId }) {
+      calls.push({ tool: "respondApproval", threadId, requestId, decision, commandId });
+      if (api.approvalError) throw new Error(api.approvalError);
+      const t = th(threadId);
+      const req = t.runtimeRequests.find((r) => r.id === requestId);
+      if (!req || req.status !== "pending") throw new Error(`Request ${requestId} is not pending`);
+      req.status = "resolved";
+      const node = t.nodes.find((nd) => nd.id === req.nodeId);
+      if (node) node.status = "completed";
+      const item = t.turnItems.find((it) => it.requestId === requestId);
+      if (item) item.status = "completed";
+      const runId = node?.runId ?? item?.runId;
+      const run = runId ? t.runs.find((r) => r.runId === runId) : undefined;
+      if (run && run.status === "waiting") run.status = "running";
+      return { sequence: ++n };
     },
     archiveError: null,
     archiveReadError: null,

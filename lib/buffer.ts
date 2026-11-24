@@ -170,7 +170,8 @@ CREATE TABLE IF NOT EXISTS tool_config (          -- what the bridge tells its b
   crew              TEXT NOT NULL,              -- JSON [{ id, name }]: the other crew bots it may mention
   exchange_cap      INTEGER NOT NULL,           -- 0 = off
   updated_at        INTEGER NOT NULL,
-  people            TEXT                        -- JSON [user id]: the people the bot listens to (#93); NULL = not published
+  people            TEXT,                       -- JSON [user id]: the people the bot listens to (#93); NULL = not published
+  channel_meta      TEXT                        -- JSON { kind, name?, parentId?, parentName? }: channel metadata for discord_channels (#98); private thread names never stored
 );
 CREATE TABLE IF NOT EXISTS tool_request (         -- one row per mutating tool call and idempotency key
   conversation_key  TEXT NOT NULL,
@@ -218,8 +219,10 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
   db.exec("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;");
   try {
     db.exec(SCHEMA);
-    // added after the table existed (#93): a DB created before gets the column in place
-    if (!(db.prepare("PRAGMA table_info(tool_config)").all() as { name: string }[]).some((c) => c.name === "people")) db.exec("ALTER TABLE tool_config ADD COLUMN people TEXT");
+    // added after the table existed (#93, #98): a DB created before gets the columns in place
+    const tcCols = new Set((db.prepare("PRAGMA table_info(tool_config)").all() as { name: string }[]).map((c) => c.name));
+    if (!tcCols.has("people")) db.exec("ALTER TABLE tool_config ADD COLUMN people TEXT");
+    if (!tcCols.has("channel_meta")) db.exec("ALTER TABLE tool_config ADD COLUMN channel_meta TEXT");
     db.exec(`PRAGMA user_version = ${BUFFER_SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (e) {
@@ -684,10 +687,13 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
     },
 
     // ---- the bot's Discord tool ----
-    setToolConfig(conversationKey: string, c: { channelId: string; botUserId: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap: number; people?: string[] }): void {
-      db.prepare(`INSERT INTO tool_config (conversation_key, channel_id, bot_user_id, crew, exchange_cap, updated_at, people) VALUES (?, ?, ?, ?, ?, ?, ?)
+    setToolConfig(conversationKey: string, c: { channelId: string; botUserId: string; crew: { id: string; name: string; talkOnly?: boolean }[]; exchangeCap: number; people?: string[]; channelMeta?: { kind: "channel" | "dm" | "thread" | "private_thread"; name?: string; parentId?: string; parentName?: string } }): void {
+      db.prepare(`INSERT INTO tool_config (conversation_key, channel_id, bot_user_id, crew, exchange_cap, updated_at, people, channel_meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (conversation_key) DO UPDATE SET channel_id = excluded.channel_id, bot_user_id = excluded.bot_user_id, crew = excluded.crew,
-        exchange_cap = excluded.exchange_cap, updated_at = excluded.updated_at, people = excluded.people`).run(conversationKey, c.channelId, c.botUserId, JSON.stringify(c.crew), c.exchangeCap, now(), c.people ? JSON.stringify(c.people) : null);
+        exchange_cap = excluded.exchange_cap, updated_at = excluded.updated_at, people = excluded.people, channel_meta = excluded.channel_meta`).run(
+        conversationKey, c.channelId, c.botUserId, JSON.stringify(c.crew), c.exchangeCap, now(),
+        c.people ? JSON.stringify(c.people) : null, c.channelMeta ? JSON.stringify(c.channelMeta) : null,
+      );
     },
     deleteToolConfig(conversationKey: string): void {
       db.prepare("DELETE FROM tool_config WHERE conversation_key = ?").run(conversationKey);

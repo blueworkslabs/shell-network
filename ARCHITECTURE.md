@@ -331,7 +331,8 @@ a timing SLA. No bridge code change was required.
   the same message is marked done without a PATCH, so only the latest text is sent. The tool only inserts (its
   connection has no UPDATE or DELETE), so it does not collapse queued edits itself; it refuses a new edit while 5
   unsent edits of the same message are waiting.
-- `discord_read` reads only the named channel's log, with no network access, and only messages by this bot, its crew and the people its bridge listens to (published in `tool_config.people`; the log is shared by every bot on the buffer, #93). A config without `people` (from a bridge before #93) filters nothing. The column is added in place when the bridge opens an older buffer.
+- `discord_read` reads only the named channel's log, with no network access, and only messages by this bot, its crew and the people its bridge listens to (published in `tool_config.people`; the log is shared by every bot on the buffer, #93). A config without `people` (from a bridge before #93) filters nothing. It supports optional backwards (`before`) or forward (`after`, mutually exclusive) snowflake cursors, returning oldest-first (#98).
+- `discord_channels` (#98) is read-only and lists this bot's allowed guild channels, DMs, public active threads, and open legacy tool threads from `tool_config.channel_meta` and `outbox`. Private thread names and ids are never exposed (private threads are reported by count only, matching `/status` in #77). Both `people` and `channel_meta` are added in place when the bridge opens an older buffer.
 - **Files** (`lib/attachments.ts`). *Inbound:* each attachment of an accepted message is described under its text, one
   line each: `[attachment: name (type, size) url]`. The name and type are made harmless, the URL is kept only on Discord's
   CDN hosts, at most 10 are listed. A mention with only files is not a bare mention. The unread header names files of

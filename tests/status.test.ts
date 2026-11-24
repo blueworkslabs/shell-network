@@ -1,7 +1,8 @@
 // /status runtime info (#99): node --test tests/status.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeBot } from "../lib/bot.ts";
 import { conversationKeyFor } from "../lib/bots.ts";
@@ -108,4 +109,31 @@ test("bridgeVersion (#99): resolves loose ref, packed-refs, detached HEAD, git w
   // 5) Missing .git
   const r5 = tempDir("ver-none-");
   assert.equal(bridgeVersion(r5), null);
+
+  // 6) Installed git-archive layout without .git (RELEASE populated via export-subst)
+  const r6 = tempDir("ver-archive-");
+  const repo = join(r6, "src");
+  const archived = join(r6, "installed-release");
+  mkdirSync(repo, { recursive: true });
+  mkdirSync(archived, { recursive: true });
+  writeFileSync(join(repo, ".gitattributes"), "RELEASE export-subst\n");
+  writeFileSync(join(repo, "RELEASE"), "$Format:%H$\n");
+  const git = (args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+  git(["init", "-q"]);
+  git(["config", "user.email", "test@example.invalid"]);
+  git(["config", "user.name", "Test"]);
+  git(["add", ".gitattributes", "RELEASE"]);
+  git(["commit", "-q", "-m", "init"]);
+  const sha = git(["rev-parse", "HEAD"]);
+  const tar = execFileSync("git", ["archive", sha], { cwd: repo });
+  execFileSync("tar", ["-x", "-C", archived], { input: tar });
+  assert.equal(existsSync(join(archived, ".git")), false, "archived install has no .git");
+  assert.equal(bridgeVersion(archived), sha.slice(0, 7), "reads commit from git-archive RELEASE file");
+  // Unexpanded RELEASE placeholder in a live checkout falls through to .git
+  assert.equal(bridgeVersion(repo), sha.slice(0, 7), "unexpanded RELEASE falls back to .git in checkout");
+
+  // 7) Installed release directory named by full 40-char commit SHA (OPERATIONS.md layout without RELEASE or .git)
+  const r7 = join(tempDir("ver-dirsha-"), "f1e2d3c4b5a69788796a5b4c3d2e1f0a1b2c3d4e");
+  mkdirSync(r7, { recursive: true });
+  assert.equal(bridgeVersion(r7), "f1e2d3c", "reads commit from 40-char hex release directory name");
 });

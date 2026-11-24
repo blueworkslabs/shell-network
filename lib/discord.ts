@@ -12,7 +12,7 @@ import { API, GatewayIntentBits, type RESTPostAPIChannelMessageJSONBody } from "
 import { REST, type RESTOptions } from "@discordjs/rest";
 import { WebSocketManager, WebSocketShardEvents } from "@discordjs/ws";
 import { errText } from "./log.ts";
-import type { CommandBody, CommandsPort, ExistingCommand, InteractionPort } from "./commands.ts";
+import type { CommandBody, CommandsPort, ExistingCommand, InteractionEditOptions, InteractionPort } from "./commands.ts";
 import type { CreateMessagePayload, DiscordChannel, DiscordMessage, DiscordPort, Log } from "./types.ts";
 
 export const INTENTS = GatewayIntentBits.Guilds | GatewayIntentBits.GuildMessages | GatewayIntentBits.MessageContent | GatewayIntentBits.DirectMessages;
@@ -72,7 +72,17 @@ export function discordRest({ token, allowedChannels, alsoAllowed = () => false,
     interactions: Object.freeze({
       reply: (interactionId: string, token: string, content: string) => { callback(interactionId, token); return api.interactions.reply(interactionId, token, { content: clip(content), flags: EPHEMERAL, allowed_mentions: { parse: [] } }); },
       defer: (interactionId: string, token: string) => { callback(interactionId, token); return api.interactions.defer(interactionId, token, { flags: EPHEMERAL }); },
-      edit: async (token: string, content: string) => { callback("0", token); return api.interactions.editReply((await application()).id, token, { content: clip(content), allowed_mentions: { parse: [] } }); },
+      deferUpdate: (interactionId: string, token: string) => { callback(interactionId, token); return api.interactions.deferMessageUpdate(interactionId, token); },
+      edit: async (token: string, content: string, opts?: InteractionEditOptions) => {
+        callback("0", token);
+        const components = opts?.components === undefined ? undefined
+          : opts.components.length ? [{ type: 1, components: opts.components.map((b) => ({ type: 2, ...b })) }] : [];
+        return api.interactions.editReply((await application()).id, token, {
+          content: clip(content),
+          allowed_mentions: { parse: [] },
+          ...(components !== undefined ? { components } : {}),
+        } as never);
+      },
     }),
     guildRoles: (guildId: string) => api.guilds.getRoles(guildId),
     me: () => api.users.getCurrent() as unknown as Promise<{ id: string; [k: string]: unknown }>,

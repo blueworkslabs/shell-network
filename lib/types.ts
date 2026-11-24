@@ -160,6 +160,8 @@ export type BlockingRequestKind =
   | "mcp-elicitation"
   | "permission"
   | "user_input";
+export type ApprovalRequestKind = Exclude<BlockingRequestKind, "user_input">;
+export type ApprovalDecision = "accept" | "decline";
 export interface ProjectionRuntimeRequest {
   id: string;
   nodeId?: string | null;
@@ -176,6 +178,9 @@ export interface ProjectionTurnItem {
   nodeId?: string | null;
   requestId?: string | null;
   requestKind?: string | null;
+  prompt?: string | null;
+  reason?: string | null;
+  appName?: string | null;
   status?: string | null;
   responseMode?: string | null;
   secretStatus?: string | null;
@@ -183,6 +188,7 @@ export interface ProjectionTurnItem {
   feedbackStatus?: string | null;
 }
 export interface Projection {
+  thread?: { id?: string; worktreePath?: string | null; title?: string; [k: string]: unknown };
   runs: ProjectionRun[];
   nodes?: ProjectionNode[];
   runtimeRequests?: ProjectionRuntimeRequest[];
@@ -287,6 +293,8 @@ export interface T3Port {
   send(args: { threadId: string; message: string; mode: "queue"; clientRequestId: string }): Promise<{ messageId?: string; runId?: string; delivery?: string }>;
   // /stop: interrupt the bound thread's recorded running turn (never `stop: true`, so queued input is not held)
   interrupt(args: { threadId: string; runId: string; clientRequestId: string }): Promise<InterruptResult>;
+  // /approve and /deny (#110): single-use accept or decline of a live pending approval on the bound thread
+  respondApproval?(args: { threadId: string; requestId: string; decision: ApprovalDecision; commandId: string }): Promise<{ sequence: number }>;
   // /new: archive the bot's own (bound) thread; archived threads stay readable by id (native search excludes them)
   archive(threadId: string): Promise<unknown>;
   // the export after /new: one page of an archived thread in the messages view (lib/t3-transcript.ts)

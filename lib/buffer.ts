@@ -599,7 +599,7 @@ export function openBuffer(path: string, { now = () => Date.now() }: { now?: () 
       db.prepare("UPDATE notice SET channel_message_id = ?, posted_at = ? WHERE id = ? AND posted_at IS NULL").run(String(channelMessageId), now(), id);
     },
     // Watchdog action log: recorded before the action, result after.
-    recordAction(a: { kind: "queue-resume" | "restart"; findingKey: string; threadId: string | null; commandId: string | null }): number {
+    recordAction(a: { kind: "queue-resume" | "restart" | "approval-accept" | "approval-decline"; findingKey: string; threadId: string | null; commandId: string | null }): number {
       return Number(db.prepare("INSERT INTO watchdog_action (kind, finding_key, thread_id, command_id, at) VALUES (?, ?, ?, ?, ?)").run(a.kind, a.findingKey, a.threadId, a.commandId, now()).lastInsertRowid);
     },
     finishAction(id: number, result: string): void { db.prepare("UPDATE watchdog_action SET result = ? WHERE id = ?").run(result, id); },

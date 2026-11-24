@@ -12,6 +12,7 @@ import type { ScheduleHandoff } from "../lib/schedule-handoff.ts";
 //   BRIDGE_LOG               event log path (JSONL)
 //   T1_MCP_URL, T1_TOKEN     t3 /mcp endpoint and the bridge's MCP token file (write path)
 //   T1_PUSH_TOKEN            WS read-only session file (projection; orchestration:read only)
+//   BRIDGE_OPERATE_TOKEN     optional, WS operate-scoped session file for /approve and /deny (#110); unset = Discord approvals disabled
 //   BRIDGE_TICK_MS           optional, step interval while a batch is open (default 3000; idle 30000)
 //   BRIDGE_ALLOWED_AUTHORS   comma-separated Discord user ids whose mentions are accepted (the user only);
 //                            everyone else is dropped before the buffer
@@ -41,6 +42,7 @@ import { startBridge, gatewayDispatch, managedRole, stepAll, dmUsers, openDms, d
 import { makeThreadManager } from "../lib/threads.ts";
 import { stepLoop } from "../lib/steploop.ts";
 import { bridgeConfig, conversationKeyFor, modelSelectionFor } from "../lib/bots.ts";
+import { approvalClient } from "../lib/operate.ts";
 import { preflight } from "../lib/preflight.ts";
 import { shellWatch } from "../lib/shellwatch.ts";
 import { mcpCallLog, t3Adapter } from "../lib/t3.ts";
@@ -65,8 +67,9 @@ try {
   process.exit(e instanceof LockHeldError ? 4 : 2);
 }
 // Secret-file hygiene next: no secret is read or used and nothing is connected before it passes.
+const operateTokenPath = process.env.BRIDGE_OPERATE_TOKEN || undefined;
 try {
-  preflight({ secretFiles: [need("BRIDGE_DISCORD_TOKEN"), need("T1_TOKEN"), need("T1_PUSH_TOKEN")] });
+  preflight({ secretFiles: [need("BRIDGE_DISCORD_TOKEN"), need("T1_TOKEN"), need("T1_PUSH_TOKEN"), ...(operateTokenPath ? [operateTokenPath] : [])] });
 } catch (e) {
   console.error((e as Error).message);
   process.exit(2);
@@ -94,6 +97,14 @@ setInterval(() => {
   }
 }, 5000);
 need("T1_MCP_URL"); need("T1_TOKEN"); need("T1_PUSH_TOKEN");
+const t3Origin = new URL(need("T1_MCP_URL")).origin;
+const operateToken = operateTokenPath ? (() => {
+  try {
+    const t = (JSON.parse(readFileSync(operateTokenPath, "utf8")) as { token?: unknown }).token;
+    return typeof t === "string" && t.trim() ? t.trim() : null;
+  } catch { return null; }
+})() : undefined;
+if (operateTokenPath && !operateToken) { console.error("BRIDGE_OPERATE_TOKEN: file must contain a non-empty JSON token"); process.exit(2); }
 const tickMs = Number(process.env.BRIDGE_TICK_MS ?? 3000);
 
 // The vendored client logs every tool result; the bridge reads the whole thread every tick, so read-type results
@@ -155,6 +166,8 @@ const policyFor = (conversationKey: string) => ({
   // only with the export on (BRIDGE_NOTES_DIR): otherwise no archived thread is readable at all
   archivedThreads: () => (notesRoot ? (JSON.parse(buffer.kvGet(`${conversationKey}:archived`) ?? "[]") as { threadId: string }[]).map((a) => a.threadId) : []),
 });
+const approvalFor = (conversationKey: string) =>
+  operateToken ? approvalClient({ origin: t3Origin, token: operateToken, log, boundThread: () => buffer.kvGet(`${conversationKey}:threadId`) }) : undefined;
 const bots: ReturnType<typeof makeBot>[] = [];
 const parentChannels = new Map<string, { name: string; botRoleId: string | null }>();
 for (const [i, channelId] of conversations.entries()) {
@@ -165,9 +178,9 @@ for (const [i, channelId] of conversations.entries()) {
   if (!dm) parentChannels.set(channelId, { name: channelName, botRoleId });
   bots.push(makeBot({
     name: cfg.name, conversationKey, channelId, channelName, threadLabel: `${cfg.name} #${channelName}`, botUserId: cfg.id, botRoleId, projectId, modelSelection,
-    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, dm, notesRoot, startedAt: START_MS, version: VERSION,
+    allowedAuthors: dm ? dms.filter((d) => d.channelId === channelId).map((d) => d.userId) : allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, workspaceDir: workspace, dm, notesRoot, startedAt: START_MS, version: VERSION,
     ...(dm ? {} : { activeThreads: () => threads?.activeThreadsFor(channelId) ?? [] }),
-    buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
+    buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH, approval: approvalFor(conversationKey) }), discord, log, session,
   }));
 }
 log.emit("bridge.start", { bot: cfg.name, key: cfg.key, botUserId: cfg.id, version: VERSION, channelIds, dms: dms.length, projectId, allowedBots: crew.allowedBots.map((b) => b.name), exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback });
@@ -190,15 +203,15 @@ threads = makeThreadManager({
       name: cfg.name, conversationKey, channelId: record.threadId, channelName: record.name,
       threadLabel: `${cfg.name} #${record.parentName} / ${shortName}`,
       botUserId: cfg.id, botRoleId, projectId, modelSelection,
-      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, dm: false, notesRoot, startedAt: START_MS, version: VERSION,
+      allowedAuthors, allowedBots: crew.allowedBots, exchangeCap: crew.exchangeCap, silentFeedback: crew.silentFeedback, t3AppLabel: crew.t3AppLabel, attachmentsDir, inboxDir, workspaceDir: workspace, dm: false, notesRoot, startedAt: START_MS, version: VERSION,
       threadContext: { parentId: record.parentId, parentName: record.parentName, threadName: record.name, isPrivate: record.type === 12, starter: record.starter ?? null },
-      buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH }), discord, log, session,
+      buffer, t3: t3Adapter({ mcp, policy: policyFor(conversationKey), log: mcpLog, projectionTokenPath: PUSH_TOKEN_PATH, approval: approvalFor(conversationKey) }), discord, log, session,
     });
   },
 });
 threads.restore();
 
-// Slash commands (`/new`, `/status`, `/stop`): answered per interaction, by the bot of the interaction's channel or active thread (lib/commands.ts).
+// Slash commands (`/new`, `/status`, `/stop`, `/approve`, `/deny`): answered per interaction, by the bot of the interaction's channel or active thread (lib/commands.ts).
 // guild channels and their active threads only: the slash commands are guild-only, and a DM conversation is never a command target
 const interact = interactionDispatch({ port: discord.interactions, bots: { get: (ch) => channelBots.get(ch) ?? threads?.botFor(ch) }, allowedAuthors, nudge, log });
 const dmIgnored = dmIgnoredDispatch({ known: new Set(conversations), log });

@@ -324,6 +324,16 @@ a timing SLA. No bridge code change was required.
   projection before dispatch so a restart after an offline resolution never posts a stale alert or clear while ordinary
   outbox traffic still drains), and posts one reply follow-up once resolved or when the run ends. The bridge never
   auto-approves, interrupts, or replays on its own.
+- **Discord `/approve` and `/deny` (#110):** guild-only slash commands allowing an allowlisted human user (never bots or
+  other members) to inspect and answer a live pending approval (never `user_input`, stale requests, or non-blocking
+  cards) directly from Discord. Running `/approve` or `/deny` replies with an ephemeral confirmation showing the agent,
+  approval type, working directory, and exact command/request detail, bound to a single-use 5-minute confirmation token
+  tied to `(userId, action, threadId, runId, requestId)`. Confirming consumes the token atomically, re-verifies the
+  exact `requestId` is still pending and live on the bound thread, sends strictly `accept` (approve once — never
+  `acceptForSession` or `acceptAlways`) or `decline` through the narrow `approvalClient` over WS
+  `orchestration.dispatchCommand` (`runtime-request.respond`, configured via optional `BRIDGE_OPERATE_TOKEN`; disabled
+  when unset), verifies t3 accepted it before reporting success, and records an audit entry in `watchdog_action` and the
+  JSONL log. `/stop` remains the separate whole-turn cancellation command.
 - **Watchdog**: findings need the same condition in two snapshots at least 60 s apart.
   - Held queue: `queue.resume`, up to 3 times, 2 min apart, then a notice.
   - Every action is recorded before it is taken.

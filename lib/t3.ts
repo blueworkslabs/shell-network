@@ -8,12 +8,13 @@ import { allowlistedMcp } from "./allowlist.ts";
 import { threadProjection } from "./vendor/push.mjs";
 import { errText } from "./log.ts";
 import type { AllowlistPolicy, McpLike } from "./allowlist.ts";
-import type { Log, ModelSelection, Projection, QueueList, T3Port, ThreadListItem, ThreadRead } from "./types.ts";
+import type { ApprovalDecision, Log, ModelSelection, Projection, QueueList, T3Port, ThreadListItem, ThreadRead } from "./types.ts";
 
 // policy: { projectId, instanceId, boundThread } for the MCP allowlist (lib/allowlist.ts); required, so no adapter
 // exists without it. The raw client is not used anywhere else in here.
-export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, projection = threadProjection }: {
+export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, projection = threadProjection, approval }: {
   mcp: McpLike; policy: AllowlistPolicy; log: Log; projectionTokenPath?: string; projection?: (log: Log, threadId: string, opts: { tokenPath?: string }) => Promise<Projection>;
+  approval?: { respondApproval(args: { threadId: string; requestId: string; decision: ApprovalDecision; commandId: string }): Promise<{ sequence: number }> };
 }): T3Port {
   const mcp = allowlistedMcp(rawMcp, policy, log);
   const call = async (name: string, args: Record<string, unknown>, label: string): Promise<any> => {
@@ -92,6 +93,7 @@ export function t3Adapter({ mcp: rawMcp, policy, log, projectionTokenPath, proje
     },
     interrupt: ({ threadId, runId, clientRequestId }: { threadId: string; runId: string; clientRequestId: string }) =>
       call("t3_thread_interrupt", { threadId, runId, clientRequestId }, "bridge-interrupt"),
+    ...(approval ? { respondApproval: (args: { threadId: string; requestId: string; decision: ApprovalDecision; commandId: string }) => approval.respondApproval(args) } : {}),
     archive: (threadId: string) => call("t3_thread_organize", { action: "archive", threadId }, "bridge-archive"),
     readArchived: (args) => call("t3_thread_read", args, "bridge-archive-read"),
   };

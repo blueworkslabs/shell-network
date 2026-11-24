@@ -89,6 +89,8 @@ export interface BotOptions {
   attachmentsDir?: string;
   // where images of accepted messages are saved for the agent to open (BRIDGE_WORKSPACE/.inbox, #59); none = links only
   inboxDir?: string; fetchFile?: FetchFile;
+  // runtime info shown in /status (#99): bridge process start time and short commit SHA (optional)
+  startedAt?: number; version?: string | null;
 }
 
 const PART = 1900;
@@ -271,7 +273,7 @@ const snowflakeAt = (ms: number): bigint => (BigInt(Math.max(0, Math.floor(ms)) 
 
 export function makeBot({ name, conversationKey, channelId, channelName, threadLabel, botUserId, botRoleId = null, allowedAuthors, projectId, modelSelection, buffer, t3, discord, log, now = () => Date.now(),
   typingEveryMs = 8000, session = () => "offline-test", backfillEveryMs = 60_000, searchPagesPerStep = 20, stuckLimits = DEFAULT_LIMITS_MS,
-  allowedBots = [], exchangeCap = 2, silentFeedback = "note", headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, activeThreads, notesRoot }: BotOptions) {
+  allowedBots = [], exchangeCap = 2, silentFeedback = "note", headerMaxMessages = 20, headerMaxChars = 4000, attachmentsDir, inboxDir, fetchFile, dm = false, threadContext, activeThreads, notesRoot, startedAt, version = null }: BotOptions) {
   const K = (k: string) => `${conversationKey}:${k}`;
   if (!Array.isArray(allowedAuthors) || !allowedAuthors.length || !allowedAuthors.every((a: unknown) => typeof a === "string" && /^\d+$/.test(a))) {
     throw new Error("makeBot: allowedAuthors must be a non-empty list of Discord user ids");
@@ -477,11 +479,27 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
   }
 
   // `/status`: what this bot is doing in this channel, for the person who asked (an ephemeral reply). No ids or paths.
+  function formatUptime(ms: number): string {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+    const d = Math.floor(h / 24);
+    return h % 24 ? `${d}d ${h % 24}h` : `${d}d`;
+  }
   async function status(): Promise<string> {
     const threadId = buffer.kvGet(K("threadId")), title = buffer.kvGet(K("threadTitle"));
     let state = "not started";
     if (threadId) state = await t3.read(threadId).then((r) => (isBusy(r) ? "busy" : "idle"), () => "unknown (t3 not reachable)");
     const open = buffer.openBatches(conversationKey)[0], rs = resetState(), st = stopState(), lastStop = lastStopState(), n = buffer.exchangeCount(channelId);
+    const queuedOutbox = buffer.outboxPendingCount(conversationKey);
+    const runtimeParts = [
+      ...(version ? [`version ${version}`] : []),
+      ...(startedAt !== undefined ? [`up ${formatUptime(now() - startedAt)}`] : []),
+      `queued outbox: ${queuedOutbox}`,
+    ];
     const stopLine = st ? ["/stop: stopping running turn"]
       : lastStop ? [`Last /stop: stopped at ${new Date(lastStop.at).toISOString().slice(0, 16).replace("T", " ")} UTC`] : [];
     const threads = activeThreads?.() ?? [];
@@ -494,6 +512,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       ? `**${name}** in thread "${threadContext.threadName}" (#${threadContext.parentName})`
       : `**${name}** in #${channelName ?? channelId}`;
     return [header,
+      `Bridge: ${runtimeParts.join("; ")}`,
       `Thread: ${title ? `"${title}"` : "none yet"}, ${state}`,
       `Open batch: ${open ? open.status : "none"}; waiting messages: ${buffer.buffered(conversationKey).length}`,
       `/new: ${rs ? `pending (${rs.stage})${resetTrouble(rs)}` : "none pending"}`,

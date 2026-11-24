@@ -330,10 +330,11 @@ a timing SLA. No bridge code change was required.
   cards) directly from Discord. Running `/approve` or `/deny` replies with an ephemeral confirmation showing the agent,
   approval type, working directory (labeled unknown when t3 does not report a request-level working directory, never
   guessed from `BRIDGE_WORKSPACE`), and the exact untruncated command/request detail, bound to a single-use 5-minute
-  confirmation token tied to `(userId, action, threadId, runId, requestId, promptSha256)`. If the exact action is
-  missing, cannot be rendered verbatim, or exceeds Discord's 2000-character message limit, no confirmation is offered
-  and the user is directed to `BRIDGE_T3_APP_LABEL`. Confirming consumes the token atomically, re-verifies the exact
-  `requestId` and prompt are still pending and live on the bound thread, sends strictly `accept` (approve once — never
+  confirmation token tied to `(userId, action, threadId, runId, requestId, kind, cwd, prompt, appName, reason)`. If
+  the exact action is missing, cannot be rendered verbatim, or exceeds the 1900-character interaction limit (enforced in
+  both `lib/bot.ts` and `lib/discord.ts`), no confirmation is offered and the user is directed to `BRIDGE_T3_APP_LABEL`.
+  Confirming consumes the token atomically, re-verifies the exact `requestId`, kind, working directory, and preview
+  details are still pending and live on the bound thread, sends strictly `accept` (approve once — never
   `acceptForSession` or `acceptAlways`) or `decline` through `approvalClient` over WS `orchestration.dispatchCommand`
   (`runtime-request.respond`, configured via optional `BRIDGE_OPERATE_TOKEN` which requires `BRIDGE_APPROVAL_USER_ID`;
   disabled when either is unset; note that the wrapper restricts normal bridge calls, not the token's server-granted

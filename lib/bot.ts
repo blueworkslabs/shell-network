@@ -31,8 +31,9 @@ import { errText } from "./log.ts";
 import {
   DEFAULT_LIMITS_MS, DEFAULT_PENDING_REQUEST_ALERT_MS, DEFAULT_T3_APP_LABEL, REQUEST_KIND_LABELS,
   clearText, findBlockingApproval, findBlockingRequest, pendingRequestAlertText, pendingRequestClearText, pendingRequestStatusLine, stuckAlerts,
-  type StuckLimits,
+  type BlockingApprovalDetail, type StuckLimits,
 } from "./stuck.ts";
+import { MAX_INTERACTION_CONTENT } from "./discord.ts";
 import type { ApprovalConfirmResult, ApprovalInspectResult } from "./commands.ts";
 import type { SilentFeedback } from "./bots.ts";
 import type { BatchLimit, Buffer } from "./buffer.ts";
@@ -111,8 +112,8 @@ const REFUSED = new Set([400, 403, 404, 413]), REFUSE_LIMIT = 3;
 export const RESET_STUCK_MS = 10 * 60_000;
 // Ephemeral /approve and /deny confirmation buttons stay valid for 5 minutes (single use, #110).
 export const APPROVAL_CONFIRM_TTL_MS = 5 * 60_000;
-// Discord interaction edit limit: approval previews are never truncated; anything longer is directed to t3 (#110).
-export const MAX_APPROVAL_PREVIEW_CHARS = 2000;
+// Must match lib/discord.ts MAX_INTERACTION_CONTENT: approval previews are never truncated; anything longer is directed to t3 (#110).
+export const MAX_APPROVAL_PREVIEW_CHARS = MAX_INTERACTION_CONTENT;
 // The agents' "nothing to post" final (OpenClaw convention): exactly NO_REPLY, surrounding whitespace ignored.
 export const isNoReply = (text: unknown): boolean => String(text ?? "").trim() === "NO_REPLY";
 // Markdown images of local paths (`![x](/abs/path.png)`, `![x](<...>)` around such a path, `![x](file:...)`, with an
@@ -444,14 +445,22 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     runId: string;
     requestId: string;
     kind: ApprovalRequestKind;
-    promptSha256: string;
+    previewSha256: string;
     createdAt: number;
     expiresAt: number;
   };
   const APPROVAL_CONFIRM_PREFIX = K("approvalConfirm:");
   const APPROVAL_CONFIRM_MAX = 20;
   const approvalConfirmKey = (nonce: string) => `${APPROVAL_CONFIRM_PREFIX}${nonce}`;
-  const hashPrompt = (prompt: string) => createHash("sha256").update(prompt).digest("hex");
+  const previewFingerprint = (d: Pick<BlockingApprovalDetail, "kind" | "prompt" | "cwd" | "threadWorktreePath" | "appName" | "reason">) =>
+    createHash("sha256").update(JSON.stringify([
+      d.kind,
+      d.prompt,
+      d.cwd,
+      d.cwd === null ? d.threadWorktreePath : null,
+      d.appName,
+      d.reason,
+    ])).digest("hex");
   function pruneApprovalConfirms(): void {
     const t = now();
     const rows = buffer.kvWithPrefix(APPROVAL_CONFIRM_PREFIX);
@@ -527,7 +536,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
     const t = now();
     const record: ApprovalConfirmRecord = {
       nonce, action, userId, author, threadId, runId: pending.runId, requestId: pending.requestId,
-      kind: pending.kind, promptSha256: hashPrompt(pending.prompt), createdAt: t, expiresAt: t + APPROVAL_CONFIRM_TTL_MS,
+      kind: pending.kind, previewSha256: previewFingerprint(pending), createdAt: t, expiresAt: t + APPROVAL_CONFIRM_TTL_MS,
     };
     buffer.atomically(() => {
       pruneApprovalConfirms();
@@ -601,7 +610,7 @@ export function makeBot({ name, conversationKey, channelId, channelName, threadL
       { ...projection, runtimeRequests: (projection.runtimeRequests ?? []).filter((r) => r?.id === rec.requestId) },
       rec.runId,
     );
-    if (!live || live.requestId !== rec.requestId || live.runId !== rec.runId || !live.prompt || hashPrompt(live.prompt) !== rec.promptSha256) {
+    if (!live || live.requestId !== rec.requestId || live.runId !== rec.runId || live.kind !== rec.kind || !live.prompt || previewFingerprint(live) !== rec.previewSha256) {
       log.emit("bridge.approval_stale", { bot: name, action: rec.action, userId, requestId: rec.requestId, runId: rec.runId });
       return { ok: false, text: "That pending approval is already resolved or no longer active. Nothing was sent." };
     }

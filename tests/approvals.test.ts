@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { interactionDispatch, type InteractionButton, type InteractionEditOptions, type InteractionPort } from "../lib/commands.ts";
 import { APPROVAL_CONFIRM_TTL_MS, MAX_APPROVAL_PREVIEW_CHARS, makeBot } from "../lib/bot.ts";
 import { conversationKeyFor } from "../lib/bots.ts";
+import { discordRest, MAX_INTERACTION_CONTENT } from "../lib/discord.ts";
 import { memoryLog } from "../lib/log.ts";
 import { approvalOwner } from "../lib/startup.ts";
 import { DEFAULT_PENDING_REQUEST_ALERT_MS } from "../lib/stuck.ts";
@@ -281,7 +282,9 @@ test("COMPLETE PREVIEW GUARD (#110): refuses missing, oversized, or triple-backt
   assert.equal(w.edits.at(-1)!.components, undefined);
   assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 0);
 
-  // 3. Long command that fits in Discord's 2000-char limit (>1100 chars) -> shown 100% verbatim, NEVER truncated
+  // 3. Long command that fits in the 1900-char interaction limit (>1100 chars) -> shown 100% verbatim, NEVER truncated
+  assert.equal(MAX_APPROVAL_PREVIEW_CHARS, MAX_INTERACTION_CONTENT);
+  assert.equal(MAX_APPROVAL_PREVIEW_CHARS, 1900);
   const mediumCmd = `python3 -c "${"x".repeat(1300)}"`;
   th.turnItems[0].prompt = mediumCmd;
   await w.slash("approve");
@@ -300,18 +303,69 @@ test("COMPLETE PREVIEW GUARD (#110): refuses missing, oversized, or triple-backt
   assert.equal(w.edits.at(-1)!.content, "That pending approval is already resolved or no longer active. Nothing was sent.");
   assert.equal(w.t3.calls.filter((c) => c.tool === "respondApproval").length, 0);
 
-  // 4. Oversized command exceeding Discord's 2000-char limit -> refused, NEVER truncated
-  th.turnItems[0].prompt = `echo ${"a".repeat(2100)}`;
+  // Working directory drift between inspect and confirm -> rejected cleanly without sending to t3
+  th.turnItems[0].prompt = "rm -f /tmp/a";
+  th.turnItems[0].cwd = "/srv/safe-dir";
+  await w.slash("approve");
+  const confirmCwd = w.edits.at(-1)!.components![0].custom_id;
+  th.turnItems[0].cwd = "/srv/other-dir";
+  await w.click(confirmCwd);
+  assert.equal(w.edits.at(-1)!.content, "That pending approval is already resolved or no longer active. Nothing was sent.");
+  assert.equal(w.t3.calls.filter((c) => c.tool === "respondApproval").length, 0);
+
+  // Request kind drift between inspect and confirm -> rejected cleanly without sending to t3
+  th.runtimeRequests[0].kind = "file-read";
+  th.turnItems[0].requestKind = "file-read";
+  await w.slash("approve");
+  const confirmKind = w.edits.at(-1)!.components![0].custom_id;
+  th.runtimeRequests[0].kind = "command";
+  th.turnItems[0].requestKind = "command";
+  await w.click(confirmKind);
+  assert.equal(w.edits.at(-1)!.content, "That pending approval is already resolved or no longer active. Nothing was sent.");
+  assert.equal(w.t3.calls.filter((c) => c.tool === "respondApproval").length, 0);
+
+  // 4. Preview between 1901 and 2000 chars (e.g. ~1950 chars) -> refused BEFORE REST adapter can clip at 1900
+  th.turnItems[0].prompt = `echo ${"a".repeat(1750)}`;
   await w.slash("approve");
   edit = w.edits.at(-1)!;
-  assert.equal(edit.components, undefined, "oversized action must never offer confirm buttons");
+  assert.equal(edit.components, undefined, "1950-char preview must never offer confirm buttons");
   assert.match(edit.content, /too long for one message/);
   assert.match(edit.content, /the t3 web app/);
   await w.slash("deny");
   assert.equal(w.edits.at(-1)!.components, undefined);
   assert.equal(w.buffer.kvWithPrefix(`${KEY}:approvalConfirm:`).length, 0);
 
-  // 5. Triple backticks in command -> refused rather than mutating displayed command
+  // 5. Real discordRest adapter guard: refuses >1900 chars when buttons are attached (never clips), sends <=1900 verbatim
+  const sentBodies: { url: string; body: Record<string, unknown> }[] = [];
+  const rest = discordRest({
+    token: "bot-tok",
+    allowedChannels: [CH],
+    makeRequest: async (url, init) => {
+      const u = String(url);
+      if (u.endsWith("/oauth2/applications/@me")) {
+        return new Response(JSON.stringify({ id: "700000000000000001" }), { status: 200, headers: { "content-type": "application/json" } }) as never;
+      }
+      sentBodies.push({ url: u, body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown> });
+      return new Response(JSON.stringify({ id: "1" }), { status: 200, headers: { "content-type": "application/json" } }) as never;
+    },
+  });
+  const sampleButtons: InteractionButton[] = [
+    { custom_id: "apv:confirm:0123456789abcdef", label: "Confirm Approve (once)", style: 3 },
+    { custom_id: "apv:cancel:0123456789abcdef", label: "Cancel", style: 2 },
+  ];
+  await assert.rejects(
+    rest.interactions.edit("tok-over", "z".repeat(1950), { components: sampleButtons }),
+    /exceeds 1900 chars/,
+    "REST adapter refuses to truncate confirmation text with buttons",
+  );
+  assert.equal(sentBodies.length, 0, "no HTTP PATCH sent when interactive edit exceeds 1900 chars");
+  const exact1900 = "v".repeat(1900);
+  await rest.interactions.edit("tok-exact", exact1900, { components: sampleButtons });
+  assert.equal(sentBodies.length, 1);
+  assert.equal(sentBodies[0].body.content, exact1900, "1900-char interactive confirmation sent 100% verbatim");
+  assert.ok(Array.isArray(sentBodies[0].body.components) && sentBodies[0].body.components.length === 1);
+
+  // 6. Triple backticks in command -> refused rather than mutating displayed command
   th.turnItems[0].prompt = "cat <<'EOF'\n```sh\necho hi\n```\nEOF";
   await w.slash("approve");
   edit = w.edits.at(-1)!;

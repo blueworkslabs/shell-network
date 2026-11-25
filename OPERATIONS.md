@@ -9,12 +9,14 @@ backups and instance-specific configuration off git. Do not print environment fi
 
 - Source checkout: `~/work/shell-network` (fetch before selecting a commit).
 - Immutable installed releases: `~/.local/lib/t3-bridge/<commit>`.
-- Services: `t3-gem-bridge`, `t3-hermes-bridge`, `t3-watchdog`; server: `t3-staging`.
-- Configuration: `~/.config/t3-bridge/{gem,hermes,watchdog}.env`, `crew.json`,
-  `gem-discord-mcp.json`. Token variables name private **files**, not token strings.
+- Services: every installed bridge unit (e.g. `t3-gem-bridge`, `t3-hermes-bridge`, `t3-codex-bridge`),
+  `t3-watchdog`; server: `t3-staging`.
+- Configuration: `~/.config/t3-bridge/{<bot>,watchdog}.env` (e.g. `gem`, `hermes`, `codex`), `crew.json`,
+  and per-profile MCP configs (e.g. `gem-discord-mcp.json`). Token variables name private **files**, not token strings.
 - Shared buffer: `~/.local/state/t3-bridge/multichannel.sqlite` (schema 2).
 - Provider settings: `~/.local/state/t3-staging/data/userdata/settings.json`.
-- Logs: `journalctl --user -u t3-hermes-bridge` (likewise Gem/watchdog);
+- Logs: `journalctl --user -u t3-<bot>-bridge` (e.g. `t3-gem-bridge`, `t3-hermes-bridge`, `t3-codex-bridge`, and
+  `t3-watchdog`);
   provider diagnostics under `~/.local/state/t3-staging/data/userdata/logs/provider/`.
   Logs can contain conversation data: inspect locally, share only sanitized excerpts.
 - Requires git, Python 3 with sqlite3, Node >=24, npm, and user systemd.
@@ -50,8 +52,10 @@ If that exact release already exists, inspect it; do not overwrite a running rel
 
 ## 2. Back up, stop, recheck, install
 
-These commands change only the two bridge unit overrides. Watchdog and provider
-MCP code have separate version pins; see below when the release changes them.
+These commands change only the affected bridge unit overrides (cover every installed
+bridge being updated, including Gem, Hermes and Codex; the `units` list below is an
+example). Watchdog and provider MCP code have separate version pins; see below when
+the release changes them.
 
 ```bash
 # Step 1 ran in a subshell. Use the same approved commit here.
@@ -64,7 +68,8 @@ h = pathlib.Path.home()
 b = pathlib.Path(os.environ['RELEASE_BACKUP'])
 r = pathlib.Path(os.environ['RELEASE_DIR'])
 assert (r / 'bin/bridge.ts').is_file()
-units = ['t3-gem-bridge', 't3-hermes-bridge']
+# Example: list every affected bridge unit on this host (add or omit units as applicable).
+units = ['t3-gem-bridge', 't3-hermes-bridge', 't3-codex-bridge']
 paths = [h / '.config/systemd/user' / (u + '.service.d/zz-public-release.conf') for u in units]
 def ctl(*a): subprocess.run(['systemctl', '--user', *a], check=True)
 c = sqlite3.connect('file:' + str(h / '.local/state/t3-bridge/multichannel.sqlite') + '?mode=ro', uri=True)
@@ -100,9 +105,10 @@ and backup until the new release has survived actual traffic.
 ## 3. Verify
 
 ```bash
-systemctl --user is-active t3-gem-bridge t3-hermes-bridge t3-watchdog t3-staging
-systemctl --user show t3-gem-bridge t3-hermes-bridge -p ExecStart -p MainPID -p NRestarts
-journalctl --user -u t3-gem-bridge -u t3-hermes-bridge --since '5 minutes ago' --no-pager
+# Example: list every affected bridge unit on this host.
+systemctl --user is-active t3-gem-bridge t3-hermes-bridge t3-codex-bridge t3-watchdog t3-staging
+systemctl --user show t3-gem-bridge t3-hermes-bridge t3-codex-bridge -p ExecStart -p MainPID -p NRestarts
+journalctl --user -u t3-gem-bridge -u t3-hermes-bridge -u t3-codex-bridge --since '5 minutes ago' --no-pager
 python3 - <<'PY'
 import json, os, pathlib, sqlite3
 h = pathlib.Path.home()
@@ -114,7 +120,7 @@ print('Bindings preserved; pending outbox:', c.execute("select count(*) from out
 PY
 ```
 
-Both bridges should connect to MCP/Discord without restart loops. Confirm one real
+Every updated bridge should connect to MCP/Discord without restart loops. Confirm one real
 message through each bot and a private `/status` reply (which reports the running
 release SHA, uptime, and queued outbox count). Do not mistake an external
 CLI tool call for a provider-tool test. For a model change, inspect the actual t3 run's
@@ -124,13 +130,14 @@ provider/model: the current `/status` does not report the executed model.
 
 Set `RELEASE_BACKUP` to the saved absolute backup path, including in a new SSH
 session (`export RELEASE_BACKUP="/absolute/path/to/saved/backup"`). Use the same quiet-window
-and idle checks above. Restore only the two overrides, never the whole config or DB:
+and idle checks above. Restore only the affected bridge overrides, never the whole config or DB:
 
 ```bash
 python3 - <<'PY'
 import os, pathlib, shutil, subprocess
 h = pathlib.Path.home(); b = pathlib.Path(os.environ['RELEASE_BACKUP'])
-units = ['t3-gem-bridge', 't3-hermes-bridge']
+# Example: match the affected bridge units backed up in step 2.
+units = ['t3-gem-bridge', 't3-hermes-bridge', 't3-codex-bridge']
 pairs = [(b / (u + '.service.d.conf'), h / '.config/systemd/user' / (u + '.service.d/zz-public-release.conf')) for u in units]
 assert all(src.is_file() for src, dst in pairs)
 subprocess.run(['systemctl', '--user', 'stop', *units], check=True)
@@ -164,12 +171,12 @@ other operators' changes; revert only this release's fields if any were changed.
   the Discord MCP executable and the owning bot's workspace/notes/index. Updating
   an old Claude profile's MCP file does not update a live Antigravity instance.
 - For an attachment-capable release, add `DISCORD_TOOL_WORKSPACE` to each server's
-  env using that bot's own workspace (`~/work/crew/gem` or `~/work/crew/hermes`,
-  expanded to an absolute path). Do not share a parent workspace between bots.
+  env using that bot's own workspace (`~/work/crew/<bot>`, e.g. `gem`, `hermes`,
+  `codex`, expanded to an absolute path). Do not share a parent workspace between bots.
 - For inbound images and small UTF-8 text attachments (#59, #102), set `BRIDGE_WORKSPACE` in each bridge's environment
   to the same path as that bot's `DISCORD_TOOL_WORKSPACE`. Saved images and `.txt` files land in `<workspace>/.inbox/`
-  and are removed after 7 days. Remove the variable and restart the bridge to roll back (lines go back to links only);
-  `.inbox/` can then be deleted.
+  and are removed after 7 days unless their message is still waiting for delivery. Remove the variable and restart the
+  bridge to roll back (lines go back to links only); `.inbox/` can then be deleted.
 - Back up each changed file, repin only those fields, and record old/new values.
   A bridge restart does **not** reload an already-running provider's MCP server.
   Let active work finish; use an agreed fresh provider session and verify MCP startup
@@ -180,18 +187,20 @@ other operators' changes; revert only this release's fields if any were changed.
 ## Slash command cleanup and re-registration
 
 Changing code does not remove registered commands. Before rolling back to code
-without slash handlers, run the **slash-capable** release's helper for both apps.
+without slash handlers, run the **slash-capable** release's helper for every affected
+bot app (including Gem, Hermes, Codex and any other installed bridge).
 The helper removes all global commands of the selected app, not just the bridge's
 commands.
 In a new SSH session, set `RELEASE_DIR` again to the installed **slash-capable**
 release (`export RELEASE_DIR="$HOME/.local/lib/t3-bridge/<commit>"`), not the
 pre-slash rollback target. Set `RELEASE_BACKUP` again too if continuing into rollback.
-Keep the bridges stopped while clearing; use the owning bot's env, whose token is a
-file path. These installed env files are trusted shell assignments:
+Keep the affected bridges stopped while clearing; use each owning bot's env, whose
+token is a file path. These installed env files are trusted shell assignments:
 
 ```bash
-systemctl --user stop t3-gem-bridge t3-hermes-bridge
-for bot in gem hermes; do
+# Example: list every affected bridge unit and bot key on this host.
+systemctl --user stop t3-gem-bridge t3-hermes-bridge t3-codex-bridge
+for bot in gem hermes codex; do
   (set -a; source "$HOME/.config/t3-bridge/$bot.env"; set +a
    "$HOME/.local/bin/node" "$RELEASE_DIR/bin/clear-commands.ts")
 done
@@ -201,7 +210,7 @@ Then restore/start the old code. To re-register, start slash-capable bridge code
 clearing saves the empty-set hash, causing next startup to reconcile `/new`,
 `/status`, `/stop`, `/approve` and `/deny`. Check `bridge.commands_reconciled` and
 each bot's picker/private reply. If already
-on slash-capable code, simply start both bridges again after clearing. Discord may
+on slash-capable code, simply start the affected bridges again after clearing. Discord may
 rate-limit deletes: the first legacy cleanup took about 4.5 minutes; do not repeatedly
 restart it. Reverting to a release with identical commands needs no cleanup.
 
@@ -215,7 +224,8 @@ path, health checks and live-message results across both install and rollback.
 For every installed bridge, `t3-staging.service` and `t3-watchdog.service`, enable
 user lingering and install an override with `Restart=on-failure`, `RestartSec=10`,
 `StartLimitIntervalSec=300`, `StartLimitBurst=6`, and `[Install] WantedBy=default.target`.
-Run `systemctl --user enable` for all five units after `daemon-reload`.
+Run `systemctl --user enable` for every installed bridge unit, `t3-watchdog.service`
+and `t3-staging.service` after `daemon-reload`.
 For bridge/watchdog overrides, use `Wants=t3-staging.service` and
 `After=t3-staging.service`. Do not bind their lifetime to a particular t3 PID.
 Add a t3 `ExecStartPost` readiness probe that waits up to 120 seconds for its local
@@ -230,7 +240,7 @@ provider configuration, credentials and LAN binding. No upstream t3 patch is nee
 
 Acceptance: in an agreed idle window, kill one bridge's main PID with SIGKILL and
 verify a new PID and an incremented restart count without a manual start. Reboot
-the guest and verify all five units start, all conversation bindings remain, and
+the guest and verify every installed unit starts, all conversation bindings remain, and
 each bot answers a real Discord message. Check provider readiness too: enabled
 units alone do not prove that an agent can answer. Never reboot while a provider
 turn, queued message or pending `/new` remains.

@@ -84,8 +84,9 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   their first bytes match png/jpeg/gif/webp (saved under the real extension), and text attachments (up to 256 KiB each,
   within the 4-file / 8 MiB per-message cap) are kept only if they are valid UTF-8 without NUL bytes and are always
   saved with a `.txt` extension regardless of original filename. Size is capped while downloading, files are written
-  into `.inbox/` (a plain directory, not a symlink) under names the bridge builds itself, and the 7-day sweep refuses a
-  symlinked inbox the same way. Forwarded attachments are never downloaded.
+  into `.inbox/` (a plain directory, not a symlink) under names the bridge builds itself, and the 7-day sweep removes
+  older files only once their message is no longer waiting for delivery (refusing a symlinked inbox the same way).
+  Forwarded attachments are never downloaded.
 - **One writer per bot token.** The bridge holds an exclusive lock for its bot (`lib/lock.ts`). The Discord tool can
   only insert outbox entries, through a SQLite authorizer (`lib/tooldb.ts`); the bridge validates each entry again
   before posting it.

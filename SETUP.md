@@ -75,7 +75,7 @@ runs once per process start; arbitrary shared roles are not included.
 
 Optional settings:
 
-- `BRIDGE_EXCHANGE_CAP`: the bot-to-bot cap (default 2; 0 turns bot-to-bot off).
+- `BRIDGE_EXCHANGE_CAP`: the bot-to-bot exchange cap (default 2; 0 disables the cap so bot-to-bot traffic continues without that limit).
 - `BRIDGE_SILENT_FEEDBACK`: visible feedback when a person directly mentions a bot and its run finishes with `NO_REPLY` without posting anything (`note` default, `reaction`, or `off`).
 - `BRIDGE_TICK_MS`: the step interval (default 3000 ms while open; 30000 ms idle).
 - `BRIDGE_T3_APP_LABEL`: where blocking approval/input alerts direct the user (default `the t3 app`).

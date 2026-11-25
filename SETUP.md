@@ -8,7 +8,8 @@ How to run Shell Network: requirements, configuration and the entrypoints. Back 
 - A t3 server with MCP enabled, plus:
   - an MCP token for the bridge;
   - a read-only WS session;
-  - an `operate` WS session for the watchdog.
+  - an `operate` WS session for the watchdog (and optionally for a bridge only if enabling Discord `/approve` and `/deny`,
+    paired with `BRIDGE_APPROVAL_USER_ID`; see [SECURITY.md](SECURITY.md)).
 - One Discord bot application per agent, with the Message Content intent enabled. The bridge also asks for the Direct Messages
   intent (not privileged, nothing to enable); it reads DMs only from `BRIDGE_DM_USERS`, see ARCHITECTURE.md.
 
@@ -74,17 +75,27 @@ runs once per process start; arbitrary shared roles are not included.
 
 Optional settings:
 
-- `BRIDGE_EXCHANGE_CAP`: the bot-to-bot cap (default 2; 0 turns bot-to-bot off).
+- `BRIDGE_EXCHANGE_CAP`: the bot-to-bot exchange cap (default 2; 0 disables the cap so bot-to-bot traffic continues without that limit).
 - `BRIDGE_SILENT_FEEDBACK`: visible feedback when a person directly mentions a bot and its run finishes with `NO_REPLY` without posting anything (`note` default, `reaction`, or `off`).
-- `BRIDGE_TICK_MS`: the step interval.
+- `BRIDGE_TICK_MS`: the step interval (default 3000 ms while open; 30000 ms idle).
+- `BRIDGE_T3_APP_LABEL`: where blocking approval/input alerts direct the user (default `the t3 app`).
+- `BRIDGE_NOTES_DIR`: absolute path to this bot's notes root (same as `DISCORD_TOOL_NOTES`) to export archived `/new` and closed-thread sessions into `sessions/` automatically.
+- `BRIDGE_WORKSPACE`: absolute path to this bot's workspace (same as `DISCORD_TOOL_WORKSPACE`) to save inbound images and small UTF-8 text attachments into `.inbox/` (text files are always saved as `.txt`).
+- `BRIDGE_DM_USERS`: comma-separated Discord user ids (each also in `BRIDGE_ALLOWED_AUTHORS`) whose DMs this bot serves.
+- `BRIDGE_APPROVAL_USER_ID` and `BRIDGE_OPERATE_TOKEN`: optional Discord `/approve` and `/deny` support. `BRIDGE_APPROVAL_USER_ID` must be a single Discord user id also in `BRIDGE_ALLOWED_AUTHORS`; `BRIDGE_OPERATE_TOKEN` names an `orchestration:operate` WS session file and fails fast at startup unless `BRIDGE_APPROVAL_USER_ID` is also set. Unset disables Discord approvals. See [SECURITY.md](SECURITY.md) for the trust boundary.
 
 The full list of settings is in the header of each entrypoint:
 
 - `bin/bridge.ts`: one bot. A second bridge for the same bot exits with status 4, "lease held".
-- `bin/watchdog.ts`: settings `WATCHDOG_DB`, `WATCHDOG_LOG` and `WATCHDOG_OPERATE_TOKEN`.
+- `bin/watchdog.ts`: settings `WATCHDOG_DB`, `WATCHDOG_LOG`, `WATCHDOG_OPERATE_TOKEN`, `T1_PUSH_TOKEN` and `T1_MCP_URL`.
 - `bin/discord-tool.ts`: configured in the t3 provider instance with `DISCORD_TOOL_BOT` and `DISCORD_TOOL_DB`. It
-  refuses to start if any of the bridge's secret variables are in its environment. Optionally set `DISCORD_TOOL_NOTES`
-  to an absolute directory containing only that bot's notes to enable the read-only `memory_search` tool.
+  refuses to start if any of the bridge's secret variables (`BRIDGE_DISCORD_TOKEN`, `T1_TOKEN`, `T1_PUSH_TOKEN`,
+  `BRIDGE_OPERATE_TOKEN`) are in its environment. Optionally set `DISCORD_TOOL_WORKSPACE` for outbound file attachments,
+  `DISCORD_TOOL_NOTES` to an absolute directory containing only that bot's notes to enable read-only `memory_search`,
+  and `DISCORD_TOOL_MEMORY_INDEX` / `DISCORD_TOOL_EMBED_*` for hybrid search (see [MEMORY.md](MEMORY.md)).
+- Utility CLIs: `bin/clear-commands.ts` (slash-command cleanup; see [OPERATIONS.md](OPERATIONS.md)),
+  `bin/index-memory.ts` (initial hybrid memory index build) and `bin/import-transcripts.ts` (importing prior
+  conversation history; see [MEMORY.md](MEMORY.md)).
 
 The `T1_` prefix on the t3 connection variables is historical.
 
@@ -168,12 +179,9 @@ For an existing bridge, use the preservation steps in
 [OPERATIONS.md](OPERATIONS.md#antigravity-cutover-and-rollback); editing the crew
 file alone does not change already-bound conversations. Verify a real model turn,
 its persona, `memory_search`, `discord_read`, and the delivered Discord reply.
-The tested Neon catalog defaults `thought_level` to `high`; it can be pinned as
-`options: [{"id":"thought_level","value":"high"}]` in t3's conversation
-model selection. Until [#66](https://github.com/blueworkslabs/shell-network/issues/66)
-is installed, the bridge passes only the crew provider/model for new conversations;
-a conversation pin is not a durable bridge default. Read back selections rather
-than assuming a project-default update persisted.
+The tested Neon catalog defaults `thought_level` to `high`. To pin it across new sessions (initial start and `/new`),
+set `"options": { "thought_level": "high" }` on the crew entry (see above); for already-bound threads, update their
+model selection in t3 directly and read back the selection to confirm it persisted.
 
 ## Upgrading from t3 0.1.0
 

@@ -18,12 +18,15 @@ model and the known limits.
   be imported.
 - **Conversation history.** `/new` starts a fresh session and archives the old one into the agent's searchable history
   automatically when archive export and memory search are configured.
-- **Discord-native.** One conversation per channel or Discord thread, DMs from allowed people, slash commands (`/new`, `/status`, `/stop`), file
-  attachments both ways, and a Discord tool the agent can use to post, react, open threads and read.
+- **Discord-native.** One conversation per channel or Discord thread, DMs from allowed people, slash commands (`/new`,
+  `/status`, `/stop`, plus optional `/approve` and `/deny`), file attachments both ways (including inbound images and
+  small UTF-8 text files), and a Discord tool the agent can use to post, edit, react, open threads, read and list its
+  allowed channels.
 - **Crews.** Several agents in one channel can hand work to each other by mention, with a cap that pauses bot-to-bot
   loops until a person speaks.
 - **Durable by design.** Every mention is committed before it is acknowledged, every reply goes through one ordered
-  outbox, and every delivery is reconciled against what t3 reports. A watchdog resumes held queues.
+  outbox, and every delivery is reconciled against what t3 reports. Blocking approval/input waits alert promptly in the
+  channel, and a watchdog resumes held queues.
 - **Scheduled work.** Agents can schedule their own tasks in t3; results reach the channel through the bridge.
 
 ## How it works

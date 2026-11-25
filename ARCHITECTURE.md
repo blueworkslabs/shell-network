@@ -17,15 +17,20 @@ Discord ──gateway/REST──▶ bridge (one per bot) ──MCP (write) / WS 
   One step runs at a time (`lib/steploop.ts`); a step goes through every channel, and a failing channel does not stop the others. Gateway messages, t3 changes
   and queued notices wake the loop early. A wake that arrives while a step runs is remembered, so the loop steps again
   right away instead of waiting for its timer.
-- **Watchdog** (`bin/watchdog.ts`, `lib/watchdog.ts` + `lib/watchdog-run.ts`): the only holder of t3's
-  `orchestration:operate` grant. It has no Discord or MCP credentials. It reads the bots' thread ids from the buffer
-  and writes notices and its action log there; the bridge posts the notices.
+- **Watchdog** (`bin/watchdog.ts`, `lib/watchdog.ts` + `lib/watchdog-run.ts`): holds t3's `orchestration:operate` grant
+  for queue recovery (a bridge holds an operate session only when explicitly configured with `BRIDGE_OPERATE_TOKEN` and
+  `BRIDGE_APPROVAL_USER_ID` for `/approve` and `/deny`; see [SECURITY.md](SECURITY.md)). It has no Discord or MCP
+  credentials. It reads the bots' thread ids from the buffer and writes notices and its action log there; the bridge
+  posts the notices.
 - **Discord tool** (`bin/discord-tool.ts`, `lib/tools.ts`, `lib/tooldb.ts`, `lib/mcpserver.ts`): a stdio MCP server
-  for the agent. It has no token and opens no network connection. It inserts outbox entries, and the bridge posts them.
+  for the agent. It has no Discord or t3 token and opens no network connection except to an optional configured
+  embedding endpoint when hybrid `memory_search` is enabled (see [SECURITY.md](SECURITY.md) and [MEMORY.md](MEMORY.md)).
+  It inserts outbox entries, and the bridge posts them.
 
 All processes share one buffer DB (`lib/buffer.ts`). The DB uses WAL mode with `synchronous=FULL`. The schema is
-created in one IMMEDIATE transaction, and its version is kept in `PRAGMA user_version`. There are no migrations: a
-schema change before the trial verdict means a fresh DB.
+created in one IMMEDIATE transaction, and its version is kept in `PRAGMA user_version` (`BUFFER_SCHEMA_VERSION = 2`).
+Additive nullable columns (`people`, `channel_meta`, `edited_at`, `forward_quote`) are added in place on schema 2
+without bumping the version; breaking schema changes require a fresh DB.
 
 ## Input: accept, batch, send
 
@@ -204,7 +209,8 @@ bot, so choosing the entry chooses the bot. The text `@Bot /new` keeps working.
 - **Rollback.** Reverting the code leaves the registered commands visible with nothing to answer them. Remove them first
   (or after) with the new release's `bin/clear-commands.ts`, for each bot: `BRIDGE_BOT=<key> BRIDGE_DISCORD_TOKEN=<token
   file> BRIDGE_DB=<buffer path> node bin/clear-commands.ts`. It deletes every global command of that application and
-  stores the empty set's hash, so the next start of this code registers `/new` and `/status` again.
+  stores the empty set's hash, so the next start of this code registers `/new`, `/status`, `/stop`, `/approve` and
+  `/deny` again.
 
 ## Discord threads (`lib/threads.ts`)
 
@@ -217,9 +223,10 @@ channels are ignored.
   thread. The first batch tells the agent the thread name and parent channel and includes the starter message (from the
   channel log or `GET /channels/<parent>/messages/<threadId>`, only if its author is allowed).
 - **Tools and commands:** the thread conversation registers its own `tool_config` row with `channel_id = <thread id>`,
-  so `discord_send`, `discord_read`, `discord_edit` and `discord_react` target the thread directly (`discord_thread` is
-  refused inside a thread). `/new`, `/stop` and `/status` work inside the thread for that thread's conversation, and
-  `/status` in the parent channel lists public active threads by name and private threads by count only.
+  so `discord_send`, `discord_read`, `discord_edit`, `discord_react` and `discord_channels` work with the thread
+  directly (`discord_thread` is refused inside a thread). `/new`, `/status`, `/stop`, `/approve` and `/deny` work
+  inside the thread for that thread's conversation, and `/status` in the parent channel lists public active threads by
+  name and private threads by count only.
 - **Cap and lifecycle:** at most 10 live thread conversations per bot (`MAX_ACTIVE_THREADS`, counting both active and
   closing threads until archive and export finish); an 11th receives one fixed notice and starts no session. After a
   restart, saved active threads stay disabled until `READY`/`RESUMED` revalidates thread type, configured parent and

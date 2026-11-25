@@ -13,8 +13,9 @@ layout:
 - `MEMORY.md`: curated long-term facts and decisions.
 - `memory/YYYY-MM-DD.md`: daily notes, written by the agent at the end of each task.
 
-Configure the provider to load these instructions: for example, use `CLAUDE.md` imports for Claude, or prepare an
-`AGENTS.md` from the same files for Codex. This is workspace setup, not automatic generation by the bridge; refresh
+Configure the provider to load these instructions: for example, use `CLAUDE.md` imports for Claude, `GEMINI.md` imports
+for Gemini via Antigravity (see [SETUP.md](SETUP.md#gemini-through-antigravity)), or prepare an `AGENTS.md` from the
+same files for Codex. This is workspace setup, not automatic generation by the bridge; refresh
 a generated file when its sources change. Daily notes and other changing memory should be read by the agent as
 needed. The agent edits its own notes; the persona files change only on purpose.
 

@@ -54,14 +54,17 @@ response body read (`lib/vendor/mcp.mjs`). A transport failure re-initializes th
 A writable MCP grant also carries `orchestration:operate`, which is more than the bridge needs.
 
 What the code does: bridge code reaches MCP only through a strict allowlist (`lib/allowlist.ts`): launch, list,
-read, queue list, and send in mode `queue`, each limited to the configured project and the bound thread. Queue
-operations such as `queue.resume` go through a separate WS grant that only the watchdog holds.
+read, queue list, and send in mode `queue` (plus narrowly gated archive for `/new`, interrupt for `/stop`, and schedule
+handoff), each limited to the configured project and the bound thread. Queue operations such as `queue.resume` go
+through a separate WS grant held by the watchdog (a bridge holds an `orchestration:operate` WS token only when
+explicitly enabled for `/approve` and `/deny` with `BRIDGE_OPERATE_TOKEN` and `BRIDGE_APPROVAL_USER_ID`, behind the
+narrow `approvalClient` wrapper; see [SECURITY.md](SECURITY.md)).
 
 ## 7. Codex threads drop per-instance MCP servers in t3 0.1.0
 
 In t3 0.1.0, the Codex thread runtime parameters replace the provider instance's `mcp_servers`. As a result, a
 Codex-backed agent does not get the Discord tool. Claude-backed agents are not affected. This is fixed upstream in
-t3 0.1.1.
+t3 0.1.1 (verified fixed on t3 0.1.11).
 
 ## 8. Things the bridge relies on that t3 does not promise
 

@@ -115,7 +115,8 @@ PY
 ```
 
 Both bridges should connect to MCP/Discord without restart loops. Confirm one real
-message through each bot and a private `/status` reply. Do not mistake an external
+message through each bot and a private `/status` reply (which reports the running
+release SHA, uptime, and queued outbox count). Do not mistake an external
 CLI tool call for a provider-tool test. For a model change, inspect the actual t3 run's
 provider/model: the current `/status` does not report the executed model.
 
@@ -165,9 +166,10 @@ other operators' changes; revert only this release's fields if any were changed.
 - For an attachment-capable release, add `DISCORD_TOOL_WORKSPACE` to each server's
   env using that bot's own workspace (`~/work/crew/gem` or `~/work/crew/hermes`,
   expanded to an absolute path). Do not share a parent workspace between bots.
-- For inbound images (#59), set `BRIDGE_WORKSPACE` in each bridge's environment to the same path as that bot's
-  `DISCORD_TOOL_WORKSPACE`. Images land in `<workspace>/.inbox/` and are removed after 7 days. Remove the variable and
-  restart the bridge to roll back (lines go back to links only); `.inbox/` can then be deleted.
+- For inbound images and small UTF-8 text attachments (#59, #102), set `BRIDGE_WORKSPACE` in each bridge's environment
+  to the same path as that bot's `DISCORD_TOOL_WORKSPACE`. Saved images and `.txt` files land in `<workspace>/.inbox/`
+  and are removed after 7 days. Remove the variable and restart the bridge to roll back (lines go back to links only);
+  `.inbox/` can then be deleted.
 - Back up each changed file, repin only those fields, and record old/new values.
   A bridge restart does **not** reload an already-running provider's MCP server.
   Let active work finish; use an agreed fresh provider session and verify MCP startup
@@ -179,7 +181,8 @@ other operators' changes; revert only this release's fields if any were changed.
 
 Changing code does not remove registered commands. Before rolling back to code
 without slash handlers, run the **slash-capable** release's helper for both apps.
-The helper removes all global commands of the selected app, not just these two.
+The helper removes all global commands of the selected app, not just the bridge's
+commands.
 In a new SSH session, set `RELEASE_DIR` again to the installed **slash-capable**
 release (`export RELEASE_DIR="$HOME/.local/lib/t3-bridge/<commit>"`), not the
 pre-slash rollback target. Set `RELEASE_BACKUP` again too if continuing into rollback.
@@ -195,17 +198,17 @@ done
 ```
 
 Then restore/start the old code. To re-register, start slash-capable bridge code:
-clearing saves the empty-set hash, causing next startup to reconcile `/new` and
-`/status`. Check `commands.reconciled` and each bot's picker/private reply. If already
+clearing saves the empty-set hash, causing next startup to reconcile `/new`,
+`/status`, `/stop`, `/approve` and `/deny`. Check `bridge.commands_reconciled` and
+each bot's picker/private reply. If already
 on slash-capable code, simply start both bridges again after clearing. Discord may
 rate-limit deletes: the first legacy cleanup took about 4.5 minutes; do not repeatedly
 restart it. Reverting to a release with identical commands needs no cleanup.
 
 ## Acceptance
 
-A second operator must perform an install and rollback from these steps and record
-commit IDs, backup path, health and live-message results. Until that happens, issue
-#30 remains open; writing the runbook alone is not acceptance.
+When validating a major install or runbook change, record the commit IDs, backup
+path, health checks and live-message results across both install and rollback.
 
 ## Boot and crash recovery (#54)
 
@@ -233,10 +236,6 @@ units alone do not prove that an agent can answer. Never reboot while a provider
 turn, queued message or pending `/new` remains.
 
 ## Bounded diagnostic logs (#56)
-
-Rollout hold (2026-11-22): do not enable the timer or run its first pass until
-the polling-log filter in #62 is installed. Preserve the existing trial logs
-until then; boot/crash recovery can be installed independently.
 
 `ops/rotate-logs.py` is an operator-installed helper, independent of the pinned
 bridge release. Install it under `~/.local/lib/t3-bridge-ops/rotate-logs.py` and run
@@ -355,4 +354,4 @@ On the headless crew VM, `keepAwakeWhileAgentsWork: false` disables t3's sleep
 inhibitor request; the operator confirmed the Access denied warning stopped on
 subsequent work. This is appropriate for an always-on VM, not a recommendation to
 disable sleep protection on a laptop. Provider-ID migration remains separate from
-these warning settings under [#67](https://github.com/blueworkslabs/shell-network/issues/67).
+these warning settings (closed under [#67](https://github.com/blueworkslabs/shell-network/issues/67)).

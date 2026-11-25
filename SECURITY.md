@@ -80,9 +80,12 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
   through symlinks and the target opened without following one). The Discord tool copies them into a staging directory
   and has no credential; the bridge validates the staged copies again before uploading them, so a tampered outbox
   entry cannot make it read a file elsewhere. Inbound attachments are described. With `BRIDGE_WORKSPACE` the bridge
-  fetches images from Discord's CDN hosts only (no redirects), keeps a file only if its first bytes are an image, caps
-  size while downloading, and writes into `.inbox/` (a plain directory, not a symlink) under a name it builds itself;
-  the 7-day sweep refuses a symlinked inbox the same way.
+  fetches images and small UTF-8 text attachments from Discord's CDN hosts only (no redirects): images are kept only if
+  their first bytes match png/jpeg/gif/webp (saved under the real extension), and text attachments (up to 256 KiB each,
+  within the 4-file / 8 MiB per-message cap) are kept only if they are valid UTF-8 without NUL bytes and are always
+  saved with a `.txt` extension regardless of original filename. Size is capped while downloading, files are written
+  into `.inbox/` (a plain directory, not a symlink) under names the bridge builds itself, and the 7-day sweep refuses a
+  symlinked inbox the same way. Forwarded attachments are never downloaded.
 - **One writer per bot token.** The bridge holds an exclusive lock for its bot (`lib/lock.ts`). The Discord tool can
   only insert outbox entries, through a SQLite authorizer (`lib/tooldb.ts`); the bridge validates each entry again
   before posting it.
@@ -92,16 +95,17 @@ The bridge is built for one VM that runs t3, the agents and the bridge processes
 ## Known limits
 
 - **Codex agents don't get the Discord tool on t3 0.1.0.** t3 0.1.0 replaces a Codex instance's `mcp_servers` with
-  its thread runtime parameters, so only Claude-backed agents get the tool. The fix is upstream in t3 0.1.1, which this
-  repository has not been tested with yet.
+  its thread runtime parameters, so only Claude-backed agents get the tool there. Fixed upstream in t3 0.1.1 and
+  verified on t3 0.1.11.
 - **Lock file swap window.** SQLite cannot open a file with `O_NOFOLLOW`. The lock file is pre-opened with
   `O_NOFOLLOW` and its inode is checked before and after SQLite's open. A symlink swapped in between those checks,
   and swapped back before the re-check, is not detected. Doing this requires write access to the state directory,
   which the lock requires to be the bridge user's own and not group/other writable. Under the trust model above, that
   means the bridge's own user or root, both of which are trusted.
-- **Threads are not in the channel log.** Messages inside Discord threads are not input. `discord_read` doesn't see
-  them, and a tool target must be a message of the channel itself. A tool thread can be written to, but replies
-  posted in it are not read.
+- **Inactive and legacy tool threads are not in the parent channel log.** Active Discord thread conversations under
+  configured parent channels (`lib/threads.ts`) have their own separate channel log and `discord_read` scope once
+  activated by a mention; messages in unactivated threads or legacy `discord_thread` targets are not read or logged,
+  and a tool target must belong to the target conversation's own log.
 - **The tool's cap reservation covers tool sends only.** `discord_send` reserves from the bot-to-bot budget before it
   queues a message that names a bot. The bridge's automatic replies and relays are not reserved on the sending side.
   They are capped on the receiving side, where the other bot's bridge counts and refuses them.
